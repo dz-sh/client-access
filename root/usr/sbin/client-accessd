@@ -8,6 +8,7 @@ import { popen } from 'fs';
 import * as ubus from 'ubus';
 import * as uloop from 'uloop';
 import * as policy from 'client_access.policy';
+import * as model from 'client_access.model';
 
 const NFT = '/usr/sbin/nft';
 const FW4 = '/sbin/fw4';
@@ -15,7 +16,9 @@ const FW4 = '/sbin/fw4';
 let timer, published;
 let generation = 0;
 let applied_signature = null;
+let last_config = null;
 let last_compiled = null;
+let last_projection = null;
 let state = {
 	running: true,
 	applied: false,
@@ -28,6 +31,10 @@ let state = {
 	clock_valid: false,
 	mode: null,
 	default_verdict: null,
+	exception_verdict: null,
+	identity_count: 0,
+	active_identity_count: 0,
+	binding_count: 0,
 	exception_count: 0,
 	source_interfaces: [],
 	destination_interfaces: [],
@@ -44,23 +51,32 @@ function as_list(value) {
 function read_config() {
 	const uci = cursor();
 	let config = {
+		schema_version: uci.get('client_access', 'main', 'schema_version'),
 		enabled: uci.get('client_access', 'main', 'enabled'),
 		mode: uci.get('client_access', 'main', 'mode'),
 		deny_action: uci.get('client_access', 'main', 'deny_action'),
 		source_zone: as_list(uci.get('client_access', 'main', 'source_zone')),
 		destination_zone: as_list(uci.get('client_access', 'main', 'destination_zone')),
 		safety_interval: uci.get('client_access', 'main', 'safety_interval') ?? 60,
-		devices: [],
+		identities: [],
+		bindings: [],
 	};
 
-	uci.foreach('client_access', 'device', function(s) {
-		push(config.devices, {
+	uci.foreach('client_access', 'identity', function(s) {
+		push(config.identities, {
+			id: s['.name'],
 			section: s['.name'],
 			name: s.name ?? s['.name'],
-			enabled: s.enabled,
-			mac: s.mac,
-			policy: s.policy,
+			activation: s.activation,
 			schedule: s.schedule,
+		});
+	});
+	uci.foreach('client_access', 'binding', function(s) {
+		push(config.bindings, {
+			section: s['.name'],
+			identity: s.identity,
+			type: s.type,
+			value: s.value,
 		});
 	});
 	uci.unload();
@@ -105,7 +121,6 @@ function resolve_zones(zones) {
 			if (length(ifname))
 				push(interfaces, ifname);
 	}
-
 	return { interfaces: unique_strings(interfaces), errors };
 }
 
@@ -120,22 +135,21 @@ function nft_elements(name, values, formatter) {
 	return script;
 }
 
-function desired_signature(compiled, sources, destinations) {
+function desired_signature(compiled, projection, sources, destinations) {
 	if (!compiled.enabled)
 		return sprintf('%J', { enabled: false });
-
 	return sprintf('%J', {
-		enabled: compiled.enabled,
+		enabled: true,
 		mode: compiled.mode,
 		deny_action: compiled.deny_action,
-		exceptions: compiled.exceptions,
+		exceptions: projection.exceptions,
 		sources,
 		destinations,
 	});
 }
 
-function apply_nft(compiled, sources, destinations) {
-	let exceptions = compiled.exceptions;
+function apply_nft(compiled, projection, sources, destinations) {
+	let exceptions = projection.exceptions;
 	if (!compiled.enabled) {
 		exceptions = [];
 		sources = [];
@@ -170,28 +184,44 @@ function update_timer(config, compiled, epoch) {
 	timer.set(delay);
 }
 
+function count_active(identities) {
+	let count = 0;
+	for (let identity in identities)
+		if (identity.effective_active)
+			count++;
+	return count;
+}
+
+function compile_runtime(config, epoch) {
+	const compiled = policy.compile(config, epoch);
+	const projection = model.project(compiled, config.bindings);
+	return { compiled, projection };
+}
+
 function reconcile(reason, force) {
 	const epoch = clock()[0];
 	const config = read_config();
-	const compiled = policy.compile(config, epoch);
+	const runtime = compile_runtime(config, epoch);
+	const compiled = runtime.compiled;
+	const projection = runtime.projection;
 	const source = compiled.enabled
 		? resolve_zones(config.source_zone)
 		: { interfaces: [], errors: [] };
 	const destination = compiled.enabled
 		? resolve_zones(config.destination_zone)
 		: { interfaces: [], errors: [] };
-	const signature = desired_signature(compiled, source.interfaces, destination.interfaces);
+	const signature = desired_signature(compiled, projection, source.interfaces, destination.interfaces);
 	let readiness_errors = [ ...source.errors, ...destination.errors ];
 	if (compiled.enabled && !length(source.interfaces))
 		push(readiness_errors, 'No source interfaces resolved; enforcement is inactive');
 	if (compiled.enabled && !length(destination.interfaces))
 		push(readiness_errors, 'No destination interfaces resolved; enforcement is inactive');
-	let errors = [ ...compiled.errors, ...readiness_errors ];
+	let errors = [ ...compiled.errors, ...projection.errors, ...readiness_errors ];
+	let warnings = [ ...compiled.warnings, ...projection.warnings ];
 	let apply = { ok: true, error: null };
 
 	if (force || signature != applied_signature)
-		apply = apply_nft(compiled, source.interfaces, destination.interfaces);
-
+		apply = apply_nft(compiled, projection, source.interfaces, destination.interfaces);
 	if (apply.ok) {
 		if (force || signature != applied_signature)
 			generation++;
@@ -200,14 +230,21 @@ function reconcile(reason, force) {
 	else
 		push(errors, apply.error);
 
-	const synchronized = apply.ok && !length(readiness_errors);
-	const state_error = apply.error ?? (length(readiness_errors) ? join('; ', readiness_errors) : null);
+	const configuration_ready = compiled.schema_supported && compiled.mode_valid;
+	const synchronized = apply.ok && configuration_ready && !length(readiness_errors);
+	const state_error = apply.error ??
+		(length(readiness_errors) ? join('; ', readiness_errors) :
+		 (!configuration_ready ? join('; ', compiled.errors) : null));
 
+	last_config = config;
 	last_compiled = compiled;
+	last_projection = projection;
 	state = {
 		running: true,
 		applied: synchronized,
 		enabled: compiled.enabled,
+		requested_enabled: compiled.requested_enabled,
+		schema_supported: compiled.schema_supported,
 		generation,
 		last_reason: reason ?? 'unknown',
 		last_attempt: epoch,
@@ -218,56 +255,104 @@ function reconcile(reason, force) {
 		mode: compiled.mode,
 		deny_action: compiled.deny_action,
 		default_verdict: compiled.default_verdict,
-		exception_count: compiled.enabled ? length(compiled.exceptions) : 0,
+		exception_verdict: compiled.exception_verdict,
+		identity_count: length(compiled.identities),
+		active_identity_count: count_active(compiled.identities),
+		binding_count: projection.binding_count,
+		exception_count: compiled.enabled ? length(projection.exceptions) : 0,
 		source_interfaces: source.interfaces,
 		destination_interfaces: destination.interfaces,
 		errors,
-		warnings: compiled.warnings,
+		warnings,
 	};
 
 	update_timer(config, compiled, epoch);
 	return state;
 }
 
-function device_inventory() {
-	// Use a separate connection for the nested synchronous lookup instead of
-	// re-entering the connection currently serving this ubus request.
+function observation_snapshot(config) {
 	const query = ubus.connect();
 	if (!query)
-		return { devices: [], clock: clock()[0], error: 'Unable to query LuCI host hints' };
+		return { observations: [], error: 'Unable to query LuCI host hints' };
 	const hints = query.call('luci-rpc', 'getHostHints', {}) ?? {};
 	query.disconnect();
-	const compiled = last_compiled ?? policy.compile(read_config(), clock()[0]);
-	let effective = {}, configured = {};
 
-	for (let client in compiled.clients) {
-		for (let mac in client.macs) {
-			effective[mac] = {
-				section: client.section,
-				policy: client.policy,
-				verdict: client.verdict,
-			};
-			configured[mac] = true;
-		}
-	}
-
-	let devices = [];
-	for (let raw_mac, hint in hints) {
-		const mac = policy.normalize_mac(raw_mac);
+	let owners = {};
+	for (let binding in config.bindings) {
+		const mac = binding.type == 'mac' ? model.normalize_mac(binding.value) : null;
 		if (!mac)
 			continue;
-		push(devices, {
-			mac,
+		owners[mac] ??= [];
+		push(owners[mac], binding.identity);
+	}
+
+	let observations = [];
+	for (let raw_mac, hint in hints) {
+		const mac = model.normalize_mac(raw_mac);
+		if (!mac)
+			continue;
+		push(observations, {
+			type: 'mac',
+			value: mac,
 			name: hint.name,
 			ipaddrs: hint.ipaddrs ?? [],
 			ip6addrs: hint.ip6addrs ?? [],
-			configured: !!configured[mac],
-			policy: effective[mac]?.policy ?? 'inherit',
-			verdict: effective[mac]?.verdict ?? compiled.default_verdict,
+			bound: !!length(owners[mac] ?? []),
+			identity_ids: unique_strings(owners[mac] ?? []),
+		});
+	}
+	return { observations, error: null };
+}
+
+function identity_inventory() {
+	const epoch = clock()[0];
+	const config = read_config();
+	const runtime = compile_runtime(config, epoch);
+	const observed = observation_snapshot(config);
+	let observation_by_mac = {}, binding_by_identity = {};
+	for (let observation in observed.observations)
+		observation_by_mac[observation.value] = observation;
+	for (let binding in runtime.projection.bindings) {
+		binding_by_identity[binding.identity_id] ??= [];
+		push(binding_by_identity[binding.identity_id], {
+			section: binding.section,
+			type: binding.type,
+			value: binding.value,
+			valid: binding.valid,
+			error: binding.error,
+			observed: !!observation_by_mac[binding.value],
 		});
 	}
 
-	return { devices, clock: clock()[0], error: null };
+	let identities = [];
+	for (let identity in runtime.compiled.identities) {
+		push(identities, {
+			id: identity.id,
+			name: identity.name,
+			activation: identity.activation,
+			verdict: identity.verdict,
+			effective_active: identity.effective_active,
+			reason: identity.reason,
+			schedule_active: identity.schedule_active,
+			next_transition: identity.next_transition,
+			bindings: binding_by_identity[identity.id] ?? [],
+		});
+	}
+	return {
+		identities,
+		mode: runtime.compiled.mode,
+		default_verdict: runtime.compiled.default_verdict,
+		exception_verdict: runtime.compiled.exception_verdict,
+		clock: epoch,
+		errors: [ ...runtime.compiled.errors, ...runtime.projection.errors ],
+		error: observed.error,
+	};
+}
+
+function observation_inventory() {
+	const config = read_config();
+	const observed = observation_snapshot(config);
+	return { observations: observed.observations, clock: clock()[0], error: observed.error };
 }
 
 uloop.init();
@@ -283,12 +368,17 @@ published = conn.publish('client_access', {
 	},
 	preview: {
 		call: function() {
-			const compiled = policy.compile(read_config(), clock()[0]);
-			return { compiled };
+			const epoch = clock()[0];
+			const config = read_config();
+			const runtime = compile_runtime(config, epoch);
+			return { compiled: runtime.compiled, projection: runtime.projection, clock: epoch };
 		},
 	},
-	devices: {
-		call: function() { return device_inventory(); },
+	identities: {
+		call: function() { return identity_inventory(); },
+	},
+	observations: {
+		call: function() { return observation_inventory(); },
 	},
 	reconcile: {
 		args: { reason: 'string' },

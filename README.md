@@ -1,41 +1,56 @@
 # luci-app-client-access
 
-`luci-app-client-access` is an OpenWrt/ImmortalWrt LuCI application for discovering known LAN clients and controlling whether each client may create new Internet-bound flows.
+An OpenWrt/ImmortalWrt LuCI application for discovering LAN clients and
+controlling their Internet access with firewall4/nftables.
 
-## Version 1 scope
+## Features
 
-- IPv4 and IPv6 forwarding through firewall4/nftables.
-- A global blacklist mode (allow by default) or whitelist mode (deny by default).
-- A separate global master switch which is off by default and bypasses both modes.
-- Per-device `inherit`, `always_allow`, `always_block`, `allow_during`, and `block_during` policies.
-- Multiple MAC addresses and multiple weekly schedule windows per logical device.
-- Best-effort names and addresses from LuCI host hints, which aggregate DHCP, neighbour, static-host, and related data.
-- One global scheduler and one runtime MAC exception set, regardless of the number of devices.
+- Discover LAN clients with best-effort names and IP addresses.
+- Create stable identities for the clients you want to manage.
+- Associate multiple MAC addresses with one identity.
+- Choose a global blacklist or whitelist policy.
+- Keep access control globally disabled until you are ready to enable it.
+- Activate an identity permanently or only during weekly time periods.
+- Use one or more periods per day, different periods on different weekdays, and
+  periods that cross midnight.
+- Control IPv4 and IPv6 forwarding without creating one nftables rule per
+  client.
 
-Version 1 deliberately does not implement bandwidth limiting, traffic accounting, unknown-device notifications, or immediate disconnection of existing sessions.
+## Global modes
 
-## Flow semantics
+Access control is disabled by default.
 
-The forward hook evaluates only conntrack `new` and `related` tuples. Existing and already offloaded flows are intentionally not removed or re-evaluated when a policy changes. A newly denied client can therefore retain an existing session until that conntrack entry expires.
-
-This boundary keeps the steady-state forwarding cost small and avoids flushing unrelated conntrack state. Immediate disconnect can be added later as an explicit, separate operation.
-
-When the global master switch is off, all runtime match, exception, and mode sets are emptied. The daemon remains available for device discovery and configuration, but no forwarding policy is enforced. The shipped UCI configuration sets this switch to off.
-
-## Policy model
-
-| Global mode | Default verdict | MAC exception set contains |
+| Mode | Unmanaged and inactive clients | Active identities |
 | --- | --- | --- |
-| `blacklist` | allow | clients currently denied |
-| `whitelist` | deny | clients currently allowed |
+| Blacklist | Allowed | Blocked |
+| Whitelist | Blocked | Allowed |
 
-Every enabled, non-inherited client policy is evaluated in userspace. Conflicting policies for the same MAC use deny-wins behavior. Disabled and inherited entries do not participate in conflict resolution.
+Changing the global mode reverses the meaning of every active identity.
 
-Scheduled policies fail closed for their affected clients when the system clock is earlier than 2020 or when a schedule is invalid. If firewall zones cannot be resolved, enforcement is globally deactivated by using empty interface sets and the runtime status reports the error; this avoids accidentally blocking every forwarded packet because of an interface configuration problem.
+## Identities and unknown clients
 
-## Schedule syntax
+The application separates discovered clients from identities:
 
-Each schedule entry has this form:
+- **Unknown Clients** are temporary observations which have not been assigned
+  to an identity. They follow the global default policy and are not scheduled.
+- **Managed Identities** are clients you have explicitly created and named.
+  Their MAC bindings and activation periods are persistent.
+
+From **Unknown Clients**, you can either create a new identity or bind the
+observed MAC to an existing identity. Private MAC addresses are never merged
+automatically.
+
+An identity can be:
+
+- **Inactive** — follow the global default policy.
+- **Always active** — always use the active-identity behavior for the selected
+  global mode.
+- **Active during schedule** — use active-identity behavior only while a weekly
+  period matches.
+
+## Weekly schedules
+
+Schedule entries use:
 
 ```text
 DAYS@HH:MM-HH:MM
@@ -44,69 +59,46 @@ DAYS@HH:MM-HH:MM
 Examples:
 
 ```text
+*@08:00-21:00
 mon,tue,wed,thu,fri@08:00-21:30
 sat,sun@09:00-23:00
-*@23:00-07:00
+mon@08:00-12:00
+mon@14:00-20:00
+fri,sat@22:00-07:00
 ```
 
-- Days use `mon` through `sun`; `*` means every day.
-- Multiple entries are combined as a union.
-- Crossing midnight is supported.
-- Equal start and end times mean the whole selected day.
-- The router's local timezone is used.
+- `*` means every day; otherwise use `mon` through `sun`.
+- Add multiple entries to combine several periods.
+- A period crossing midnight ends on the following day.
+- Times use the router's local timezone with one-minute resolution.
 
-## Runtime architecture
+## Usage
 
-`client-accessd` owns the runtime state:
+After installation, open:
 
-1. Read UCI as the source of truth.
-2. Evaluate every client against the current wall clock.
-3. Calculate the earliest transition across all schedules.
-4. Materialize the current exception MACs, source interfaces, destination interfaces, and mode into named nftables sets using one atomic nft transaction.
-5. Arm one uloop timer using monotonic elapsed time.
-
-The timer wakes at the earlier of the next schedule transition or the configured safety interval. The default 60-second safety wakeup also performs a full reconcile, which repairs runtime set contents after an out-of-band firewall4 reload and handles manual wall-clock changes. NTP and interface hotplug events request an immediate reconcile.
-
-The packet path is fixed-size: an interface match and jump, a mode-set lookup, and one MAC-set lookup for new or related tuples. No per-client nft rule is created, and there is no per-packet logging.
-
-## UCI example
-
-```uci
-config client_access 'main'
-	option enabled '1'
-	option mode 'blacklist'
-	option deny_action 'reject'
-	list source_zone 'lan'
-	list destination_zone 'wan'
-	option safety_interval '60'
-
-config device
-	option name 'Tablet'
-	option enabled '1'
-	list mac '02:00:00:00:00:01'
-	option policy 'allow_during'
-	list schedule 'mon,tue,wed,thu,fri@08:00-21:30'
+```text
+Network → Client Access
 ```
 
-## Remote build and validation
+1. Review **Unknown Clients** and create or assign identities.
+2. Configure identity activation under **Identities & Policy**.
+3. Select blacklist or whitelist mode.
+4. Review the displayed mode-dependent behavior.
+5. Enable global enforcement and apply the configuration.
 
-All repository build and validation jobs run in GitHub-hosted Linux environments. The workflow contains:
+## Current limitations
 
-- JSON, shell, LuCI JavaScript, and nftables syntax checks.
-- Policy unit tests using an official ucode checkout built on the remote runner.
-- An OpenWrt SDK package build using `openwrt/gh-action-sdk`.
-- An ImmortalWrt SDK package build using `immortalwrt/gh-action-sdk`.
-- Package and build-log artifacts retained for inspection.
+- Policy changes apply to new and related flows. Existing or already offloaded
+  flows are not disconnected.
+- Bandwidth limiting, quota, traffic accounting, private-MAC correlation, and
+  unknown-client notifications are not implemented.
+- Names and addresses are best-effort discovery information and may be stale or
+  incomplete.
 
-The SDK jobs currently use the rolling `x86_64` SDK as a portability baseline. Release-specific and hardware-target matrices can be added once the supported release floor and target devices are fixed.
+## Compatibility
 
-SDK compilation proves package construction and dependency compatibility. End-to-end validation of ubus, procd, firewall reload behavior, and forwarding still requires an isolated x86_64 router VM or an explicitly authorized target gateway.
-
-## Installation notes
-
-Installing the package enables `client-accessd`, reloads firewall4 so its automatic nftables includes are present, and restarts rpcd so the LuCI menu and ACLs are visible. Enforcement remains disabled until enabled in **Network → Client Access → Policies**.
-
-The firewall4 option `auto_includes` must remain enabled because the application installs fragments under `/usr/share/nftables.d/`.
+The application currently targets firewall4/nftables on OpenWrt and
+ImmortalWrt. The firewall4 `auto_includes` option must remain enabled.
 
 ## License
 

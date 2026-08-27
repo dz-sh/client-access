@@ -1,4 +1,5 @@
 config client_access 'main'
+	option schema_version '2'
 	option enabled '0'
 	option mode 'blacklist'
 	option deny_action 'reject'
@@ -6,12 +7,16 @@ config client_access 'main'
 	list destination_zone 'wan'
 	option safety_interval '60'
 
-# A device may contain multiple MAC addresses and multiple schedule windows.
-# Window syntax: mon,tue,wed@08:00-21:30 or *@23:00-07:00.
+# Identities are stable, user-managed objects. Their named UCI section is the
+# identity ID. Bindings carry nftables selectors but never carry policy.
 #
-# config device
+# config identity 'identity_example_tablet'
 #	option name 'Example tablet'
-#	option enabled '1'
-#	list mac '02:00:00:00:00:01'
-#	option policy 'allow_during'
+#	option activation 'active_during'
 #	list schedule 'mon,tue,wed,thu,fri@08:00-21:30'
+#	list schedule 'sat,sun@09:00-23:00'
+#
+# config binding
+#	option identity 'identity_example_tablet'
+#	option type 'mac'
+#	option value '02:00:00:00:00:01'

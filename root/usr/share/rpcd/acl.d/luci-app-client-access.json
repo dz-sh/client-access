@@ -1,9 +1,9 @@
 {
 	"luci-app-client-access": {
-		"description": "View LAN clients and Internet access policies",
+		"description": "View LAN observations, identities, bindings, and Internet access policy",
 		"read": {
 			"ubus": {
-				"client_access": [ "status", "preview", "devices" ]
+				"client_access": [ "status", "preview", "identities", "observations" ]
 			},
 			"uci": [ "client_access", "network", "firewall", "dhcp" ]
 		},

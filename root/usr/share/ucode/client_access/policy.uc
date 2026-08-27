@@ -32,13 +32,6 @@ function parse_time(hour, minute) {
 		? hour * 60 + minute : null;
 }
 
-export function normalize_mac(value) {
-	if (value == null)
-		return null;
-	const mac = lc(trim('' + value));
-	return match(mac, /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/) ? mac : null;
-}
-
 export function parse_window(value) {
 	const spec = lc(trim('' + (value ?? '')));
 	const m = match(spec, /^([a-z*,]+)@([0-9]{2}):([0-9]{2})-([0-9]{2}):([0-9]{2})$/);
@@ -118,114 +111,135 @@ function next_boundary(intervals, minute) {
 	return best;
 }
 
-function device_verdict(device, default_verdict, epoch, clock_valid) {
-	const policy = device.policy ?? 'inherit';
-	const scheduled = policy == 'allow_during' || policy == 'block_during';
-	let errors = [], active = null, next_epoch = null;
+function fail_closed(default_verdict, schedule_active, next_epoch, reason, errors) {
+	return {
+		verdict: 'deny',
+		effective_active: default_verdict != 'deny',
+		schedule_active,
+		next_epoch,
+		reason,
+		errors,
+	};
+}
 
-	if (!flag(device.enabled, true) || policy == 'inherit')
-		return { verdict: default_verdict, active, next_epoch, errors, applies: false };
-	if (policy == 'always_allow')
-		return { verdict: 'allow', active, next_epoch, errors, applies: true };
-	if (policy == 'always_block')
-		return { verdict: 'deny', active, next_epoch, errors, applies: true };
-	if (!scheduled) {
-		push(errors, `Unknown policy '${policy}'`);
-		return { verdict: 'deny', active, next_epoch, errors, applies: true };
+function compile_identity(identity, default_verdict, exception_verdict, epoch, clock_valid) {
+	const activation = identity.activation ?? 'inactive';
+	let schedule_active = null, next_epoch = null, errors = [];
+
+	if (activation == 'inactive') {
+		return {
+			verdict: default_verdict,
+			effective_active: false,
+			schedule_active,
+			next_epoch,
+			reason: 'inactive',
+			errors,
+		};
 	}
 
-	const windows = compile_windows(device.schedule);
+	if (activation == 'always_active') {
+		return {
+			verdict: exception_verdict,
+			effective_active: true,
+			schedule_active,
+			next_epoch,
+			reason: 'always_active',
+			errors,
+		};
+	}
+
+	if (activation != 'active_during') {
+		push(errors, `Unknown activation '${activation}'`);
+		return fail_closed(default_verdict, schedule_active, next_epoch, 'invalid_activation', errors);
+	}
+
+	const windows = compile_windows(identity.schedule);
 	for (let error in windows.errors)
 		push(errors, error);
+	if (!length(windows.intervals))
+		push(errors, 'Active-during identity has no valid schedule windows');
+
 	if (!clock_valid) {
-		push(errors, 'Clock is not valid; scheduled policy is fail-closed');
-		return { verdict: 'deny', active, next_epoch, errors, applies: true };
+		push(errors, 'Clock is not valid; scheduled activation is fail-closed');
+		return fail_closed(default_verdict, schedule_active, next_epoch, 'invalid_clock', errors);
 	}
-	if (!length(windows.intervals) || length(windows.errors)) {
-		if (!length(windows.intervals))
-			push(errors, 'Scheduled policy has no valid windows');
-		return { verdict: 'deny', active, next_epoch, errors, applies: true };
-	}
+	if (length(errors))
+		return fail_closed(default_verdict, schedule_active, next_epoch, 'invalid_schedule', errors);
 
 	const tm = localtime(epoch);
 	const minute = weekly_minute(tm);
-	active = schedule_state(windows.intervals, minute);
+	schedule_active = schedule_state(windows.intervals, minute);
 	const delta = next_boundary(windows.intervals, minute);
 	if (delta != null)
 		next_epoch = epoch - tm.sec + delta * 60;
 
 	return {
-		verdict: policy == 'allow_during'
-			? (active ? 'allow' : 'deny')
-			: (active ? 'deny' : 'allow'),
-		active,
+		verdict: schedule_active ? exception_verdict : default_verdict,
+		effective_active: schedule_active,
+		schedule_active,
 		next_epoch,
+		reason: schedule_active ? 'schedule_match' : 'schedule_miss',
 		errors,
-		applies: true,
 	};
 }
 
 export function compile(config, epoch) {
 	epoch ??= clock()[0];
+	const schema_supported = '' + (config.schema_version ?? '') == '2';
+	const requested_enabled = flag(config.enabled, false);
+	const mode_valid = config.mode == 'blacklist' || config.mode == 'whitelist';
 	const mode = config.mode == 'whitelist' ? 'whitelist' : 'blacklist';
 	const default_verdict = mode == 'whitelist' ? 'deny' : 'allow';
+	const exception_verdict = mode == 'whitelist' ? 'allow' : 'deny';
 	const clock_valid = epoch >= CLOCK_VALID_AFTER;
-	let errors = [], warnings = [], clients = [], verdicts = {}, next_transition = null;
+	let errors = [], warnings = [], identities = [], next_transition = null;
+	let seen_ids = {};
 
-	for (let device in (config.devices ?? [])) {
-		const result = device_verdict(device, default_verdict, epoch, clock_valid);
-		let valid_macs = [];
-		for (let raw_mac in as_list(device.mac)) {
-			const mac = normalize_mac(raw_mac);
-			if (!mac) {
-				push(errors, `${device.name ?? device.section ?? 'device'}: invalid MAC '${raw_mac}'`);
-				continue;
-			}
-			push(valid_macs, mac);
-			if (!result.applies)
-				continue;
+	if (!schema_supported)
+		push(errors, `Unsupported configuration schema '${config.schema_version ?? 'missing'}'`);
+	if (!mode_valid)
+		push(errors, `Unknown global mode '${config.mode ?? 'missing'}'`);
 
-			if (verdicts[mac] && verdicts[mac] != result.verdict) {
-				push(warnings, `${mac} has conflicting policies; deny wins`);
-				verdicts[mac] = 'deny';
-			}
-			else
-				verdicts[mac] = result.verdict;
-		}
+	for (let identity in (config.identities ?? [])) {
+		const id = trim('' + (identity.id ?? identity.section ?? ''));
+		if (!length(id))
+			push(errors, 'Identity has no stable ID');
+		else if (seen_ids[id])
+			push(errors, `Duplicate identity ID '${id}'`);
+		else
+			seen_ids[id] = true;
 
+		const result = compile_identity(identity, default_verdict, exception_verdict, epoch, clock_valid);
 		for (let error in result.errors)
-			push(errors, `${device.name ?? device.section ?? 'device'}: ${error}`);
-		if (result.applies && !length(valid_macs))
-			push(errors, `${device.name ?? device.section ?? 'device'}: active policy has no valid MAC address`);
+			push(errors, `${identity.name ?? id ?? 'identity'}: ${error}`);
 		if (result.next_epoch != null &&
 		    (next_transition == null || result.next_epoch < next_transition))
 			next_transition = result.next_epoch;
 
-		push(clients, {
-			section: device.section,
-			name: device.name,
-			macs: valid_macs,
-			policy: device.policy ?? 'inherit',
+		push(identities, {
+			id,
+			section: identity.section,
+			name: identity.name ?? id,
+			activation: identity.activation ?? 'inactive',
 			verdict: result.verdict,
-			schedule_active: result.active,
+			effective_active: result.effective_active,
+			reason: result.reason,
+			schedule_active: result.schedule_active,
 			next_transition: result.next_epoch,
 		});
 	}
 
-	let exceptions = [];
-	for (let mac, verdict in verdicts)
-		if (verdict != default_verdict)
-			push(exceptions, mac);
-	sort(exceptions);
-
 	return {
-		enabled: flag(config.enabled, false),
+		schema_supported,
+		mode_valid,
+		requested_enabled,
+		enabled: requested_enabled && schema_supported && mode_valid,
 		mode,
 		deny_action: config.deny_action == 'drop' ? 'drop' : 'reject',
 		default_verdict,
+		exception_verdict,
 		clock_valid,
-		exceptions,
-		clients,
+		identities,
 		next_transition,
 		errors,
 		warnings,

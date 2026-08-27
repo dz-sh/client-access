@@ -313,6 +313,7 @@ function identity_inventory() {
 	for (let observation in observed.observations)
 		observation_by_mac[observation.value] = observation;
 	for (let binding in runtime.projection.bindings) {
+		const observation = observation_by_mac[binding.value];
 		binding_by_identity[binding.identity_id] ??= [];
 		push(binding_by_identity[binding.identity_id], {
 			section: binding.section,
@@ -320,7 +321,10 @@ function identity_inventory() {
 			value: binding.value,
 			valid: binding.valid,
 			error: binding.error,
-			observed: !!observation_by_mac[binding.value],
+			observed: !!observation,
+			observed_name: observation ? observation.name : null,
+			ipaddrs: observation ? observation.ipaddrs : [],
+			ip6addrs: observation ? observation.ip6addrs : [],
 		});
 	}
 

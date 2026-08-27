@@ -3,26 +3,11 @@
 		"title": "Client Access",
 		"order": 65,
 		"action": {
-			"type": "firstchild"
+			"type": "view",
+			"path": "client-access/policies"
 		},
 		"depends": {
 			"acl": [ "luci-app-client-access" ]
-		}
-	},
-	"admin/network/client-access/devices": {
-		"title": "Unknown Clients",
-		"order": 10,
-		"action": {
-			"type": "view",
-			"path": "client-access/devices"
-		}
-	},
-	"admin/network/client-access/policies": {
-		"title": "Identities & Policy",
-		"order": 20,
-		"action": {
-			"type": "view",
-			"path": "client-access/policies"
 		}
 	}
 }

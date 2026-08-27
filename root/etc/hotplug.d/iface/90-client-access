@@ -1,0 +1,4 @@
+#!/bin/sh
+
+[ "$ACTION" = ifup ] || [ "$ACTION" = ifupdate ] || [ "$ACTION" = ifdown ] || exit 0
+ubus call client_access reconcile "{\"reason\":\"iface-$ACTION\"}" >/dev/null 2>&1 || true

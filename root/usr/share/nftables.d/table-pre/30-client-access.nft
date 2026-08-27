@@ -1,0 +1,46 @@
+# Managed by luci-app-client-access. Runtime contents are reconciled by client-accessd.
+set client_access_exceptions {
+	type ether_addr
+	policy performance
+}
+
+set client_access_sources {
+	type ifname
+	policy performance
+}
+
+set client_access_destinations {
+	type ifname
+	policy performance
+}
+
+set client_access_whitelist_mode {
+	type nf_proto
+	policy performance
+}
+
+set client_access_drop_mode {
+	type nf_proto
+	policy performance
+}
+
+chain client_access_dispatch {
+	meta nfproto @client_access_whitelist_mode jump client_access_whitelist
+	jump client_access_blacklist
+}
+
+chain client_access_blacklist {
+	ether saddr @client_access_exceptions jump client_access_deny
+	return
+}
+
+chain client_access_whitelist {
+	ether saddr @client_access_exceptions return
+	jump client_access_deny
+}
+
+chain client_access_deny {
+	meta nfproto @client_access_drop_mode drop
+	meta l4proto tcp reject with tcp reset
+	reject with icmpx type admin-prohibited
+}

@@ -1,0 +1,165 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source-checks:
+    name: Remote source checks
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out client-access
+        uses: actions/checkout@v6
+
+      - name: Install nftables for remote syntax checking
+        run: sudo apt-get update && sudo apt-get install --yes nftables
+
+      - name: Check JSON and shell syntax
+        shell: bash
+        run: |
+          find root/usr/share/luci/menu.d root/usr/share/rpcd/acl.d -name '*.json' -print0 \
+            | xargs -0 -n1 jq empty
+          find root/etc -type f \( -path '*/init.d/*' -o -path '*/hotplug.d/*' \) -print0 \
+            | xargs -0 -n1 sh -n
+
+      - name: Check the generated nftables fragment
+        shell: bash
+        run: |
+          {
+            echo 'table inet fw4 {'
+            cat root/usr/share/nftables.d/table-pre/30-client-access.nft
+            echo 'chain forward {'
+            echo 'type filter hook forward priority filter; policy accept;'
+            cat root/usr/share/nftables.d/chain-pre/forward/30-client-access.nft
+            echo '}'
+            echo '}'
+          } > "${RUNNER_TEMP}/client-access.nft"
+          sudo nft --check --file "${RUNNER_TEMP}/client-access.nft"
+
+      - name: Fetch the official LuCI tree
+        run: git clone --depth=1 https://github.com/openwrt/luci.git "${RUNNER_TEMP}/luci"
+
+      - name: Check LuCI JavaScript
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/luci/applications/luci-app-client-access"
+          cp -a htdocs root Makefile "${RUNNER_TEMP}/luci/applications/luci-app-client-access/"
+          cd "${RUNNER_TEMP}/luci"
+          npm install --ignore-scripts
+          npx eslint applications/luci-app-client-access/htdocs/luci-static/resources/view/client-access/*.js
+
+  policy-tests:
+    name: Remote ucode policy tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out client-access
+        uses: actions/checkout@v6
+
+      - name: Install ucode build dependencies
+        run: sudo apt-get update && sudo apt-get install --yes build-essential cmake libjson-c-dev pkg-config
+
+      - name: Build the official ucode interpreter
+        shell: bash
+        run: |
+          git clone --depth=1 https://github.com/jow-/ucode.git "${RUNNER_TEMP}/ucode-src"
+          cmake \
+            -S "${RUNNER_TEMP}/ucode-src" \
+            -B "${RUNNER_TEMP}/ucode-build" \
+            -DUBUS_SUPPORT=OFF \
+            -DUCI_SUPPORT=OFF \
+            -DULOOP_SUPPORT=OFF
+          cmake --build "${RUNNER_TEMP}/ucode-build" --parallel 2
+
+      - name: Run policy tests
+        env:
+          TZ: UTC
+        run: >-
+          "${RUNNER_TEMP}/ucode-build/ucode"
+          -L "${GITHUB_WORKSPACE}/root/usr/share/ucode"
+          "${GITHUB_WORKSPACE}/tests/policy.uc"
+
+      - name: Compile-check the daemon with stub target modules
+        run: >-
+          "${RUNNER_TEMP}/ucode-build/ucode"
+          -c
+          -o "${RUNNER_TEMP}/client-accessd.ucb"
+          -L "${GITHUB_WORKSPACE}/tests/stubs"
+          -L "${GITHUB_WORKSPACE}/root/usr/share/ucode"
+          "${GITHUB_WORKSPACE}/root/usr/sbin/client-accessd"
+
+  openwrt-package:
+    name: OpenWrt SDK package
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out client-access
+        uses: actions/checkout@v6
+
+      - name: Stage package as an OpenWrt feed
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/client-access-feed/luci-app-client-access"
+          mkdir -p "${RUNNER_TEMP}/openwrt-artifacts"
+          rsync -a --exclude '.git' --exclude '.github' ./ \
+            "${RUNNER_TEMP}/client-access-feed/luci-app-client-access/"
+
+      - name: Build with the official OpenWrt SDK
+        uses: openwrt/gh-action-sdk@main
+        env:
+          ARCH: x86_64
+          ARTIFACTS_DIR: ${{ runner.temp }}/openwrt-artifacts
+          BUILD_LOG: 1
+          FEED_DIR: ${{ runner.temp }}/client-access-feed
+          PACKAGES: luci-app-client-access
+          V: s
+
+      - name: Upload OpenWrt packages and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-x86_64
+          path: ${{ runner.temp }}/openwrt-artifacts
+          if-no-files-found: error
+          retention-days: 14
+
+  immortalwrt-package:
+    name: ImmortalWrt SDK package
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out client-access
+        uses: actions/checkout@v6
+
+      - name: Stage package as an ImmortalWrt feed
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/client-access-feed/luci-app-client-access"
+          mkdir -p "${RUNNER_TEMP}/immortalwrt-artifacts"
+          rsync -a --exclude '.git' --exclude '.github' ./ \
+            "${RUNNER_TEMP}/client-access-feed/luci-app-client-access/"
+
+      - name: Build with the official ImmortalWrt SDK
+        uses: immortalwrt/gh-action-sdk@master
+        env:
+          ARCH: x86_64
+          ARTIFACTS_DIR: ${{ runner.temp }}/immortalwrt-artifacts
+          BUILD_LOG: 1
+          FEED_DIR: ${{ runner.temp }}/client-access-feed
+          PACKAGES: luci-app-client-access
+          V: s
+
+      - name: Upload ImmortalWrt packages and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-x86_64
+          path: ${{ runner.temp }}/immortalwrt-artifacts
+          if-no-files-found: error
+          retention-days: 14

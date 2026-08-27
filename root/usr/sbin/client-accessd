@@ -1,0 +1,306 @@
+#!/usr/bin/ucode
+// SPDX-License-Identifier: Apache-2.0
+
+'use strict';
+
+import { cursor } from 'uci';
+import { popen } from 'fs';
+import * as ubus from 'ubus';
+import * as uloop from 'uloop';
+import * as policy from 'client_access.policy';
+
+const NFT = '/usr/sbin/nft';
+const FW4 = '/sbin/fw4';
+
+let timer, published;
+let generation = 0;
+let applied_signature = null;
+let last_compiled = null;
+let state = {
+	running: true,
+	applied: false,
+	generation: 0,
+	last_reason: 'startup',
+	last_attempt: null,
+	last_success: null,
+	last_error: null,
+	next_transition: null,
+	clock_valid: false,
+	mode: null,
+	default_verdict: null,
+	exception_count: 0,
+	source_interfaces: [],
+	destination_interfaces: [],
+	errors: [],
+	warnings: [],
+};
+
+function as_list(value) {
+	if (value == null)
+		return [];
+	return type(value) == 'array' ? value : [ value ];
+}
+
+function read_config() {
+	const uci = cursor();
+	let config = {
+		enabled: uci.get('client_access', 'main', 'enabled'),
+		mode: uci.get('client_access', 'main', 'mode'),
+		deny_action: uci.get('client_access', 'main', 'deny_action'),
+		source_zone: as_list(uci.get('client_access', 'main', 'source_zone')),
+		destination_zone: as_list(uci.get('client_access', 'main', 'destination_zone')),
+		safety_interval: uci.get('client_access', 'main', 'safety_interval') ?? 60,
+		devices: [],
+	};
+
+	uci.foreach('client_access', 'device', function(s) {
+		push(config.devices, {
+			section: s['.name'],
+			name: s.name ?? s['.name'],
+			enabled: s.enabled,
+			mac: s.mac,
+			policy: s.policy,
+			schedule: s.schedule,
+		});
+	});
+	uci.unload();
+	return config;
+}
+
+function run_capture(argv) {
+	const proc = popen(argv, 'r');
+	if (!proc)
+		return { code: null, output: '' };
+	const output = proc.read('all') ?? '';
+	return { code: proc.close(), output };
+}
+
+function unique_strings(values) {
+	let result = [], seen = {};
+	for (let value in values) {
+		value = trim('' + value);
+		if (length(value) && !seen[value]) {
+			seen[value] = true;
+			push(result, value);
+		}
+	}
+	sort(result);
+	return result;
+}
+
+function resolve_zones(zones) {
+	let interfaces = [], errors = [];
+	for (let zone in zones) {
+		zone = trim('' + zone);
+		if (!length(zone))
+			continue;
+
+		const result = run_capture([ FW4, 'zone', zone ]);
+		if (result.code != 0) {
+			push(errors, `Unable to resolve firewall zone '${zone}'`);
+			continue;
+		}
+
+		for (let ifname in split(trim(result.output), /\s+/))
+			if (length(ifname))
+				push(interfaces, ifname);
+	}
+
+	return { interfaces: unique_strings(interfaces), errors };
+}
+
+function nft_quote(value) {
+	return '"' + replace(replace(value, /\\/g, '\\\\'), /"/g, '\\"') + '"';
+}
+
+function nft_elements(name, values, formatter) {
+	let script = `flush set inet fw4 ${name}\n`;
+	if (length(values))
+		script += `add element inet fw4 ${name} { ${join(', ', map(values, formatter))} }\n`;
+	return script;
+}
+
+function desired_signature(compiled, sources, destinations) {
+	if (!compiled.enabled)
+		return sprintf('%J', { enabled: false });
+
+	return sprintf('%J', {
+		enabled: compiled.enabled,
+		mode: compiled.mode,
+		deny_action: compiled.deny_action,
+		exceptions: compiled.exceptions,
+		sources,
+		destinations,
+	});
+}
+
+function apply_nft(compiled, sources, destinations) {
+	let exceptions = compiled.exceptions;
+	if (!compiled.enabled) {
+		exceptions = [];
+		sources = [];
+		destinations = [];
+	}
+
+	let script = '';
+	script += nft_elements('client_access_exceptions', exceptions, value => value);
+	script += nft_elements('client_access_sources', sources, nft_quote);
+	script += nft_elements('client_access_destinations', destinations, nft_quote);
+	script += nft_elements('client_access_whitelist_mode',
+		compiled.enabled && compiled.mode == 'whitelist' ? [ 'ipv4', 'ipv6' ] : [], value => value);
+	script += nft_elements('client_access_drop_mode',
+		compiled.enabled && compiled.deny_action == 'drop' ? [ 'ipv4', 'ipv6' ] : [], value => value);
+
+	const proc = popen([ NFT, '-f', '-' ], 'w');
+	if (!proc)
+		return { ok: false, error: 'Unable to start nft' };
+	if (proc.write(script) != length(script)) {
+		proc.close();
+		return { ok: false, error: 'Unable to write complete nft transaction' };
+	}
+
+	const code = proc.close();
+	return code == 0
+		? { ok: true, error: null }
+		: { ok: false, error: `nft transaction failed with exit code ${code}` };
+}
+
+function update_timer(config, compiled, epoch) {
+	const delay = policy.safety_delay_ms(compiled, epoch, config.safety_interval);
+	timer.set(delay);
+}
+
+function reconcile(reason, force) {
+	const epoch = clock()[0];
+	const config = read_config();
+	const compiled = policy.compile(config, epoch);
+	const source = compiled.enabled
+		? resolve_zones(config.source_zone)
+		: { interfaces: [], errors: [] };
+	const destination = compiled.enabled
+		? resolve_zones(config.destination_zone)
+		: { interfaces: [], errors: [] };
+	const signature = desired_signature(compiled, source.interfaces, destination.interfaces);
+	let readiness_errors = [ ...source.errors, ...destination.errors ];
+	if (compiled.enabled && !length(source.interfaces))
+		push(readiness_errors, 'No source interfaces resolved; enforcement is inactive');
+	if (compiled.enabled && !length(destination.interfaces))
+		push(readiness_errors, 'No destination interfaces resolved; enforcement is inactive');
+	let errors = [ ...compiled.errors, ...readiness_errors ];
+	let apply = { ok: true, error: null };
+
+	if (force || signature != applied_signature)
+		apply = apply_nft(compiled, source.interfaces, destination.interfaces);
+
+	if (apply.ok) {
+		if (force || signature != applied_signature)
+			generation++;
+		applied_signature = signature;
+	}
+	else
+		push(errors, apply.error);
+
+	const synchronized = apply.ok && !length(readiness_errors);
+	const state_error = apply.error ?? (length(readiness_errors) ? join('; ', readiness_errors) : null);
+
+	last_compiled = compiled;
+	state = {
+		running: true,
+		applied: synchronized,
+		enabled: compiled.enabled,
+		generation,
+		last_reason: reason ?? 'unknown',
+		last_attempt: epoch,
+		last_success: synchronized ? epoch : state.last_success,
+		last_error: state_error,
+		next_transition: compiled.next_transition,
+		clock_valid: compiled.clock_valid,
+		mode: compiled.mode,
+		deny_action: compiled.deny_action,
+		default_verdict: compiled.default_verdict,
+		exception_count: compiled.enabled ? length(compiled.exceptions) : 0,
+		source_interfaces: source.interfaces,
+		destination_interfaces: destination.interfaces,
+		errors,
+		warnings: compiled.warnings,
+	};
+
+	update_timer(config, compiled, epoch);
+	return state;
+}
+
+function device_inventory() {
+	// Use a separate connection for the nested synchronous lookup instead of
+	// re-entering the connection currently serving this ubus request.
+	const query = ubus.connect();
+	if (!query)
+		return { devices: [], clock: clock()[0], error: 'Unable to query LuCI host hints' };
+	const hints = query.call('luci-rpc', 'getHostHints', {}) ?? {};
+	query.disconnect();
+	const compiled = last_compiled ?? policy.compile(read_config(), clock()[0]);
+	let effective = {}, configured = {};
+
+	for (let client in compiled.clients) {
+		for (let mac in client.macs) {
+			effective[mac] = {
+				section: client.section,
+				policy: client.policy,
+				verdict: client.verdict,
+			};
+			configured[mac] = true;
+		}
+	}
+
+	let devices = [];
+	for (let raw_mac, hint in hints) {
+		const mac = policy.normalize_mac(raw_mac);
+		if (!mac)
+			continue;
+		push(devices, {
+			mac,
+			name: hint.name,
+			ipaddrs: hint.ipaddrs ?? [],
+			ip6addrs: hint.ip6addrs ?? [],
+			configured: !!configured[mac],
+			policy: effective[mac]?.policy ?? 'inherit',
+			verdict: effective[mac]?.verdict ?? compiled.default_verdict,
+		});
+	}
+
+	return { devices, clock: clock()[0], error: null };
+}
+
+uloop.init();
+const conn = ubus.connect();
+if (!conn) {
+	warn('client-accessd: unable to connect to ubus\n');
+	exit(1);
+}
+
+published = conn.publish('client_access', {
+	status: {
+		call: function() { return state; },
+	},
+	preview: {
+		call: function() {
+			const compiled = policy.compile(read_config(), clock()[0]);
+			return { compiled };
+		},
+	},
+	devices: {
+		call: function() { return device_inventory(); },
+	},
+	reconcile: {
+		args: { reason: 'string' },
+		call: function(req, msg) { return reconcile(msg.reason ?? 'ubus', true); },
+	},
+});
+
+if (!published) {
+	warn('client-accessd: unable to publish ubus object\n');
+	exit(1);
+}
+
+// The safety wakeup also repairs runtime set loss after an out-of-band fw4 reload.
+timer = uloop.timer(1, function() { reconcile('timer', true); });
+uloop.run();

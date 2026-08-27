@@ -1,0 +1,2 @@
+# Only new and related tuples are gated. Established/offloaded flows are intentionally untouched.
+ct state { new, related } iifname @client_access_sources oifname @client_access_destinations jump client_access_dispatch

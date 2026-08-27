@@ -1,0 +1,17 @@
+config client_access 'main'
+	option enabled '0'
+	option mode 'blacklist'
+	option deny_action 'reject'
+	list source_zone 'lan'
+	list destination_zone 'wan'
+	option safety_interval '60'
+
+# A device may contain multiple MAC addresses and multiple schedule windows.
+# Window syntax: mon,tue,wed@08:00-21:30 or *@23:00-07:00.
+#
+# config device
+#	option name 'Example tablet'
+#	option enabled '1'
+#	list mac '02:00:00:00:00:01'
+#	option policy 'allow_during'
+#	list schedule 'mon,tue,wed,thu,fri@08:00-21:30'

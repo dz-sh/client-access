@@ -392,6 +392,8 @@ jobs:
             .flow_app_allow_verdicts >= 1 and
             .packet_app_deny_verdicts >= 1 and
             .classification_admission_denied >= 1 and
+            .flows_unclassified_load_shed >= 1 and
+            .flows_unclassified >= .flows_unclassified_load_shed and
             .policy_reevaluations >= 1
           ' "${RUNNER_TEMP}/client-access-bpf-status.json"
 

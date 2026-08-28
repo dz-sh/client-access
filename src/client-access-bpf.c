@@ -618,17 +618,51 @@ static __always_inline bool ca_try_terminal(const struct ca_config *config,
 
 static __always_inline int ca_load_shed(struct __sk_buff *skb,
 									 const struct ca_config *config,
-									 __u32 subject_id)
+									 const struct ca_flow_key *key,
+									 __u32 subject_id, __u64 now)
 {
-	__u8 verdict = ca_policy_verdict(config, subject_id, CA_CLASS_UNCLASSIFIED);
+	struct ca_flow_state terminal = {
+		.first_seen_ns = now,
+		.last_seen_ns = now,
+		.app_policy_generation = config->app_policy_generation,
+		.classifier_generation = config->classifier_generation,
+		.class_id = CA_CLASS_UNCLASSIFIED,
+		.classification_state = CA_FLOW_UNCLASSIFIED_FINAL,
+	};
+	struct ca_flow_state *existing;
 
+	terminal.app_verdict = ca_policy_verdict(config, subject_id,
+										   CA_CLASS_UNCLASSIFIED);
 	ca_stat_inc(CA_STAT_CLASSIFICATION_ADMISSION_DENIED);
-	ca_stat_inc(CA_STAT_FLOWS_UNCLASSIFIED_LOAD_SHED);
-	if (verdict == CA_VERDICT_DENY)
-		ca_stat_inc(CA_STAT_FLOW_APP_DENY_VERDICTS);
-	else
-		ca_stat_inc(CA_STAT_FLOW_APP_ALLOW_VERDICTS);
-	return ca_emit_app_verdict(skb, verdict);
+	if (!bpf_map_update_elem(&ca_flows, key, &terminal, BPF_NOEXIST)) {
+		ca_stat_inc(CA_STAT_FLOWS_TOTAL);
+		ca_stat_inc(CA_STAT_FLOWS_UNCLASSIFIED_LOAD_SHED);
+		ca_record_terminal(&terminal, false);
+		return ca_emit_app_verdict(skb, terminal.app_verdict);
+	}
+
+	/* A concurrent CPU may have admitted the same flow after our initial
+	 * lookup. Reuse that state instead of misreporting a full map.
+	 */
+	existing = bpf_map_lookup_elem(&ca_flows, key);
+	if (existing) {
+		existing->last_seen_ns = now;
+		if (existing->classification_state == CA_FLOW_PENDING)
+			return ca_emit_app_verdict(skb, config->provisional_app_verdict);
+		if (existing->app_policy_generation != config->app_policy_generation) {
+			existing->app_verdict = ca_policy_verdict(config, subject_id,
+											existing->class_id);
+			existing->app_policy_generation = config->app_policy_generation;
+			ca_stat_inc(CA_STAT_POLICY_REEVALUATIONS);
+		}
+		return ca_emit_app_verdict(skb, existing->app_verdict);
+	}
+
+	/* A fixed-capacity HASH map deliberately refuses new state instead of
+	 * evicting an active terminal flow and reopening its leakage window.
+	 */
+	ca_stat_inc(CA_STAT_FLOW_MAP_FULL);
+	return ca_emit_app_verdict(skb, terminal.app_verdict);
 }
 
 SEC("tc")
@@ -692,7 +726,7 @@ int ca_ingress(struct __sk_buff *skb)
 
 	if (!ca_admit_classification(config, *subject_id, now) ||
 	    !ca_pending_reserve(config->max_pending_entries))
-		return ca_load_shed(skb, config, *subject_id);
+		return ca_load_shed(skb, config, &flow_key, *subject_id, now);
 
 	initial.first_seen_ns = now;
 	initial.last_seen_ns = now;
@@ -718,7 +752,7 @@ int ca_ingress(struct __sk_buff *skb)
 		ca_pending_release();
 		bpf_map_delete_elem(&ca_flows, &flow_key);
 		ca_stat_inc(CA_STAT_FLOW_MAP_FULL);
-		return ca_load_shed(skb, config, *subject_id);
+		return ca_load_shed(skb, config, &flow_key, *subject_id, now);
 	}
 	if (terminal) {
 		ca_pending_release();

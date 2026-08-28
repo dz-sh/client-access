@@ -739,8 +739,7 @@ int ca_ingress(struct __sk_buff *skb)
 	initial.app_verdict = config->provisional_app_verdict;
 	if (bpf_map_update_elem(&ca_flows, &flow_key, &initial, BPF_NOEXIST)) {
 		ca_pending_release();
-		ca_stat_inc(CA_STAT_FLOW_MAP_FULL);
-		return ca_load_shed(skb, config, *subject_id);
+		return ca_load_shed(skb, config, &flow_key, *subject_id, now);
 	}
 	ca_stat_inc(CA_STAT_FLOWS_TOTAL);
 	ca_stat_inc(CA_STAT_FLOWS_PENDING);
@@ -751,7 +750,6 @@ int ca_ingress(struct __sk_buff *skb)
 	if (bpf_map_update_elem(&ca_flows, &flow_key, &initial, BPF_EXIST)) {
 		ca_pending_release();
 		bpf_map_delete_elem(&ca_flows, &flow_key);
-		ca_stat_inc(CA_STAT_FLOW_MAP_FULL);
 		return ca_load_shed(skb, config, &flow_key, *subject_id, now);
 	}
 	if (terminal) {

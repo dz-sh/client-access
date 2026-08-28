@@ -135,12 +135,12 @@ jobs:
             if [ -n "${udp_server_pid:-}" ]; then
               sudo kill "${udp_server_pid}" || true
             fi
-            sudo "${RUNNER_TEMP}/client-access-bpfctl" detach ca-lan || true
-            sudo ip link del ca-lan || true
-            sudo ip link del ca-wan || true
+            sudo ip netns exec ca-router-ns \
+              "${RUNNER_TEMP}/client-access-bpfctl" detach ca-lan || true
+            sudo ip netns exec ca-router-ns nft delete table inet fw4 || true
             sudo ip netns del ca-client-ns || true
             sudo ip netns del ca-server-ns || true
-            sudo nft delete table inet fw4 || true
+            sudo ip netns del ca-router-ns || true
             sudo "${RUNNER_TEMP}/client-access-bpfctl" unload || true
           }
           trap cleanup EXIT
@@ -152,18 +152,22 @@ jobs:
           sudo "${RUNNER_TEMP}/client-access-bpfctl" load \
             "${RUNNER_TEMP}/client-access-bpf.o"
 
+          sudo ip netns add ca-router-ns
           sudo ip netns add ca-client-ns
           sudo ip netns add ca-server-ns
           sudo ip link add ca-lan type veth peer name ca-client
           sudo ip link add ca-wan type veth peer name ca-server
+          sudo ip link set ca-lan netns ca-router-ns
+          sudo ip link set ca-wan netns ca-router-ns
           sudo ip link set ca-client netns ca-client-ns
           sudo ip link set ca-server netns ca-server-ns
-          sudo ip link set ca-lan up
-          sudo ip link set ca-wan up
-          sudo ip address add 192.0.2.1/24 dev ca-lan
-          sudo ip address add 198.51.100.1/24 dev ca-wan
-          sudo ip -6 address add 2001:db8:1::1/64 dev ca-lan
-          sudo ip -6 address add 2001:db8:2::1/64 dev ca-wan
+          sudo ip netns exec ca-router-ns ip link set lo up
+          sudo ip netns exec ca-router-ns ip link set ca-lan up
+          sudo ip netns exec ca-router-ns ip link set ca-wan up
+          sudo ip netns exec ca-router-ns ip address add 192.0.2.1/24 dev ca-lan
+          sudo ip netns exec ca-router-ns ip address add 198.51.100.1/24 dev ca-wan
+          sudo ip netns exec ca-router-ns ip -6 address add 2001:db8:1::1/64 dev ca-lan
+          sudo ip netns exec ca-router-ns ip -6 address add 2001:db8:2::1/64 dev ca-wan
           sudo ip netns exec ca-client-ns ip link set lo up
           sudo ip netns exec ca-server-ns ip link set lo up
           sudo ip netns exec ca-client-ns ip link set ca-client \
@@ -188,15 +192,20 @@ jobs:
           sudo ip netns exec ca-server-ns ip route add 192.0.2.0/24 via 198.51.100.1
           sudo ip netns exec ca-client-ns ip -6 route add default via 2001:db8:1::1
           sudo ip netns exec ca-server-ns ip -6 route add 2001:db8:1::/64 via 2001:db8:2::1
-          sudo sysctl -w net.ipv4.ip_forward=1
-          sudo sysctl -w net.ipv6.conf.all.forwarding=1
-          sudo ip neigh replace 198.51.100.2 lladdr 02:00:00:00:00:99 dev ca-wan nud permanent
-          sudo ip neigh replace 198.51.100.3 lladdr 02:00:00:00:00:99 dev ca-wan nud permanent
-          sudo ip neigh replace 198.51.100.4 lladdr 02:00:00:00:00:99 dev ca-wan nud permanent
-          sudo ip -6 neigh replace 2001:db8:2::2 lladdr 02:00:00:00:00:99 dev ca-wan nud permanent
+          sudo ip netns exec ca-router-ns sysctl -w net.ipv4.ip_forward=1
+          sudo ip netns exec ca-router-ns sysctl -w net.ipv6.conf.all.forwarding=1
+          sudo ip netns exec ca-router-ns ip neigh replace 198.51.100.2 \
+            lladdr 02:00:00:00:00:99 dev ca-wan nud permanent
+          sudo ip netns exec ca-router-ns ip neigh replace 198.51.100.3 \
+            lladdr 02:00:00:00:00:99 dev ca-wan nud permanent
+          sudo ip netns exec ca-router-ns ip neigh replace 198.51.100.4 \
+            lladdr 02:00:00:00:00:99 dev ca-wan nud permanent
+          sudo ip netns exec ca-router-ns ip -6 neigh replace 2001:db8:2::2 \
+            lladdr 02:00:00:00:00:99 dev ca-wan nud permanent
           sudo ip netns exec ca-server-ns nc -u -l -k 443 >/dev/null &
           udp_server_pid=$!
-          sudo "${RUNNER_TEMP}/client-access-bpfctl" attach ca-lan
+          sudo ip netns exec ca-router-ns \
+            "${RUNNER_TEMP}/client-access-bpfctl" attach ca-lan
 
           # Establish that the namespace router works before adding the
           # application workflow's nft forward consumer.
@@ -212,16 +221,19 @@ jobs:
             echo '}'
             echo '}'
           } > "${RUNNER_TEMP}/client-access-runtime.nft"
-          sudo nft --file "${RUNNER_TEMP}/client-access-runtime.nft"
-          sudo nft add element inet fw4 client_access_app_sources '{ "ca-lan" }'
-          sudo nft add element inet fw4 client_access_app_destinations '{ "ca-wan" }'
+          sudo ip netns exec ca-router-ns nft \
+            --file "${RUNNER_TEMP}/client-access-runtime.nft"
+          sudo ip netns exec ca-router-ns nft add element inet fw4 \
+            client_access_app_sources '{ "ca-lan" }'
+          sudo ip netns exec ca-router-ns nft add element inet fw4 \
+            client_access_app_destinations '{ "ca-wan" }'
 
           # Installing the app-only consumer must remain neutral while the
           # BPF application snapshot is disabled.
           if ! sudo ip netns exec ca-client-ns ping -c 1 -W 1 198.51.100.2; then
-            sudo ip -details route show
-            sudo tc -s filter show dev ca-lan ingress
-            sudo nft -a list ruleset
+            sudo ip netns exec ca-router-ns ip -details route show
+            sudo ip netns exec ca-router-ns tc -s filter show dev ca-lan ingress
+            sudo ip netns exec ca-router-ns nft -a list ruleset
             sudo "${RUNNER_TEMP}/client-access-bpfctl" status || true
             exit 1
           fi

@@ -7,7 +7,7 @@ PKG_LICENSE:=Apache-2.0
 PKG_LICENSE_FILES:=LICENSE
 PKG_MAINTAINER:=luci-app-client-access contributors
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)
-PKG_BUILD_DEPENDS:=$(if $(CONFIG_PACKAGE_client-access-bpf),bpf-headers)
+PKG_BUILD_DEPENDS:=HAS_BPF_TOOLCHAIN:bpf-headers
 
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/bpf.mk

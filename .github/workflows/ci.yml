@@ -166,8 +166,10 @@ jobs:
           sudo ip netns exec ca-router-ns ip link set ca-wan up
           sudo ip netns exec ca-router-ns ip address add 192.0.2.1/24 dev ca-lan
           sudo ip netns exec ca-router-ns ip address add 198.51.100.1/24 dev ca-wan
-          sudo ip netns exec ca-router-ns ip -6 address add 2001:db8:1::1/64 dev ca-lan
-          sudo ip netns exec ca-router-ns ip -6 address add 2001:db8:2::1/64 dev ca-wan
+          sudo ip netns exec ca-router-ns ip -6 address add \
+            2001:db8:1::1/64 dev ca-lan nodad
+          sudo ip netns exec ca-router-ns ip -6 address add \
+            2001:db8:2::1/64 dev ca-wan nodad
           sudo ip netns exec ca-client-ns ip link set lo up
           sudo ip netns exec ca-server-ns ip link set lo up
           sudo ip netns exec ca-client-ns ip link set ca-client \
@@ -185,9 +187,9 @@ jobs:
           sudo ip netns exec ca-server-ns ip address add \
             198.51.100.4/24 dev ca-server
           sudo ip netns exec ca-client-ns ip -6 address add \
-            2001:db8:1::2/64 dev ca-client
+            2001:db8:1::2/64 dev ca-client nodad
           sudo ip netns exec ca-server-ns ip -6 address add \
-            2001:db8:2::2/64 dev ca-server
+            2001:db8:2::2/64 dev ca-server nodad
           sudo ip netns exec ca-client-ns ip route add default via 192.0.2.1
           sudo ip netns exec ca-server-ns ip route add 192.0.2.0/24 via 198.51.100.1
           sudo ip netns exec ca-client-ns ip -6 route add default via 2001:db8:1::1

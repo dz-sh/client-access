@@ -19,6 +19,8 @@ struct ca_vlan_hdr {
 	__be16 encapsulated_proto;
 };
 
+#define CA_IPV4_FRAGMENT_MASK 0x3fff
+
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
@@ -157,7 +159,7 @@ static __always_inline int ca_parse_flow(void *data, void *data_end,
 		ihl = ip->ihl * 4;
 		if (ihl < sizeof(*ip) || data + offset + ihl > data_end)
 			return -1;
-		if (ip->frag_off & bpf_htons(IP_MF | IP_OFFSET))
+		if (ip->frag_off & bpf_htons(CA_IPV4_FRAGMENT_MASK))
 			return -1;
 		key->ip_proto = ip->protocol;
 		key->addr.v4.src = ip->saddr;

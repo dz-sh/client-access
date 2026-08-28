@@ -213,7 +213,6 @@ jobs:
           ARTIFACTS_DIR: ${{ runner.temp }}/openwrt-artifacts
           BUILD_LOG: 1
           FEED_DIR: ${{ runner.temp }}/client-access-feed
-          PACKAGES: luci-app-client-access client-access-bpf
           V: s
 
       - name: Upload OpenWrt packages and logs
@@ -247,7 +246,6 @@ jobs:
           ARTIFACTS_DIR: ${{ runner.temp }}/immortalwrt-artifacts
           BUILD_LOG: 1
           FEED_DIR: ${{ runner.temp }}/client-access-feed
-          PACKAGES: luci-app-client-access client-access-bpf
           V: s
 
       - name: Upload ImmortalWrt packages and logs

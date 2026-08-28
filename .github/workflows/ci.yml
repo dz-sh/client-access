@@ -114,7 +114,7 @@ jobs:
         run: >-
           sudo apt-get update && sudo apt-get install --yes
           clang llvm libbpf-dev libelf-dev zlib1g-dev
-          iproute2 iputils-ping netcat-openbsd nftables
+          iproute2 iputils-ping netcat-openbsd nftables util-linux
 
       - name: Build the datapath and publisher on Linux
         shell: bash
@@ -135,7 +135,7 @@ jobs:
             if [ -n "${udp_server_pid:-}" ]; then
               sudo kill "${udp_server_pid}" || true
             fi
-            sudo ip netns exec ca-router-ns \
+            sudo nsenter --net=/var/run/netns/ca-router-ns -- \
               "${RUNNER_TEMP}/client-access-bpfctl" detach ca-lan || true
             sudo ip netns exec ca-router-ns nft delete table inet fw4 || true
             sudo ip netns del ca-client-ns || true
@@ -204,7 +204,7 @@ jobs:
             lladdr 02:00:00:00:00:99 dev ca-wan nud permanent
           sudo ip netns exec ca-server-ns nc -u -l -k 443 >/dev/null &
           udp_server_pid=$!
-          sudo ip netns exec ca-router-ns \
+          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
             "${RUNNER_TEMP}/client-access-bpfctl" attach ca-lan
 
           # Establish that the namespace router works before adding the

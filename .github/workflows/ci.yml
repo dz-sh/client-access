@@ -103,6 +103,94 @@ jobs:
           -L "${GITHUB_WORKSPACE}/root/usr/share/ucode"
           "${GITHUB_WORKSPACE}/root/usr/sbin/client-accessd"
 
+  bpf-datapath:
+    name: Remote TC eBPF datapath
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out client-access
+        uses: actions/checkout@v6
+
+      - name: Install eBPF build and runtime dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          clang llvm libbpf-dev libelf-dev zlib1g-dev bpftool
+          iproute2 iputils-ping
+
+      - name: Build the datapath and publisher on Linux
+        shell: bash
+        run: |
+          clang -O2 -g -target bpf -D__TARGET_ARCH_x86 \
+            -I/usr/include/x86_64-linux-gnu \
+            -c src/client-access-bpf.c \
+            -o "${RUNNER_TEMP}/client-access-bpf.o"
+          cc -O2 -Wall -Wextra -Werror -std=gnu11 \
+            src/client-access-bpfctl.c \
+            -o "${RUNNER_TEMP}/client-access-bpfctl" \
+            -lbpf -lelf -lz
+
+      - name: Verify independent application-layer enforcement
+        shell: bash
+        run: |
+          cleanup() {
+            sudo "${RUNNER_TEMP}/client-access-bpfctl" detach ca-lan || true
+            sudo ip link del ca-lan || true
+            sudo ip netns del ca-client-ns || true
+            sudo "${RUNNER_TEMP}/client-access-bpfctl" unload || true
+          }
+          trap cleanup EXIT
+
+          sudo mkdir -p /sys/fs/bpf
+          if ! mountpoint --quiet /sys/fs/bpf; then
+            sudo mount -t bpf bpf /sys/fs/bpf
+          fi
+          sudo "${RUNNER_TEMP}/client-access-bpfctl" load \
+            "${RUNNER_TEMP}/client-access-bpf.o"
+
+          sudo ip netns add ca-client-ns
+          sudo ip link add ca-lan type veth peer name ca-client
+          sudo ip link set ca-client netns ca-client-ns
+          sudo ip link set ca-lan up
+          sudo ip address add 192.0.2.1/24 dev ca-lan
+          sudo ip netns exec ca-client-ns ip link set lo up
+          sudo ip netns exec ca-client-ns ip link set ca-client \
+            address 02:00:00:00:00:42
+          sudo ip netns exec ca-client-ns ip link set ca-client up
+          sudo ip netns exec ca-client-ns ip address add \
+            192.0.2.2/24 dev ca-client
+          sudo "${RUNNER_TEMP}/client-access-bpfctl" attach ca-lan
+
+          printf '%s\n' \
+            'CONFIG 1 1 1 0 0' \
+            'SUBJECT 02:00:00:00:00:42 42' \
+            'POLICY 42 1 1' \
+            'POLICY 42 0 1' \
+            | sudo "${RUNNER_TEMP}/client-access-bpfctl" sync
+          if sudo ip netns exec ca-client-ns ping -c 1 -W 1 192.0.2.1; then
+            echo 'application DENY did not drop the packet' >&2
+            exit 1
+          fi
+
+          printf '%s\n' \
+            'CONFIG 1 2 1 0 0' \
+            'SUBJECT 02:00:00:00:00:42 42' \
+            'POLICY 42 1 0' \
+            'POLICY 42 0 0' \
+            | sudo "${RUNNER_TEMP}/client-access-bpfctl" sync
+          sudo ip netns exec ca-client-ns ping -c 1 -W 1 192.0.2.1
+
+          sudo "${RUNNER_TEMP}/client-access-bpfctl" status \
+            | tee "${RUNNER_TEMP}/client-access-bpf-status.json"
+          jq -e '
+            .enabled == true and
+            .app_policy_generation == 2 and
+            .subject_entries == 1 and
+            .policy_entries == 2 and
+            .flow_entries >= 1 and
+            .flows_denied >= 1 and
+            .flows_allowed >= 1 and
+            .policy_reevaluations >= 1
+          ' "${RUNNER_TEMP}/client-access-bpf-status.json"
+
   openwrt-package:
     name: OpenWrt SDK package
     runs-on: ubuntu-24.04
@@ -125,7 +213,7 @@ jobs:
           ARTIFACTS_DIR: ${{ runner.temp }}/openwrt-artifacts
           BUILD_LOG: 1
           FEED_DIR: ${{ runner.temp }}/client-access-feed
-          PACKAGES: luci-app-client-access
+          PACKAGES: luci-app-client-access client-access-bpf
           V: s
 
       - name: Upload OpenWrt packages and logs
@@ -159,7 +247,7 @@ jobs:
           ARTIFACTS_DIR: ${{ runner.temp }}/immortalwrt-artifacts
           BUILD_LOG: 1
           FEED_DIR: ${{ runner.temp }}/client-access-feed
-          PACKAGES: luci-app-client-access
+          PACKAGES: luci-app-client-access client-access-bpf
           V: s
 
       - name: Upload ImmortalWrt packages and logs

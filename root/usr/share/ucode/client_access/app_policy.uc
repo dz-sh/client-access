@@ -329,7 +329,7 @@ export function consistency(nft_compiled, app_compiled) {
 		if (!nft_identity || nft_identity.verdict != 'deny')
 			continue;
 		push(warnings,
-			`${policy.identity_id}: application ${policy.verdict} for class ${policy.class_id} is currently shadowed by nftables deny`);
+			`${policy.identity_id}: application ${policy.verdict} for class ${policy.class_id} cannot affect forwarding while nftables independently denies this identity`);
 	}
 
 	return { warnings };

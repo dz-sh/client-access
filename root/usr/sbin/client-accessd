@@ -4,21 +4,28 @@
 'use strict';
 
 import { cursor } from 'uci';
-import { popen } from 'fs';
+import { popen, stat } from 'fs';
 import * as ubus from 'ubus';
 import * as uloop from 'uloop';
 import * as policy from 'client_access.policy';
+import * as app_policy from 'client_access.app_policy';
 import * as model from 'client_access.model';
 
 const NFT = '/usr/sbin/nft';
 const FW4 = '/sbin/fw4';
+const BPFCTL = '/usr/sbin/client-access-bpfctl';
 
 let timer, published;
 let generation = 0;
 let applied_signature = null;
+let app_policy_generation = 0;
+let app_applied_signature = null;
+let app_attached_interfaces = [];
 let last_config = null;
 let last_compiled = null;
 let last_projection = null;
+let last_app_compiled = null;
+let last_subject_projection = null;
 let state = {
 	running: true,
 	applied: false,
@@ -40,6 +47,18 @@ let state = {
 	destination_interfaces: [],
 	errors: [],
 	warnings: [],
+	app_filter: {
+		backend_mode: 'V3_NFT_ONLY',
+		requested_enabled: false,
+		enabled: false,
+		available: false,
+		degraded: false,
+		retained_previous_snapshot: false,
+		app_policy_generation: 0,
+		next_transition: null,
+		errors: [],
+		warnings: [],
+	},
 };
 
 function as_list(value) {
@@ -54,12 +73,19 @@ function read_config() {
 		schema_version: uci.get('client_access', 'main', 'schema_version'),
 		enabled: uci.get('client_access', 'main', 'enabled'),
 		mode: uci.get('client_access', 'main', 'mode'),
+		app_filter_enabled: uci.get('client_access', 'main', 'app_filter_enabled'),
+		unknown_app_verdict: uci.get('client_access', 'main', 'unknown_app_verdict'),
+		provisional_app_verdict: uci.get('client_access', 'main', 'provisional_app_verdict'),
 		deny_action: uci.get('client_access', 'main', 'deny_action'),
 		source_zone: as_list(uci.get('client_access', 'main', 'source_zone')),
 		destination_zone: as_list(uci.get('client_access', 'main', 'destination_zone')),
 		safety_interval: uci.get('client_access', 'main', 'safety_interval') ?? 60,
 		identities: [],
 		bindings: [],
+		app_classes: [],
+		app_rules: [],
+		flow_offloading: false,
+		flow_offloading_hw: false,
 	};
 
 	uci.foreach('client_access', 'identity', function(s) {
@@ -67,6 +93,31 @@ function read_config() {
 			id: s['.name'],
 			section: s['.name'],
 			name: s.name ?? s['.name'],
+			subject_id: s.subject_id,
+			activation: s.activation,
+			schedule: s.schedule,
+		});
+	});
+	uci.foreach('client_access', 'app_class', function(s) {
+		push(config.app_classes, {
+			section: s['.name'],
+			id: s.class_id,
+			name: s.name ?? s['.name'],
+			kind: s.kind,
+			parent_id: s.parent_id,
+			domains: as_list(s.domain),
+			tcp_ports: as_list(s.tcp_port),
+			udp_ports: as_list(s.udp_port),
+			ipv4_prefixes: as_list(s.ipv4_prefix),
+			ipv6_prefixes: as_list(s.ipv6_prefix),
+		});
+	});
+	uci.foreach('client_access', 'app_rule', function(s) {
+		push(config.app_rules, {
+			section: s['.name'],
+			identity: s.identity,
+			class_id: s.class_id,
+			verdict: s.verdict,
 			activation: s.activation,
 			schedule: s.schedule,
 		});
@@ -79,6 +130,11 @@ function read_config() {
 			value: s.value,
 		});
 	});
+	uci.foreach('firewall', 'defaults', function(s) {
+		config.flow_offloading = s.flow_offloading == '1';
+		config.flow_offloading_hw = s.flow_offloading_hw == '1';
+		return false;
+	});
 	uci.unload();
 	return config;
 }
@@ -89,6 +145,20 @@ function run_capture(argv) {
 		return { code: null, output: '' };
 	const output = proc.read('all') ?? '';
 	return { code: proc.close(), output };
+}
+
+function run_write(argv, content) {
+	const proc = popen(argv, 'w');
+	if (!proc)
+		return { ok: false, error: `Unable to start ${argv[0]}` };
+	if (proc.write(content) != length(content)) {
+		proc.close();
+		return { ok: false, error: `Unable to write complete input to ${argv[0]}` };
+	}
+	const code = proc.close();
+	return code == 0
+		? { ok: true, error: null }
+		: { ok: false, error: `${argv[0]} exited with code ${code}` };
 }
 
 function unique_strings(values) {
@@ -148,6 +218,179 @@ function desired_signature(compiled, projection, sources, destinations) {
 	});
 }
 
+function app_signature(app_compiled, subject_projection, sources) {
+	return sprintf('%J', {
+		enabled: app_compiled.enabled,
+		unknown_app_verdict: app_compiled.unknown_app_verdict,
+		provisional_app_verdict: app_compiled.provisional_app_verdict,
+		selectors: subject_projection.selectors,
+		policies: app_compiled.policies,
+		sources,
+	});
+}
+
+function verdict_number(verdict) {
+	return verdict == 'deny' ? 1 : 0;
+}
+
+function app_snapshot(app_compiled, subject_projection, candidate_generation) {
+	let lines = [ sprintf('CONFIG %d %d %d %d %d',
+		app_compiled.enabled ? 1 : 0,
+		candidate_generation,
+		1,
+		verdict_number(app_compiled.unknown_app_verdict),
+		verdict_number(app_compiled.provisional_app_verdict)) ];
+	for (let selector in subject_projection.selectors)
+		push(lines, sprintf('SUBJECT %s %d', selector.mac, selector.subject_id));
+	for (let entry in app_compiled.policies)
+		push(lines, sprintf('POLICY %d %d %d',
+			entry.subject_id, entry.class_id, verdict_number(entry.verdict)));
+	return join('\n', lines) + '\n';
+}
+
+function detach_app_interfaces(keep) {
+	let keep_set = {}, remaining = [];
+	for (let ifname in keep)
+		keep_set[ifname] = true;
+	for (let ifname in app_attached_interfaces) {
+		if (keep_set[ifname]) {
+			push(remaining, ifname);
+			continue;
+		}
+		run_capture([ BPFCTL, 'detach', ifname ]);
+	}
+	app_attached_interfaces = remaining;
+}
+
+function apply_app_filter(config, app_compiled, subject_projection, sources, force) {
+	let errors = [ ...app_compiled.errors, ...subject_projection.errors ];
+	let warnings = [ ...app_compiled.warnings ];
+	const previously_enabled = app_applied_signature != null && length(app_attached_interfaces) > 0;
+	const previous_interfaces = {};
+	for (let ifname in app_attached_interfaces)
+		previous_interfaces[ifname] = true;
+
+	if (!app_compiled.requested_enabled) {
+		const disabled = stat(BPFCTL)
+			? run_capture([ BPFCTL, 'disable' ])
+			: { code: null, output: '' };
+		if (disabled.code != null && disabled.code != 0)
+			push(errors, 'Unable to neutralize the application-filter datapath');
+		detach_app_interfaces([]);
+		app_applied_signature = null;
+		return {
+			ok: disabled.code == null || disabled.code == 0,
+			available: false,
+			enabled: false,
+			degraded: disabled.code != null && disabled.code != 0,
+			retained_previous_snapshot: false,
+			backend_mode: 'V3_NFT_ONLY',
+			generation: app_policy_generation,
+			errors,
+			warnings,
+		};
+	}
+	if (config.flow_offloading || config.flow_offloading_hw)
+		push(errors, 'Disable firewall software and hardware flow offloading before enabling application filtering');
+	if (!length(sources))
+		push(errors, 'No LAN source interfaces resolved for the application filter');
+	if (!app_compiled.enabled || length(errors)) {
+		return {
+			ok: false,
+			available: previously_enabled,
+			enabled: previously_enabled,
+			degraded: true,
+			retained_previous_snapshot: previously_enabled,
+			backend_mode: previously_enabled ? 'V4_BPF_BASIC' : 'V3_NFT_ONLY',
+			generation: app_policy_generation,
+			errors,
+			warnings,
+		};
+	}
+
+	const ensured = run_capture([ BPFCTL, 'ensure' ]);
+	if (ensured.code != 0) {
+		push(errors, 'Unable to load or verify the TC eBPF application backend');
+		return {
+			ok: false,
+			available: previously_enabled,
+			enabled: previously_enabled,
+			degraded: true,
+			retained_previous_snapshot: previously_enabled,
+			backend_mode: previously_enabled ? 'V4_BPF_BASIC' : 'V3_NFT_ONLY',
+			generation: app_policy_generation,
+			errors,
+			warnings,
+		};
+	}
+
+	let attached = [];
+	for (let ifname in sources) {
+		const result = run_capture([ BPFCTL, 'attach', ifname ]);
+		if (result.code != 0)
+			push(errors, `Unable to attach application filter to '${ifname}'`);
+		else
+			push(attached, ifname);
+	}
+	if (length(errors)) {
+		for (let ifname in attached)
+			if (!previous_interfaces[ifname])
+				run_capture([ BPFCTL, 'detach', ifname ]);
+		return {
+			ok: false,
+			available: true,
+			enabled: previously_enabled,
+			degraded: true,
+			retained_previous_snapshot: previously_enabled,
+			backend_mode: 'V4_BPF_BASIC',
+			generation: app_policy_generation,
+			errors,
+			warnings,
+		};
+	}
+
+	const signature = app_signature(app_compiled, subject_projection, sources);
+	const changed = signature != app_applied_signature;
+	const candidate_generation = changed ? app_policy_generation + 1 : app_policy_generation;
+	if (force || changed) {
+		const result = run_write([ BPFCTL, 'sync' ],
+			app_snapshot(app_compiled, subject_projection, candidate_generation));
+		if (!result.ok) {
+			push(errors, result.error);
+			for (let ifname in attached)
+				if (!previous_interfaces[ifname])
+					run_capture([ BPFCTL, 'detach', ifname ]);
+			return {
+				ok: false,
+				available: true,
+				enabled: previously_enabled,
+				degraded: true,
+				retained_previous_snapshot: previously_enabled,
+				backend_mode: 'V4_BPF_BASIC',
+				generation: app_policy_generation,
+				errors,
+				warnings,
+			};
+		}
+	}
+	detach_app_interfaces(sources);
+	app_attached_interfaces = [ ...sources ];
+	if (changed)
+		app_policy_generation = candidate_generation;
+	app_applied_signature = signature;
+	return {
+		ok: true,
+		available: true,
+		enabled: true,
+		degraded: false,
+		retained_previous_snapshot: false,
+		backend_mode: 'V4_BPF_BASIC',
+		generation: app_policy_generation,
+		errors,
+		warnings,
+	};
+}
+
 function apply_nft(compiled, projection, sources, destinations) {
 	let exceptions = projection.exceptions;
 	if (!compiled.enabled) {
@@ -179,8 +422,13 @@ function apply_nft(compiled, projection, sources, destinations) {
 		: { ok: false, error: `nft transaction failed with exit code ${code}` };
 }
 
-function update_timer(config, compiled, epoch) {
-	const delay = policy.safety_delay_ms(compiled, epoch, config.safety_interval);
+function update_timer(config, compiled, app_compiled, epoch) {
+	let delay = policy.safety_delay_ms(compiled, epoch, config.safety_interval);
+	if (app_compiled.requested_enabled && app_compiled.next_transition != null) {
+		const app_delay = (app_compiled.next_transition - epoch) * 1000;
+		if (app_delay > 0 && app_delay < delay)
+			delay = app_delay;
+	}
 	timer.set(delay);
 }
 
@@ -195,7 +443,10 @@ function count_active(identities) {
 function compile_runtime(config, epoch) {
 	const compiled = policy.compile(config, epoch);
 	const projection = model.project(compiled, config.bindings);
-	return { compiled, projection };
+	const app_compiled = app_policy.compile(config, epoch);
+	const subject_projection = model.project_subjects(app_compiled, config.bindings);
+	const consistency = app_policy.consistency(compiled, app_compiled);
+	return { compiled, projection, app_compiled, subject_projection, consistency };
 }
 
 function reconcile(reason, force) {
@@ -204,7 +455,9 @@ function reconcile(reason, force) {
 	const runtime = compile_runtime(config, epoch);
 	const compiled = runtime.compiled;
 	const projection = runtime.projection;
-	const source = compiled.enabled
+	const app_compiled = runtime.app_compiled;
+	const subject_projection = runtime.subject_projection;
+	const source = compiled.enabled || app_compiled.requested_enabled
 		? resolve_zones(config.source_zone)
 		: { interfaces: [], errors: [] };
 	const destination = compiled.enabled
@@ -230,6 +483,11 @@ function reconcile(reason, force) {
 	else
 		push(errors, apply.error);
 
+	const app_apply = apply_app_filter(config, app_compiled, subject_projection,
+		source.interfaces, force);
+	for (let warning in runtime.consistency.warnings)
+		push(app_apply.warnings, warning);
+
 	const configuration_ready = compiled.schema_supported && compiled.mode_valid;
 	const synchronized = apply.ok && configuration_ready && !length(readiness_errors);
 	const state_error = apply.error ??
@@ -239,6 +497,8 @@ function reconcile(reason, force) {
 	last_config = config;
 	last_compiled = compiled;
 	last_projection = projection;
+	last_app_compiled = app_compiled;
+	last_subject_projection = subject_projection;
 	state = {
 		running: true,
 		applied: synchronized,
@@ -264,9 +524,25 @@ function reconcile(reason, force) {
 		destination_interfaces: destination.interfaces,
 		errors,
 		warnings,
+		app_filter: {
+			backend_mode: app_apply.backend_mode,
+			requested_enabled: app_compiled.requested_enabled,
+			enabled: app_apply.enabled,
+			degraded: app_apply.degraded,
+			retained_previous_snapshot: app_apply.retained_previous_snapshot,
+			available: app_apply.available,
+			applied: app_apply.ok,
+			app_policy_generation: app_apply.generation,
+			next_transition: app_compiled.next_transition,
+			subject_count: length(app_compiled.identities),
+			selector_count: length(subject_projection.preview_selectors),
+			policy_entry_count: length(app_compiled.policies),
+			errors: app_apply.errors,
+			warnings: app_apply.warnings,
+		},
 	};
 
-	update_timer(config, compiled, epoch);
+	update_timer(config, compiled, app_compiled, epoch);
 	return state;
 }
 
@@ -375,7 +651,14 @@ published = conn.publish('client_access', {
 			const epoch = clock()[0];
 			const config = read_config();
 			const runtime = compile_runtime(config, epoch);
-			return { compiled: runtime.compiled, projection: runtime.projection, clock: epoch };
+			return {
+				compiled: runtime.compiled,
+				projection: runtime.projection,
+				app_compiled: runtime.app_compiled,
+				subject_projection: runtime.subject_projection,
+				consistency: runtime.consistency,
+				clock: epoch,
+			};
 		},
 	},
 	identities: {

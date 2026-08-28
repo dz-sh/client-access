@@ -198,6 +198,11 @@ jobs:
           udp_server_pid=$!
           sudo "${RUNNER_TEMP}/client-access-bpfctl" attach ca-lan
 
+          # Establish that the namespace router works before adding the
+          # application workflow's nft forward consumer.
+          sudo ip netns exec ca-client-ns ping -c 1 -W 1 198.51.100.2
+          sudo ip netns exec ca-client-ns ping -6 -c 1 -W 1 2001:db8:2::2
+
           {
             echo 'table inet fw4 {'
             cat root/usr/share/nftables.d/table-pre/30-client-access.nft
@@ -211,9 +216,15 @@ jobs:
           sudo nft add element inet fw4 client_access_app_sources '{ "ca-lan" }'
           sudo nft add element inet fw4 client_access_app_destinations '{ "ca-wan" }'
 
-          # Warm route and neighbour state before enabling the application layer.
-          sudo ip netns exec ca-client-ns ping -c 1 -W 1 198.51.100.2
-
+          # Installing the app-only consumer must remain neutral while the
+          # BPF application snapshot is disabled.
+          if ! sudo ip netns exec ca-client-ns ping -c 1 -W 1 198.51.100.2; then
+            sudo ip -details route show
+            sudo tc -s filter show dev ca-lan ingress
+            sudo nft -a list ruleset
+            sudo "${RUNNER_TEMP}/client-access-bpfctl" status || true
+            exit 1
+          fi
           sudo ip netns exec ca-client-ns ping -6 -c 1 -W 1 2001:db8:2::2
 
           printf '%s\n' \

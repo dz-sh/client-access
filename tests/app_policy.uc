@@ -26,14 +26,18 @@ function config(enabled, rules, identities) {
 	return {
 		schema_version: '4',
 		app_filter_enabled: enabled ?? '1',
-		unknown_app_verdict: 'allow',
+		unknown_subject_app_verdict: 'allow',
 		provisional_app_verdict: 'allow',
 		identities: identities ?? [
 			{ id: 'alice', name: 'Alice', subject_id: '1001' },
 		],
 		app_classes: [
-			{ id: '10', name: 'Video', kind: 'category' },
-			{ id: '100', name: 'YouTube', kind: 'application', parent_id: '10' },
+			{ id: '10', name: 'Video', kind: 'category', tcp_ports: [ '443' ] },
+			{
+				id: '100', name: 'YouTube', kind: 'application', parent_id: '10',
+				domains: [ '*.youtube.example' ],
+				ipv4_prefixes: [ '192.0.2.0/24' ],
+			},
 			{ id: '101', name: 'TikTok', kind: 'application', parent_id: '10' },
 		],
 		app_rules: rules ?? [],
@@ -53,13 +57,34 @@ const monday_1000 = epoch(2026, 8, 24, 10, 0);
 let result = app_policy.compile(config('0'), monday_0900);
 assert_equal(result.requested_enabled, false, 'application workflow is disabled independently');
 assert_equal(result.enabled, false, 'disabled application workflow remains inactive');
-assert_equal(result.unknown_app_verdict, 'allow', 'unknown subject has an independent neutral app verdict');
+assert_equal(result.unknown_subject_app_verdict, 'allow', 'unknown subject has an independent neutral app verdict');
 assert_equal(result.provisional_app_verdict, 'allow', 'V4.1 provisional app verdict is allow');
 
 result = app_policy.compile(config('1'), monday_0900);
 assert_equal(result.enabled, true, 'valid application workflow can be enabled');
 assert_equal(verdict(result, 1001, 100), 'allow', 'missing app rule uses app-policy default allow');
 assert_equal(verdict(result, 1001, 1), 'allow', 'unclassified traffic uses app-policy default allow');
+assert_equal(result.resource_limits, {
+	max_packets_inspected: 1,
+	max_bytes_examined: 256,
+	max_classification_age_ms: 200,
+	max_pending_entries: 256,
+	max_new_classifications_per_second: 512,
+	per_subject_new_classification_rate: 64,
+}, 'V4.1 compiles explicit bounded resource defaults');
+assert_equal(result.classifier.ports, [ {
+	protocol: 6,
+	port: 443,
+	hint: { class_id: 10, category_id: 10, kind: 2 },
+} ], 'port-only evidence compiles to a category hint');
+assert_equal(result.classifier.ipv4_prefixes, [ {
+	prefix: '192.0.2.0/24',
+	hint: { class_id: 100, category_id: 10, kind: 1 },
+} ], 'static prefix evidence can identify an exact application');
+assert_equal(result.classifier.domains, [ {
+	pattern: '*.youtube.example',
+	hint: { class_id: 100, category_id: 10, kind: 1 },
+} ], 'domain evidence compiles for bounded DNS correlation');
 
 result = app_policy.compile(config('1', [
 	{ identity: 'alice', class: '10', verdict: 'deny', activation: 'always_active' },
@@ -136,6 +161,19 @@ assert_equal(length(diagnostics.warnings) > 0, true,
 	'cross-workflow consistency analysis warns without changing either verdict');
 assert_equal(nft.identities[0].verdict, 'deny', 'consistency analysis does not rewrite nft verdict');
 assert_equal(verdict(result, 1001, 100), 'allow', 'consistency analysis does not rewrite app verdict');
+
+let conflicting = config('1');
+push(conflicting.app_classes, {
+	id: '20', name: 'Social', kind: 'category', tcp_ports: [ '443' ],
+});
+result = app_policy.compile(conflicting, monday_0900);
+assert_equal(result.enabled, false, 'conflicting classifier evidence prevents publication');
+assert_equal(length(result.errors) > 0, true, 'classifier conflicts are diagnosed');
+
+let invalid_limits = config('1');
+invalid_limits.max_packets_inspected = '2';
+result = app_policy.compile(invalid_limits, monday_0900);
+assert_equal(result.enabled, false, 'V4.1 rejects multi-packet inspection configuration');
 
 if (failures)
 	exit(1);

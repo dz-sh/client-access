@@ -68,6 +68,28 @@ function randomSubjectId() {
 	return String(value);
 }
 
+function randomSectionId(prefix) {
+	const bytes = new Uint8Array(8);
+	window.crypto.getRandomValues(bytes);
+	return prefix + '_' + Array.from(bytes, function(value) {
+		return value.toString(16).padStart(2, '0');
+	}).join('');
+}
+
+function randomClassId() {
+	const configured = {};
+	uci.sections('client_access', 'app_class').forEach(function(appClass) {
+		configured[String(appClass.class_id || '')] = true;
+	});
+	let value;
+	do {
+		const bytes = new Uint16Array(1);
+		window.crypto.getRandomValues(bytes);
+		value = 2 + (bytes[0] % 65534);
+	} while (configured[String(value)]);
+	return String(value);
+}
+
 function saveChanges() {
 	return uci.save()
 		.then(L.bind(ui.changes.init, ui.changes))
@@ -155,6 +177,73 @@ function statusPanel(status) {
 	]);
 }
 
+function runtimeStatus(appStatus) {
+	try {
+		return JSON.parse(appStatus.runtime_status_json || '{}');
+	}
+	catch (error) {
+		return {};
+	}
+}
+
+function applicationStatusPanel(status) {
+	const appStatus = status.app_filter || {};
+	const runtime = runtimeStatus(appStatus);
+	const disabled = !appStatus.requested_enabled;
+	const healthy = appStatus.enabled && !appStatus.degraded;
+	const exact = runtime.flows_classified_exact || 0;
+	const category = runtime.flows_classified_category || 0;
+	const unclassified = runtime.flows_unclassified || 0;
+	const terminal = exact + category + unclassified;
+	const coverage = terminal ? Math.round(100 * (exact + category) / terminal) : 0;
+
+	return E('div', { 'class': 'cbi-section' }, [
+		E('div', { 'class': disabled || healthy ? 'alert-message success' : 'alert-message warning' }, [
+			disabled
+				? _('Application filtering is off. The nftables Internet access policy remains independent.')
+				: (healthy
+					? _('Application filtering is active for managed identities.')
+					: _('Application filtering is degraded; see diagnostics before relying on its rules.'))
+		]),
+		E('details', {}, [
+			E('summary', {}, [ _('Application diagnostics') ]),
+			E('p', {}, [
+				_('Packets still pass the application layer while a new flow is pending. V4.1 inspects one early packet, so a denied application has a small initial leakage window.')
+			]),
+			E('div', { 'class': 'table' }, [
+				E('div', { 'class': 'tr' }, [
+					E('div', { 'class': 'td left' }, [ _('Backend') ]),
+					E('div', { 'class': 'td left' }, [ appStatus.backend_mode || 'V3_NFT_ONLY' ]),
+					E('div', { 'class': 'td left' }, [ _('Classifier coverage') ]),
+					E('div', { 'class': 'td left' }, [ terminal ? coverage + '%' : _('No terminal flows yet') ])
+				]),
+				E('div', { 'class': 'tr' }, [
+					E('div', { 'class': 'td left' }, [ _('Exact / category') ]),
+					E('div', { 'class': 'td left' }, [ '%s / %s'.format(exact, category) ]),
+					E('div', { 'class': 'td left' }, [ _('Unclassified / load shed') ]),
+					E('div', { 'class': 'td left' }, [ '%s / %s'.format(unclassified, runtime.flows_unclassified_load_shed || 0) ])
+				]),
+				E('div', { 'class': 'tr' }, [
+					E('div', { 'class': 'td left' }, [ _('Policy / classifier generation') ]),
+					E('div', { 'class': 'td left' }, [ '%s / %s'.format(appStatus.app_policy_generation || 0, appStatus.classifier_generation || 0) ]),
+					E('div', { 'class': 'td left' }, [ _('Flow map') ]),
+					E('div', { 'class': 'td left' }, [ '%s / %s'.format(runtime.flow_map_entries || 0, runtime.flow_capacity || 0) ])
+				]),
+				E('div', { 'class': 'tr' }, [
+					E('div', { 'class': 'td left' }, [ _('DNS correlation') ]),
+					E('div', { 'class': 'td left' }, [ appStatus.dns_subscribed ? _('Subscribed') : _('Unavailable') ]),
+					E('div', { 'class': 'td left' }, [ _('DNS events accepted / dropped') ]),
+					E('div', { 'class': 'td left' }, [ '%s / %s'.format(appStatus.dns_events_accepted || 0, appStatus.dns_events_dropped || 0) ])
+				])
+			]),
+			(appStatus.errors || []).length
+				? E('p', { 'class': 'alert-message error' }, [ appStatus.errors.join('; ') ]) : '',
+			(appStatus.warnings || []).length
+				? E('p', { 'class': 'alert-message warning' }, [ appStatus.warnings.join('; ') ]) : ''
+		])
+	]);
+}
+
 function parseScheduleMap(sectionId) {
 	const result = {};
 	DAYS.forEach(function(day) { result[day.id] = []; });
@@ -199,6 +288,33 @@ function validatePeriod(sectionId, value) {
 	if (+match[1] > 23 || +match[2] > 59 || +match[3] > 23 || +match[4] > 59)
 		return _('Hours must be 00-23 and minutes must be 00-59.');
 	return true;
+}
+
+function validateDomainPattern(sectionId, value) {
+	if (!value)
+		return true;
+	return /^(\*\.)?[a-z0-9_-]+(\.[a-z0-9_-]+)+$/i.test(String(value).trim())
+		? true : _('Enter a domain such as video.example or *.video.example.');
+}
+
+function configuredClassById() {
+	const result = {};
+	uci.sections('client_access', 'app_class').forEach(function(appClass) {
+		result[String(appClass.class_id || '')] = appClass;
+	});
+	return result;
+}
+
+function classLabel(appClass) {
+	return appClass.name || _('Class %s').format(appClass.class_id || '?');
+}
+
+function ruleClassLabel(classId, classes) {
+	if (String(classId) === '0')
+		return _('All other applications');
+	if (String(classId) === '1')
+		return _('Unclassified traffic');
+	return classes[String(classId)] ? classLabel(classes[String(classId)]) : _('Unknown class');
 }
 
 function bindingsForIdentity(sectionId) {
@@ -442,6 +558,8 @@ return view.extend({
 		const observationInventory = data[2];
 		const inventoryById = identityById(identityInventory);
 		const configuredIdentities = uci.sections('client_access', 'identity');
+		const configuredClasses = uci.sections('client_access', 'app_class');
+		const classesById = configuredClassById();
 		const initialAccessPolicy = accessPolicyFromUci();
 		let m, s, o;
 
@@ -452,6 +570,7 @@ return view.extend({
 		s.anonymous = true;
 		s.addremove = false;
 		s.tab('policy', _('Policy'));
+		s.tab('applications', _('Application filtering'));
 		s.tab('advanced', _('Advanced settings'));
 
 		o = s.taboption('policy', form.ListValue, '_access_policy', _('Internet access policy'));
@@ -476,6 +595,24 @@ return view.extend({
 				]), 'warning');
 			}
 		};
+
+		o = s.taboption('applications', form.Flag, 'app_filter_enabled', _('Enable application filtering'));
+		o.default = '0';
+		o.rmempty = false;
+		o.description = _('Adds a separate application-filter layer for managed identities. It does not replace or consume the nftables Internet access result. Flow offloading must be disabled.');
+
+		o = s.taboption('applications', form.ListValue, 'unknown_subject_app_verdict', _('Clients without an identity'));
+		o.value('allow', _('Pass the application layer'));
+		o.value('deny', _('Block in the application layer'));
+		o.default = 'allow';
+		o.rmempty = false;
+		o.depends('app_filter_enabled', '1');
+		o.description = _('Unknown detected clients have no subject or application schedule. This independent application-layer fallback applies to all of their traffic.');
+
+		o = s.taboption('applications', form.DummyValue, '_pending_behavior', _('New-flow behavior'));
+		o.depends('app_filter_enabled', '1');
+		o.cfgvalue = function() { return _('Allow packets during the initial classification window'); };
+		o.description = _('V4.1 uses one-packet best-effort classification. This is suitable for parental controls, not zero-leak security enforcement.');
 
 		o = s.taboption('advanced', form.ListValue, 'deny_action', _('When access is blocked'));
 		o.value('reject', _('Reject the connection'));
@@ -513,6 +650,10 @@ return view.extend({
 		s.handleRemove = function(sectionId, ev) {
 			bindingsForIdentity(sectionId).forEach(function(binding) {
 				uci.remove('client_access', binding['.name']);
+			});
+			uci.sections('client_access', 'app_rule').forEach(function(rule) {
+				if (rule.identity === sectionId)
+					uci.remove('client_access', rule['.name']);
 			});
 			return removeIdentity.call(this, sectionId, ev);
 		};
@@ -602,6 +743,190 @@ return view.extend({
 				: null;
 		});
 
+		s = m.section(form.GridSection, 'app_class', _('Application and category catalog'));
+		s.anonymous = true;
+		s.addremove = true;
+		s.sortable = true;
+		s.nodescriptions = true;
+		s.addbtntitle = _('Add application or category');
+		s.description = _('Classification is best effort. Domains and IP prefixes may identify an application; port-only evidence identifies only a category. Conflicting evidence becomes unclassified.');
+		s.sectiontitle = function(sectionId) {
+			return uci.get('client_access', sectionId, 'name') || _('Unnamed application class');
+		};
+		const addClass = s.handleAdd;
+		s.handleAdd = function(ev) {
+			const sectionId = randomSectionId('app_class');
+			const result = addClass.call(this, ev, sectionId);
+			uci.set('client_access', sectionId, 'class_id', randomClassId());
+			uci.set('client_access', sectionId, 'kind', 'application');
+			uci.set('client_access', sectionId, 'signature_source', 'user-configured');
+			uci.set('client_access', sectionId, 'signature_license', 'user-configured');
+			return result;
+		};
+		const removeClass = s.handleRemove;
+		s.handleRemove = function(sectionId, ev) {
+			const classId = String(uci.get('client_access', sectionId, 'class_id') || '');
+			uci.sections('client_access', 'app_rule').forEach(function(rule) {
+				if (String(rule.class_id || '') === classId)
+					uci.remove('client_access', rule['.name']);
+			});
+			uci.sections('client_access', 'app_class').forEach(function(appClass) {
+				if (String(appClass.parent_id || '') === classId)
+					uci.unset('client_access', appClass['.name'], 'parent_id');
+			});
+			return removeClass.call(this, sectionId, ev);
+		};
+		s.tab('identity', _('Identity'));
+		s.tab('evidence', _('Classification evidence'));
+
+		o = s.option(form.DummyValue, '_catalog_name', _('Name'));
+		o.modalonly = false;
+		o.cfgvalue = function(sectionId) {
+			return uci.get('client_access', sectionId, 'name') || _('Unnamed');
+		};
+
+		o = s.option(form.DummyValue, '_catalog_kind', _('Type'));
+		o.modalonly = false;
+		o.cfgvalue = function(sectionId) {
+			return uci.get('client_access', sectionId, 'kind') === 'category'
+				? _('Category') : _('Application');
+		};
+
+		o = s.taboption('identity', form.Value, 'name', _('Name'));
+		o.rmempty = false;
+
+		o = s.taboption('identity', form.Value, 'class_id', _('Stable class ID'));
+		o.datatype = 'range(2,65535)';
+		o.rmempty = false;
+		o.description = _('A stable numeric key used only by the application workflow. Avoid changing it while active flows exist.');
+
+		o = s.taboption('identity', form.ListValue, 'kind', _('Type'));
+		o.value('application', _('Application'));
+		o.value('category', _('Category'));
+		o.default = 'application';
+		o.rmempty = false;
+
+		o = s.taboption('identity', form.ListValue, 'parent_id', _('Parent category'));
+		o.value('', _('No category'));
+		configuredClasses.forEach(function(appClass) {
+			if (appClass.kind === 'category')
+				o.value(String(appClass.class_id), classLabel(appClass));
+		});
+		o.depends('kind', 'application');
+		o.rmempty = true;
+		o.description = _('A broad category provides a safe fallback when evidence cannot identify the exact application.');
+
+		o = s.taboption('evidence', form.DynamicList, 'domain', _('Domains'));
+		o.placeholder = '*.video.example';
+		o.validate = validateDomainPattern;
+		o.rmempty = true;
+
+		o = s.taboption('evidence', form.DynamicList, 'tcp_port', _('TCP destination ports'));
+		o.datatype = 'port';
+		o.placeholder = '443';
+		o.rmempty = true;
+
+		o = s.taboption('evidence', form.DynamicList, 'udp_port', _('UDP destination ports'));
+		o.datatype = 'port';
+		o.placeholder = '443';
+		o.rmempty = true;
+
+		o = s.taboption('evidence', form.DynamicList, 'ipv4_prefix', _('IPv4 prefixes'));
+		o.datatype = 'cidr4';
+		o.placeholder = '192.0.2.0/24';
+		o.rmempty = true;
+
+		o = s.taboption('evidence', form.DynamicList, 'ipv6_prefix', _('IPv6 prefixes'));
+		o.datatype = 'cidr6';
+		o.placeholder = '2001:db8::/32';
+		o.rmempty = true;
+
+		s = m.section(form.GridSection, 'app_rule', _('Application rules'));
+		s.anonymous = true;
+		s.addremove = configuredIdentities.length > 0;
+		s.sortable = true;
+		s.nodescriptions = true;
+		s.addbtntitle = _('Add application rule');
+		s.description = configuredIdentities.length
+			? _('Each rule belongs to an identity and produces only an application-layer verdict. Inactive rules are saved as presets.')
+			: _('Create an identity before adding application rules.');
+		s.tab('rule', _('Rule'));
+		s.tab('schedule', _('Weekly schedule'));
+
+		o = s.option(form.DummyValue, '_rule_identity', _('Identity'));
+		o.modalonly = false;
+		o.cfgvalue = function(sectionId) {
+			const identityId = uci.get('client_access', sectionId, 'identity');
+			const identity = configuredIdentities.find(function(item) { return item['.name'] === identityId; });
+			return identity ? identity.name || identityId : _('Unknown identity');
+		};
+
+		o = s.option(form.DummyValue, '_rule_class', _('Application'));
+		o.modalonly = false;
+		o.cfgvalue = function(sectionId) {
+			return ruleClassLabel(uci.get('client_access', sectionId, 'class_id'), classesById);
+		};
+
+		o = s.option(form.DummyValue, '_rule_result', _('Result'));
+		o.modalonly = false;
+		o.cfgvalue = function(sectionId) {
+			const verdict = uci.get('client_access', sectionId, 'verdict') === 'deny'
+				? _('Block') : _('Allow');
+			return '%s · %s'.format(verdict,
+				applyPolicyLabel(uci.get('client_access', sectionId, 'activation')));
+		};
+
+		o = s.taboption('rule', form.ListValue, 'identity', _('Identity'));
+		configuredIdentities.forEach(function(identity) {
+			o.value(identity['.name'], identity.name || identity['.name']);
+		});
+		o.rmempty = false;
+
+		o = s.taboption('rule', form.ListValue, 'class_id', _('Application or category'));
+		o.value('0', _('All other applications'));
+		o.value('1', _('Unclassified traffic'));
+		configuredClasses.forEach(function(appClass) {
+			o.value(String(appClass.class_id), classLabel(appClass));
+		});
+		o.default = '0';
+		o.rmempty = false;
+
+		o = s.taboption('rule', form.ListValue, 'verdict', _('Application-layer result'));
+		o.value('allow', _('Allow'));
+		o.value('deny', _('Block'));
+		o.default = 'deny';
+		o.rmempty = false;
+
+		o = s.taboption('rule', form.ListValue, 'activation', _('Apply rule'));
+		o.value('inactive', _('Never'));
+		o.value('always_active', _('Always'));
+		o.value('active_during', _('On schedule'));
+		o.default = 'inactive';
+		o.rmempty = false;
+		o.validate = function(sectionId, value) {
+			if (value !== 'active_during')
+				return true;
+			const section = this.section;
+			const hasPeriod = DAYS.some(function(day) {
+				return asList(section.formvalue(sectionId, '_schedule_' + day.id)).some(function(period) {
+					return String(period || '').trim().length > 0;
+				});
+			});
+			return hasPeriod ? true : _('Add at least one weekly period when Apply rule is On schedule.');
+		};
+
+		DAYS.forEach(function(day) {
+			o = s.taboption('schedule', form.DynamicList, '_schedule_' + day.id, day.label);
+			o.depends('activation', 'active_during');
+			o.retain = true;
+			o.placeholder = '08:00-12:00';
+			o.rmempty = true;
+			o.cfgvalue = function(sectionId) { return parseScheduleMap(sectionId)[day.id]; };
+			o.validate = validatePeriod;
+			o.write = function(sectionId, value) { writeScheduleDay(sectionId, day.id, value); };
+			o.remove = function(sectionId) { writeScheduleDay(sectionId, day.id, []); };
+		});
+
 		return m.render().then(function(formNode) {
 			const managedSection = formNode.querySelector('#cbi-client_access-identity');
 			if (managedSection) {
@@ -609,7 +934,7 @@ return view.extend({
 				formNode.appendChild(clientViews(managedSection,
 					unknownClientsSection(observationInventory, configuredIdentities, inventoryById, status)));
 			}
-			return E([], [ statusPanel(status), formNode ]);
+			return E([], [ statusPanel(status), applicationStatusPanel(status), formNode ]);
 		});
 	}
 });

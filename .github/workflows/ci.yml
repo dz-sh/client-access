@@ -114,7 +114,7 @@ jobs:
         run: >-
           sudo apt-get update && sudo apt-get install --yes
           clang llvm libbpf-dev libelf-dev zlib1g-dev
-          iproute2 iputils-ping
+          iproute2 iputils-ping netcat-openbsd
 
       - name: Build the datapath and publisher on Linux
         shell: bash
@@ -132,9 +132,14 @@ jobs:
         shell: bash
         run: |
           cleanup() {
+            if [ -n "${udp_server_pid:-}" ]; then
+              sudo kill "${udp_server_pid}" || true
+            fi
             sudo "${RUNNER_TEMP}/client-access-bpfctl" detach ca-lan || true
             sudo ip link del ca-lan || true
+            sudo ip link del ca-wan || true
             sudo ip netns del ca-client-ns || true
+            sudo ip netns del ca-server-ns || true
             sudo "${RUNNER_TEMP}/client-access-bpfctl" unload || true
           }
           trap cleanup EXIT
@@ -147,47 +152,173 @@ jobs:
             "${RUNNER_TEMP}/client-access-bpf.o"
 
           sudo ip netns add ca-client-ns
+          sudo ip netns add ca-server-ns
           sudo ip link add ca-lan type veth peer name ca-client
+          sudo ip link add ca-wan type veth peer name ca-server
           sudo ip link set ca-client netns ca-client-ns
+          sudo ip link set ca-server netns ca-server-ns
           sudo ip link set ca-lan up
+          sudo ip link set ca-wan up
           sudo ip address add 192.0.2.1/24 dev ca-lan
+          sudo ip address add 198.51.100.1/24 dev ca-wan
+          sudo ip -6 address add 2001:db8:1::1/64 dev ca-lan
+          sudo ip -6 address add 2001:db8:2::1/64 dev ca-wan
           sudo ip netns exec ca-client-ns ip link set lo up
+          sudo ip netns exec ca-server-ns ip link set lo up
           sudo ip netns exec ca-client-ns ip link set ca-client \
             address 02:00:00:00:00:42
+          sudo ip netns exec ca-server-ns ip link set ca-server \
+            address 02:00:00:00:00:99
           sudo ip netns exec ca-client-ns ip link set ca-client up
+          sudo ip netns exec ca-server-ns ip link set ca-server up
           sudo ip netns exec ca-client-ns ip address add \
             192.0.2.2/24 dev ca-client
+          sudo ip netns exec ca-server-ns ip address add \
+            198.51.100.2/24 dev ca-server
+          sudo ip netns exec ca-server-ns ip address add \
+            198.51.100.3/24 dev ca-server
+          sudo ip netns exec ca-server-ns ip address add \
+            198.51.100.4/24 dev ca-server
+          sudo ip netns exec ca-client-ns ip -6 address add \
+            2001:db8:1::2/64 dev ca-client
+          sudo ip netns exec ca-server-ns ip -6 address add \
+            2001:db8:2::2/64 dev ca-server
+          sudo ip netns exec ca-client-ns ip route add default via 192.0.2.1
+          sudo ip netns exec ca-server-ns ip route add 192.0.2.0/24 via 198.51.100.1
+          sudo ip netns exec ca-client-ns ip -6 route add default via 2001:db8:1::1
+          sudo ip netns exec ca-server-ns ip -6 route add 2001:db8:1::/64 via 2001:db8:2::1
+          sudo sysctl -w net.ipv4.ip_forward=1
+          sudo sysctl -w net.ipv6.conf.all.forwarding=1
+          sudo ip neigh replace 198.51.100.2 lladdr 02:00:00:00:00:99 dev ca-wan nud permanent
+          sudo ip neigh replace 198.51.100.3 lladdr 02:00:00:00:00:99 dev ca-wan nud permanent
+          sudo ip neigh replace 198.51.100.4 lladdr 02:00:00:00:00:99 dev ca-wan nud permanent
+          sudo ip -6 neigh replace 2001:db8:2::2 lladdr 02:00:00:00:00:99 dev ca-wan nud permanent
+          sudo ip netns exec ca-server-ns nc -u -l -k 443 >/dev/null &
+          udp_server_pid=$!
           sudo "${RUNNER_TEMP}/client-access-bpfctl" attach ca-lan
 
+          # Warm route and neighbour state before enabling the application layer.
+          sudo ip netns exec ca-client-ns ping -c 1 -W 1 198.51.100.2
+
+          sudo ip netns exec ca-client-ns ping -6 -c 1 -W 1 2001:db8:2::2
+
           printf '%s\n' \
-            'CONFIG 1 1 1 0 0' \
+            'CONFIG 1 1 1 0 0 1 256 200 256 512 64' \
             'SUBJECT 02:00:00:00:00:42 42' \
+            'DESTINATION ca-wan' \
+            'PREFIX4 198.51.100.2/32 100 10 1' \
+            'PREFIX6 2001:db8:2::2/128 100 10 1' \
+            'PORT 17 443 10 10 2' \
+            'POLICY 42 100 1' \
+            'POLICY 42 10 1' \
             'POLICY 42 1 1' \
-            'POLICY 42 0 1' \
+            'POLICY 42 0 0' \
             | sudo "${RUNNER_TEMP}/client-access-bpfctl" sync
-          if sudo ip netns exec ca-client-ns ping -c 1 -W 1 192.0.2.1; then
-            echo 'application DENY did not drop the packet' >&2
+
+          # Router-local traffic is outside the app-filter workflow.
+          sudo ip netns exec ca-client-ns ping -c 1 -W 1 192.0.2.1
+
+          # Port-only evidence resolves only the category and is cached for
+          # the second datagram on the same socket.
+          sudo ip netns exec ca-client-ns bash -c \
+            'exec 3>/dev/udp/198.51.100.3/443; echo first >&3; echo second >&3'
+
+          # The first packet has the explicit provisional ALLOW; the cached
+          # exact-application verdict drops the next packet.
+          sudo ip netns exec ca-client-ns ping -c 1 -W 1 198.51.100.2
+          if sudo ip netns exec ca-client-ns ping -c 1 -W 1 198.51.100.2; then
+            echo 'cached exact-application DENY did not drop the second packet' >&2
+            exit 1
+          fi
+          sudo ip netns exec ca-client-ns ping -6 -c 1 -W 1 2001:db8:2::2
+          if sudo ip netns exec ca-client-ns ping -6 -c 1 -W 1 2001:db8:2::2; then
+            echo 'IPv6 exact-application DENY did not drop the second packet' >&2
             exit 1
           fi
 
           printf '%s\n' \
-            'CONFIG 1 2 1 0 0' \
+            'CONFIG 1 2 1 0 0 1 256 200 256 512 64' \
             'SUBJECT 02:00:00:00:00:42 42' \
+            'DESTINATION ca-wan' \
+            'PREFIX4 198.51.100.2/32 100 10 1' \
+            'PREFIX6 2001:db8:2::2/128 100 10 1' \
+            'PORT 17 443 10 10 2' \
+            'POLICY 42 100 0' \
+            'POLICY 42 10 1' \
             'POLICY 42 1 0' \
             'POLICY 42 0 0' \
             | sudo "${RUNNER_TEMP}/client-access-bpfctl" sync
-          sudo ip netns exec ca-client-ns ping -c 1 -W 1 192.0.2.1
+          # Policy-generation mismatch reuses the exact class and allows the
+          # existing flow without reopening provisional classification.
+          sudo ip netns exec ca-client-ns ping -c 1 -W 1 198.51.100.2
+
+          # A failed inactive-slot build must leave generation 2 active.
+          if printf '%s\n' \
+              'CONFIG 1 3 1 0 0 1 256 200 256 512 64' \
+              'SUBJECT 02:00:00:00:00:42 42' \
+              'SUBJECT 02:00:00:00:00:42 42' \
+              'DESTINATION ca-wan' \
+              | sudo "${RUNNER_TEMP}/client-access-bpfctl" sync; then
+            echo 'invalid atomic snapshot unexpectedly succeeded' >&2
+            exit 1
+          fi
+
+          # DNS hints are generation scoped. Conflicting hints for one shared
+          # IP degrade to UNCLASSIFIED rather than last-writer-wins.
+          printf '%s\n' \
+            'DNSGEN 1' \
+            'DNS4 198.51.100.3 101 10 1 60' \
+            'DNS4 198.51.100.4 100 10 1 60' \
+            'DNS4 198.51.100.4 101 10 1 60' \
+            | sudo "${RUNNER_TEMP}/client-access-bpfctl" dns-sync
+
+          printf '%s\n' \
+            'CONFIG 1 3 1 0 0 1 256 200 256 512 64' \
+            'SUBJECT 02:00:00:00:00:42 42' \
+            'DESTINATION ca-wan' \
+            'PORT 17 443 10 10 2' \
+            'POLICY 42 101 1' \
+            'POLICY 42 10 1' \
+            'POLICY 42 1 0' \
+            'POLICY 42 0 0' \
+            | sudo "${RUNNER_TEMP}/client-access-bpfctl" sync
+          sudo ip netns exec ca-client-ns ping -c 1 -W 1 198.51.100.3
+          if sudo ip netns exec ca-client-ns ping -c 1 -W 1 198.51.100.3; then
+            echo 'DNS-derived exact application DENY did not become terminal' >&2
+            exit 1
+          fi
+          sudo ip netns exec ca-client-ns ping -c 2 -W 1 198.51.100.4
+
+          # Five-tuple churn is load-shed by aggregate and per-subject
+          # admission limits without creating userspace flow work.
+          printf '%s\n' \
+            'CONFIG 1 4 1 0 0 1 256 200 256 1 1' \
+            'SUBJECT 02:00:00:00:00:42 42' \
+            'DESTINATION ca-wan' \
+            'POLICY 42 1 0' \
+            'POLICY 42 0 0' \
+            | sudo "${RUNNER_TEMP}/client-access-bpfctl" sync
+          sudo ip netns exec ca-client-ns bash -c '
+            for port in $(seq 5000 5031); do
+              echo pressure >"/dev/udp/198.51.100.3/${port}" || true
+            done
+          '
 
           sudo "${RUNNER_TEMP}/client-access-bpfctl" status \
             | tee "${RUNNER_TEMP}/client-access-bpf-status.json"
           jq -e '
             .enabled == true and
-            .app_policy_generation == 2 and
+            .app_policy_generation == 4 and
+            .classifier_generation == 1 and
             .subject_entries == 1 and
+            .destination_entries == 1 and
             .policy_entries == 2 and
-            .flow_entries >= 1 and
+            .flow_map_entries >= 4 and
+            .flows_classified_exact >= 3 and
+            .flows_classified_category >= 1 and
             .flows_denied >= 1 and
             .flows_allowed >= 1 and
+            .classification_admission_denied >= 1 and
             .policy_reevaluations >= 1
           ' "${RUNNER_TEMP}/client-access-bpf-status.json"
 

@@ -19,8 +19,20 @@ let timer, published;
 let generation = 0;
 let applied_signature = null;
 let app_policy_generation = 0;
+let classifier_generation = 0;
 let app_applied_signature = null;
+let classifier_applied_signature = null;
+let generation_floors_loaded = false;
 let app_attached_interfaces = [];
+let dns_subscriber, dns_flush_timer;
+let dns_subscribed = false;
+let dns_queue = {};
+let dns_window_epoch = 0;
+let dns_window_events = 0;
+let dns_events_accepted = 0;
+let dns_events_dropped = 0;
+let dns_hint_conflicts = 0;
+let dns_publish_errors = 0;
 let last_config = null;
 let last_compiled = null;
 let last_projection = null;
@@ -55,6 +67,12 @@ let state = {
 		degraded: false,
 		retained_previous_snapshot: false,
 		app_policy_generation: 0,
+		classifier_generation: 0,
+		dns_subscribed: false,
+		dns_events_accepted: 0,
+		dns_events_dropped: 0,
+		dns_hint_conflicts: 0,
+		dns_publish_errors: 0,
 		next_transition: null,
 		errors: [],
 		warnings: [],
@@ -74,8 +92,14 @@ function read_config() {
 		enabled: uci.get('client_access', 'main', 'enabled'),
 		mode: uci.get('client_access', 'main', 'mode'),
 		app_filter_enabled: uci.get('client_access', 'main', 'app_filter_enabled'),
-		unknown_app_verdict: uci.get('client_access', 'main', 'unknown_app_verdict'),
+		unknown_subject_app_verdict: uci.get('client_access', 'main', 'unknown_subject_app_verdict'),
 		provisional_app_verdict: uci.get('client_access', 'main', 'provisional_app_verdict'),
+		max_packets_inspected: uci.get('client_access', 'main', 'max_packets_inspected'),
+		max_bytes_examined: uci.get('client_access', 'main', 'max_bytes_examined'),
+		max_classification_age_ms: uci.get('client_access', 'main', 'max_classification_age_ms'),
+		max_pending_entries: uci.get('client_access', 'main', 'max_pending_entries'),
+		max_new_classifications_per_second: uci.get('client_access', 'main', 'max_new_classifications_per_second'),
+		per_subject_new_classification_rate: uci.get('client_access', 'main', 'per_subject_new_classification_rate'),
 		deny_action: uci.get('client_access', 'main', 'deny_action'),
 		source_zone: as_list(uci.get('client_access', 'main', 'source_zone')),
 		destination_zone: as_list(uci.get('client_access', 'main', 'destination_zone')),
@@ -110,6 +134,8 @@ function read_config() {
 			udp_ports: as_list(s.udp_port),
 			ipv4_prefixes: as_list(s.ipv4_prefix),
 			ipv6_prefixes: as_list(s.ipv6_prefix),
+			signature_source: s.signature_source,
+			signature_license: s.signature_license,
 		});
 	});
 	uci.foreach('client_access', 'app_rule', function(s) {
@@ -218,34 +244,226 @@ function desired_signature(compiled, projection, sources, destinations) {
 	});
 }
 
-function app_signature(app_compiled, subject_projection, sources) {
+function app_signature(app_compiled, subject_projection, sources, destinations) {
 	return sprintf('%J', {
 		enabled: app_compiled.enabled,
-		unknown_app_verdict: app_compiled.unknown_app_verdict,
+		unknown_subject_app_verdict: app_compiled.unknown_subject_app_verdict,
 		provisional_app_verdict: app_compiled.provisional_app_verdict,
 		selectors: subject_projection.selectors,
 		policies: app_compiled.policies,
+		resource_limits: app_compiled.resource_limits,
 		sources,
+		destinations,
 	});
+}
+
+function classifier_signature(app_compiled) {
+	return sprintf('%J', app_compiled.classifier);
+}
+
+function load_generation_floors() {
+	if (generation_floors_loaded)
+		return;
+	const result = run_capture([ BPFCTL, 'generations' ]);
+	const values = split(trim(result.output), /\s+/);
+	if (result.code != 0 || length(values) != 2 ||
+	    !match(values[0], /^(0|[1-9][0-9]*)$/) ||
+	    !match(values[1], /^(0|[1-9][0-9]*)$/))
+		return;
+	const policy_floor = +values[0];
+	const classifier_floor = +values[1];
+	if (policy_floor > app_policy_generation)
+		app_policy_generation = policy_floor;
+	if (classifier_floor > classifier_generation)
+		classifier_generation = classifier_floor;
+	generation_floors_loaded = true;
 }
 
 function verdict_number(verdict) {
 	return verdict == 'deny' ? 1 : 0;
 }
 
-function app_snapshot(app_compiled, subject_projection, candidate_generation) {
-	let lines = [ sprintf('CONFIG %d %d %d %d %d',
+function app_snapshot(app_compiled, subject_projection, candidate_generation,
+		candidate_classifier_generation, destinations) {
+	const limits = app_compiled.resource_limits;
+	let lines = [ sprintf('CONFIG %d %d %d %d %d %d %d %d %d %d %d',
 		app_compiled.enabled ? 1 : 0,
 		candidate_generation,
-		1,
-		verdict_number(app_compiled.unknown_app_verdict),
-		verdict_number(app_compiled.provisional_app_verdict)) ];
+		candidate_classifier_generation,
+		verdict_number(app_compiled.unknown_subject_app_verdict),
+		verdict_number(app_compiled.provisional_app_verdict),
+		limits.max_packets_inspected,
+		limits.max_bytes_examined,
+		limits.max_classification_age_ms,
+		limits.max_pending_entries,
+		limits.max_new_classifications_per_second,
+		limits.per_subject_new_classification_rate) ];
 	for (let selector in subject_projection.selectors)
 		push(lines, sprintf('SUBJECT %s %d', selector.mac, selector.subject_id));
+	for (let ifname in destinations)
+		push(lines, sprintf('DESTINATION %s', ifname));
 	for (let entry in app_compiled.policies)
 		push(lines, sprintf('POLICY %d %d %d',
 			entry.subject_id, entry.class_id, verdict_number(entry.verdict)));
+	for (let entry in app_compiled.classifier.ports)
+		push(lines, sprintf('PORT %d %d %d %d %d', entry.protocol, entry.port,
+			entry.hint.class_id, entry.hint.category_id, entry.hint.kind));
+	for (let entry in app_compiled.classifier.ipv4_prefixes)
+		push(lines, sprintf('PREFIX4 %s %d %d %d', entry.prefix,
+			entry.hint.class_id, entry.hint.category_id, entry.hint.kind));
+	for (let entry in app_compiled.classifier.ipv6_prefixes)
+		push(lines, sprintf('PREFIX6 %s %d %d %d', entry.prefix,
+			entry.hint.class_id, entry.hint.category_id, entry.hint.kind));
 	return join('\n', lines) + '\n';
+}
+
+function clear_dns_queue() {
+	dns_queue = {};
+}
+
+function domain_hint(app_compiled, raw_name) {
+	let name = lc(trim('' + (raw_name ?? '')));
+	name = replace(name, /\.+$/, '');
+	if (!length(name))
+		return null;
+
+	let selected = null, selected_score = -1, conflict = false;
+	for (let entry in (app_compiled.classifier.domains ?? [])) {
+		const pattern = entry.pattern;
+		let score = -1;
+		if (substr(pattern, 0, 2) == '*.') {
+			const suffix = substr(pattern, 1);
+			if (length(name) > length(suffix) &&
+			    substr(name, length(name) - length(suffix)) == suffix)
+				score = length(suffix);
+		}
+		else if (name == pattern) {
+			score = 100000 + length(pattern);
+		}
+
+		if (score > selected_score) {
+			selected = entry.hint;
+			selected_score = score;
+			conflict = false;
+		}
+		else if (score >= 0 && score == selected_score &&
+		         sprintf('%J', selected) != sprintf('%J', entry.hint)) {
+			conflict = true;
+		}
+	}
+
+	return selected_score >= 0 && !conflict ? selected : null;
+}
+
+function dns_queue_size() {
+	let count = 0;
+	for (let key in dns_queue)
+		count++;
+	return count;
+}
+
+function flush_dns_queue() {
+	if (!dns_queue_size())
+		return;
+
+	const batch = dns_queue;
+	dns_queue = {};
+	if (!last_app_compiled || !last_app_compiled.enabled || !classifier_generation)
+		return;
+
+	let lines = [ sprintf('DNSGEN %d', classifier_generation) ];
+	for (let key, entry in batch)
+		push(lines, sprintf('%s %s %d %d %d %d',
+			entry.type == 'A' ? 'DNS4' : 'DNS6', entry.address,
+			entry.hint.class_id, entry.hint.category_id,
+			entry.hint.kind, entry.ttl));
+
+	const result = run_write([ BPFCTL, 'dns-sync' ], join('\n', lines) + '\n');
+	if (!result.ok)
+		dns_publish_errors++;
+}
+
+function queue_dns_result(data) {
+	if (!last_app_compiled || !last_app_compiled.enabled || !classifier_generation)
+		return;
+	if (data.type != 'A' && data.type != 'AAAA')
+		return;
+
+	const hint = domain_hint(last_app_compiled, data.name);
+	if (!hint)
+		return;
+
+	const address = trim('' + (data.address ?? ''));
+	const ttl_text = trim('' + (data.ttl ?? ''));
+	if (!length(address) || !match(ttl_text, /^(0|[1-9][0-9]*)$/)) {
+		dns_events_dropped++;
+		return;
+	}
+
+	const now = clock()[0];
+	if (now != dns_window_epoch) {
+		dns_window_epoch = now;
+		dns_window_events = 0;
+	}
+	if (dns_window_events >= 128) {
+		dns_events_dropped++;
+		return;
+	}
+	dns_window_events++;
+
+	const key = `${data.type}/${address}`;
+	const was_empty = dns_queue_size() == 0;
+	if (!dns_queue[key] && dns_queue_size() >= 256) {
+		dns_events_dropped++;
+		return;
+	}
+	let ttl = +ttl_text;
+	if (ttl < 1)
+		ttl = 1;
+	if (ttl > 86400)
+		ttl = 86400;
+	const queued = dns_queue[key];
+	if (queued && sprintf('%J', queued.hint) != sprintf('%J', hint)) {
+		dns_queue[key] = {
+			type: data.type,
+			address,
+			hint: { class_id: 1, category_id: 0, kind: 0 },
+			ttl: ttl > queued.ttl ? ttl : queued.ttl,
+		};
+		dns_hint_conflicts++;
+	}
+	else if (!queued || queued.hint.kind != 0) {
+		dns_queue[key] = {
+			type: data.type,
+			address,
+			hint,
+			ttl: queued && queued.ttl > ttl ? queued.ttl : ttl,
+		};
+	}
+	dns_events_accepted++;
+
+	if (was_empty) {
+		if (!dns_flush_timer)
+			dns_flush_timer = uloop.timer(100, function() { flush_dns_queue(); });
+		else
+			dns_flush_timer.set(100);
+	}
+}
+
+function ensure_dns_subscription() {
+	if (!dns_subscriber) {
+		dns_subscriber = conn.subscriber(
+			function(notify) {
+				queue_dns_result(notify.data ?? {});
+				notify.reply({}, 0);
+			},
+			function(id) {
+				dns_subscribed = false;
+			}
+		);
+	}
+	if (!dns_subscribed)
+		dns_subscribed = !!dns_subscriber.subscribe('dnsmasq.dns');
 }
 
 function detach_app_interfaces(keep) {
@@ -262,8 +480,9 @@ function detach_app_interfaces(keep) {
 	app_attached_interfaces = remaining;
 }
 
-function apply_app_filter(config, app_compiled, subject_projection, sources, force) {
-	let errors = [ ...app_compiled.errors, ...subject_projection.errors ];
+function apply_app_filter(config, app_compiled, subject_projection, sources,
+		destinations, zone_errors, force) {
+	let errors = [ ...app_compiled.errors, ...subject_projection.errors, ...zone_errors ];
 	let warnings = [ ...app_compiled.warnings ];
 	const previously_enabled = app_applied_signature != null && length(app_attached_interfaces) > 0;
 	const previous_interfaces = {};
@@ -278,6 +497,8 @@ function apply_app_filter(config, app_compiled, subject_projection, sources, for
 			push(errors, 'Unable to neutralize the application-filter datapath');
 		detach_app_interfaces([]);
 		app_applied_signature = null;
+		classifier_applied_signature = null;
+		clear_dns_queue();
 		return {
 			ok: disabled.code == null || disabled.code == 0,
 			available: false,
@@ -286,14 +507,37 @@ function apply_app_filter(config, app_compiled, subject_projection, sources, for
 			retained_previous_snapshot: false,
 			backend_mode: 'V3_NFT_ONLY',
 			generation: app_policy_generation,
+			classifier_generation,
 			errors,
 			warnings,
 		};
 	}
-	if (config.flow_offloading || config.flow_offloading_hw)
+	if (config.flow_offloading || config.flow_offloading_hw) {
 		push(errors, 'Disable firewall software and hardware flow offloading before enabling application filtering');
+		const disabled = stat(BPFCTL)
+			? run_capture([ BPFCTL, 'disable' ])
+			: { code: null, output: '' };
+		detach_app_interfaces([]);
+		app_applied_signature = null;
+		classifier_applied_signature = null;
+		clear_dns_queue();
+		return {
+			ok: false,
+			available: disabled.code != null,
+			enabled: false,
+			degraded: true,
+			retained_previous_snapshot: false,
+			backend_mode: 'V3_NFT_ONLY',
+			generation: app_policy_generation,
+			classifier_generation,
+			errors,
+			warnings,
+		};
+	}
 	if (!length(sources))
 		push(errors, 'No LAN source interfaces resolved for the application filter');
+	if (!length(destinations))
+		push(errors, 'No Internet destination interfaces resolved for the application filter');
 	if (!app_compiled.enabled || length(errors)) {
 		return {
 			ok: false,
@@ -303,6 +547,7 @@ function apply_app_filter(config, app_compiled, subject_projection, sources, for
 			retained_previous_snapshot: previously_enabled,
 			backend_mode: previously_enabled ? 'V4_BPF_BASIC' : 'V3_NFT_ONLY',
 			generation: app_policy_generation,
+			classifier_generation,
 			errors,
 			warnings,
 		};
@@ -319,10 +564,12 @@ function apply_app_filter(config, app_compiled, subject_projection, sources, for
 			retained_previous_snapshot: previously_enabled,
 			backend_mode: previously_enabled ? 'V4_BPF_BASIC' : 'V3_NFT_ONLY',
 			generation: app_policy_generation,
+			classifier_generation,
 			errors,
 			warnings,
 		};
 	}
+	load_generation_floors();
 
 	let attached = [];
 	for (let ifname in sources) {
@@ -344,17 +591,23 @@ function apply_app_filter(config, app_compiled, subject_projection, sources, for
 			retained_previous_snapshot: previously_enabled,
 			backend_mode: 'V4_BPF_BASIC',
 			generation: app_policy_generation,
+			classifier_generation,
 			errors,
 			warnings,
 		};
 	}
 
-	const signature = app_signature(app_compiled, subject_projection, sources);
+	const signature = app_signature(app_compiled, subject_projection, sources, destinations);
 	const changed = signature != app_applied_signature;
 	const candidate_generation = changed ? app_policy_generation + 1 : app_policy_generation;
-	if (force || changed) {
+	const current_classifier_signature = classifier_signature(app_compiled);
+	const classifier_changed = current_classifier_signature != classifier_applied_signature;
+	const candidate_classifier_generation = classifier_changed
+		? classifier_generation + 1 : classifier_generation;
+	if (force || changed || classifier_changed) {
 		const result = run_write([ BPFCTL, 'sync' ],
-			app_snapshot(app_compiled, subject_projection, candidate_generation));
+			app_snapshot(app_compiled, subject_projection, candidate_generation,
+				candidate_classifier_generation, destinations));
 		if (!result.ok) {
 			push(errors, result.error);
 			for (let ifname in attached)
@@ -368,6 +621,7 @@ function apply_app_filter(config, app_compiled, subject_projection, sources, for
 				retained_previous_snapshot: previously_enabled,
 				backend_mode: 'V4_BPF_BASIC',
 				generation: app_policy_generation,
+				classifier_generation,
 				errors,
 				warnings,
 			};
@@ -377,6 +631,11 @@ function apply_app_filter(config, app_compiled, subject_projection, sources, for
 	app_attached_interfaces = [ ...sources ];
 	if (changed)
 		app_policy_generation = candidate_generation;
+	if (classifier_changed) {
+		classifier_generation = candidate_classifier_generation;
+		classifier_applied_signature = current_classifier_signature;
+		clear_dns_queue();
+	}
 	app_applied_signature = signature;
 	return {
 		ok: true,
@@ -386,9 +645,42 @@ function apply_app_filter(config, app_compiled, subject_projection, sources, for
 		retained_previous_snapshot: false,
 		backend_mode: 'V4_BPF_BASIC',
 		generation: app_policy_generation,
+		classifier_generation,
 		errors,
 		warnings,
 	};
+}
+
+function app_runtime_snapshot(enabled) {
+	if (!enabled || !stat(BPFCTL))
+		return { available: false, status_json: null, error: null };
+
+	const gc = run_capture([ BPFCTL, 'gc', '300' ]);
+	const status = run_capture([ BPFCTL, 'status' ]);
+	return {
+		available: status.code == 0,
+		status_json: status.code == 0 ? trim(status.output) : null,
+		error: status.code == 0
+			? (gc.code == 0 ? null : 'Unable to reclaim idle application flows')
+			: 'Unable to read application-filter runtime diagnostics',
+	};
+}
+
+function current_status() {
+	let result = { ...state, app_filter: { ...(state.app_filter ?? {}) } };
+	result.app_filter.dns_subscribed = dns_subscribed;
+	result.app_filter.dns_queue_entries = dns_queue_size();
+	result.app_filter.dns_events_accepted = dns_events_accepted;
+	result.app_filter.dns_events_dropped = dns_events_dropped;
+	result.app_filter.dns_hint_conflicts = dns_hint_conflicts;
+	result.app_filter.dns_publish_errors = dns_publish_errors;
+	if (result.app_filter.enabled && stat(BPFCTL)) {
+		const runtime = run_capture([ BPFCTL, 'status' ]);
+		result.app_filter.runtime_available = runtime.code == 0;
+		result.app_filter.runtime_status_json = runtime.code == 0
+			? trim(runtime.output) : null;
+	}
+	return result;
 }
 
 function apply_nft(compiled, projection, sources, destinations) {
@@ -450,6 +742,7 @@ function compile_runtime(config, epoch) {
 }
 
 function reconcile(reason, force) {
+	ensure_dns_subscription();
 	const epoch = clock()[0];
 	const config = read_config();
 	const runtime = compile_runtime(config, epoch);
@@ -460,11 +753,12 @@ function reconcile(reason, force) {
 	const source = compiled.enabled || app_compiled.requested_enabled
 		? resolve_zones(config.source_zone)
 		: { interfaces: [], errors: [] };
-	const destination = compiled.enabled
+	const destination = compiled.enabled || app_compiled.requested_enabled
 		? resolve_zones(config.destination_zone)
 		: { interfaces: [], errors: [] };
 	const signature = desired_signature(compiled, projection, source.interfaces, destination.interfaces);
-	let readiness_errors = [ ...source.errors, ...destination.errors ];
+	let readiness_errors = compiled.enabled
+		? [ ...source.errors, ...destination.errors ] : [];
 	if (compiled.enabled && !length(source.interfaces))
 		push(readiness_errors, 'No source interfaces resolved; enforcement is inactive');
 	if (compiled.enabled && !length(destination.interfaces))
@@ -484,7 +778,11 @@ function reconcile(reason, force) {
 		push(errors, apply.error);
 
 	const app_apply = apply_app_filter(config, app_compiled, subject_projection,
-		source.interfaces, force);
+		source.interfaces, destination.interfaces,
+		[ ...source.errors, ...destination.errors ], force);
+	const app_runtime = app_runtime_snapshot(app_apply.enabled);
+	if (app_runtime.error)
+		push(app_apply.warnings, app_runtime.error);
 	for (let warning in runtime.consistency.warnings)
 		push(app_apply.warnings, warning);
 
@@ -533,6 +831,17 @@ function reconcile(reason, force) {
 			available: app_apply.available,
 			applied: app_apply.ok,
 			app_policy_generation: app_apply.generation,
+			classifier_generation: app_apply.classifier_generation,
+			classifier_signature_count: app_compiled.classifier.signature_count,
+			resource_limits: app_compiled.resource_limits,
+			runtime_available: app_runtime.available,
+			runtime_status_json: app_runtime.status_json,
+			dns_subscribed,
+			dns_queue_entries: dns_queue_size(),
+			dns_events_accepted,
+			dns_events_dropped,
+			dns_hint_conflicts,
+			dns_publish_errors,
 			next_transition: app_compiled.next_transition,
 			subject_count: length(app_compiled.identities),
 			selector_count: length(subject_projection.preview_selectors),
@@ -644,7 +953,7 @@ if (!conn) {
 
 published = conn.publish('client_access', {
 	status: {
-		call: function() { return state; },
+		call: function() { return current_status(); },
 	},
 	preview: {
 		call: function() {

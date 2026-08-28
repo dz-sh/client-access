@@ -125,12 +125,114 @@ static int acquire_update_lock(void)
 	return fd;
 }
 
+static int program_id_from_fd(int fd, __u32 *id)
+{
+	struct bpf_prog_info info = {};
+	__u32 size = sizeof(info);
+
+	if (bpf_prog_get_info_by_fd(fd, &info, &size))
+		return -errno;
+	*id = info.id;
+	return 0;
+}
+
+static int tc_query_program(unsigned int ifindex, __u32 handle, __u32 priority,
+			    __u32 *program_id)
+{
+	DECLARE_LIBBPF_OPTS(bpf_tc_hook, hook,
+		.ifindex = ifindex,
+		.attach_point = BPF_TC_INGRESS,
+	);
+	DECLARE_LIBBPF_OPTS(bpf_tc_opts, opts,
+		.handle = handle,
+		.priority = priority,
+	);
+	int err = bpf_tc_query(&hook, &opts);
+
+	if (!err)
+		*program_id = opts.prog_id;
+	return err;
+}
+
+static int detach_program_from_all_interfaces(__u32 program_id)
+{
+	static const struct {
+		__u32 handle;
+		__u32 priority;
+	} coordinates[] = {
+		{ CA_TC_HANDLE, CA_TC_PRIORITY },
+		/* Remove filters left by the pre-schema-version implementation. */
+		{ 1, 1 },
+	};
+	struct if_nameindex *interfaces = if_nameindex();
+	int failures = 0;
+
+	if (!interfaces) {
+		fprintf(stderr, "unable to enumerate interfaces: %s\n", strerror(errno));
+		return 1;
+	}
+	for (struct if_nameindex *entry = interfaces; entry->if_index; entry++) {
+		for (size_t i = 0; i < ARRAY_SIZE(coordinates); i++) {
+			DECLARE_LIBBPF_OPTS(bpf_tc_hook, hook,
+				.ifindex = entry->if_index,
+				.attach_point = BPF_TC_INGRESS,
+			);
+			DECLARE_LIBBPF_OPTS(bpf_tc_opts, opts,
+				.handle = coordinates[i].handle,
+				.priority = coordinates[i].priority,
+			);
+			__u32 attached_id = 0;
+			int err = tc_query_program(entry->if_index, opts.handle,
+						   opts.priority, &attached_id);
+
+			if (err || attached_id != program_id)
+				continue;
+			err = bpf_tc_detach(&hook, &opts);
+			if (err && err != -ENOENT) {
+				fprintf(stderr, "unable to detach owned TC program from %s: %s\n",
+					entry->if_name, strerror(-err));
+				failures++;
+			}
+		}
+	}
+	if_freenameindex(interfaces);
+	return failures ? 1 : 0;
+}
+
+static int detach_pinned_program(void)
+{
+	__u32 program_id;
+	int fd = bpf_obj_get(CA_PROGRAM_PIN);
+	int ret;
+
+	if (fd < 0)
+		return errno == ENOENT ? 0 : 1;
+	ret = program_id_from_fd(fd, &program_id);
+	close(fd);
+	if (ret) {
+		fprintf(stderr, "unable to identify pinned BPF program: %s\n",
+			strerror(-ret));
+		return 1;
+	}
+	return detach_program_from_all_interfaces(program_id);
+}
+
 static bool pinned_backend_available(void)
 {
+	__u32 zero = 0, schema = 0;
 	int fd = bpf_obj_get(CA_PROGRAM_PIN);
 
 	if (fd < 0)
 		return false;
+	close(fd);
+	fd = open_map("ca_mark_schema");
+	if (fd < 0)
+		return false;
+	if (bpf_map_lookup_elem(fd, &zero, &schema) ||
+	    schema != CA_BPF_SCHEMA_VERSION) {
+		close(fd);
+		return false;
+	}
 	close(fd);
 	for (size_t i = 0; i < ARRAY_SIZE(map_names); i++) {
 		fd = open_map(map_names[i]);
@@ -181,14 +283,20 @@ static int load_object(const char *path, bool replace)
 		.pin_root_path = CA_PIN_ROOT,
 	);
 	struct bpf_program *program;
+	struct bpf_map *schema_map;
 	struct bpf_object *object;
 	bool available = pinned_backend_available();
+	__u32 zero = 0, schema = CA_BPF_SCHEMA_VERSION;
 	int err;
 
 	if (!replace && available)
 		return 0;
 	if (ensure_pin_root())
 		return 1;
+	if (detach_pinned_program()) {
+		fprintf(stderr, "refusing to replace BPF state while an owned TC filter remains attached\n");
+		return 1;
+	}
 	/* Remove partial or schema-incompatible pins before loading this object. */
 	unlink_pins();
 
@@ -211,11 +319,22 @@ static int load_object(const char *path, bool replace)
 		bpf_object__close(object);
 		return 1;
 	}
+	schema_map = bpf_object__find_map_by_name(object, "ca_mark_schema");
+	if (!schema_map || bpf_map_update_elem(bpf_map__fd(schema_map), &zero,
+					       &schema, BPF_ANY)) {
+		fprintf(stderr, "unable to publish BPF schema version: %s\n",
+			strerror(errno));
+		bpf_object__close(object);
+		unlink_pins();
+		return 1;
+	}
 	unlink(CA_PROGRAM_PIN);
 	err = bpf_program__pin(program, CA_PROGRAM_PIN);
 	if (err)
 		fprintf(stderr, "unable to pin BPF program: %s\n", strerror(-err));
 	bpf_object__close(object);
+	if (err)
+		unlink_pins();
 	return err ? 1 : 0;
 }
 
@@ -225,9 +344,10 @@ static int tc_action(const char *ifname, bool attach)
 		.attach_point = BPF_TC_INGRESS,
 	);
 	DECLARE_LIBBPF_OPTS(bpf_tc_opts, opts,
-		.handle = 1,
-		.priority = 1,
+		.handle = CA_TC_HANDLE,
+		.priority = CA_TC_PRIORITY,
 	);
+	__u32 attached_id = 0, program_id = 0;
 	int program_fd, err;
 
 	hook.ifindex = if_nametoindex(ifname);
@@ -235,18 +355,42 @@ static int tc_action(const char *ifname, bool attach)
 		fprintf(stderr, "unknown interface %s\n", ifname);
 		return 1;
 	}
-	if (!attach) {
-		err = bpf_tc_detach(&hook, &opts);
-		if (err && err != -ENOENT)
-			fprintf(stderr, "unable to detach TC program from %s: %s\n",
-				ifname, strerror(-err));
-		return err && err != -ENOENT ? 1 : 0;
-	}
-
 	program_fd = bpf_obj_get(CA_PROGRAM_PIN);
 	if (program_fd < 0) {
 		fprintf(stderr, "pinned BPF program is unavailable: %s\n", strerror(errno));
 		return 1;
+	}
+	err = program_id_from_fd(program_fd, &program_id);
+	if (err) {
+		fprintf(stderr, "unable to identify pinned BPF program: %s\n",
+			strerror(-err));
+		close(program_fd);
+		return 1;
+	}
+	err = tc_query_program(hook.ifindex, opts.handle, opts.priority, &attached_id);
+	if (!attach) {
+		if (err == -ENOENT) {
+			close(program_fd);
+			return 0;
+		}
+		if (err) {
+			fprintf(stderr, "unable to query TC program on %s: %s\n",
+				ifname, strerror(-err));
+			close(program_fd);
+			return 1;
+		}
+		if (attached_id != program_id) {
+			fprintf(stderr, "refusing to detach an unowned TC program from %s\n",
+				ifname);
+			close(program_fd);
+			return 1;
+		}
+		err = bpf_tc_detach(&hook, &opts);
+		if (err && err != -ENOENT)
+			fprintf(stderr, "unable to detach TC program from %s: %s\n",
+				ifname, strerror(-err));
+		close(program_fd);
+		return err && err != -ENOENT ? 1 : 0;
 	}
 	err = bpf_tc_hook_create(&hook);
 	if (err && err != -EEXIST) {
@@ -254,12 +398,32 @@ static int tc_action(const char *ifname, bool attach)
 		close(program_fd);
 		return 1;
 	}
+	attached_id = 0;
+	err = tc_query_program(hook.ifindex, opts.handle, opts.priority, &attached_id);
+	if (!err) {
+		if (attached_id == program_id) {
+			close(program_fd);
+			return 0;
+		}
+		fprintf(stderr, "TC coordinate %u/%u on %s is owned by another program\n",
+			opts.handle, opts.priority, ifname);
+		close(program_fd);
+		return 1;
+	}
+	if (err != -ENOENT) {
+		fprintf(stderr, "unable to query TC coordinate on %s: %s\n",
+			ifname, strerror(-err));
+		close(program_fd);
+		return 1;
+	}
 	opts.prog_fd = program_fd;
 	opts.flags = 0;
 	err = bpf_tc_attach(&hook, &opts);
 	if (err == -EEXIST) {
-		opts.flags = BPF_TC_F_REPLACE;
-		err = bpf_tc_attach(&hook, &opts);
+		attached_id = 0;
+		if (!tc_query_program(hook.ifindex, opts.handle, opts.priority,
+				      &attached_id) && attached_id == program_id)
+			err = 0;
 	}
 	if (err)
 		fprintf(stderr, "unable to attach TC program to %s: %s\n", ifname, strerror(-err));
@@ -1024,11 +1188,11 @@ static int print_status(void)
 {
 	struct ca_config config = {};
 	__u64 runtime = 0;
-	__u32 zero = 0;
+	__u32 zero = 0, schema = 0;
 	int config_fd = -1, subject_fd = -1, policy_fd = -1;
 	int port_fd = -1, ipv4_fd = -1, ipv6_fd = -1;
 	int dns4_fd = -1, dns6_fd = -1, flow_fd = -1;
-	int runtime_fd = -1, stats_fd = -1;
+	int runtime_fd = -1, stats_fd = -1, schema_fd = -1;
 	int cpus = libbpf_num_possible_cpus();
 	uint64_t *percpu = NULL;
 	uint64_t stats[CA_STATS_COUNT] = {};
@@ -1042,6 +1206,11 @@ static int print_status(void)
 	config_fd = open_map("ca_config");
 	if (config_fd < 0 || bpf_map_lookup_elem(config_fd, &zero, &config)) {
 		fprintf(stderr, "application BPF state is unavailable\n");
+		goto out;
+	}
+	schema_fd = open_map("ca_mark_schema");
+	if (schema_fd < 0 || bpf_map_lookup_elem(schema_fd, &zero, &schema)) {
+		fprintf(stderr, "application BPF schema is unavailable\n");
 		goto out;
 	}
 	subject_fd = open_map(config.active_slot ? "ca_subject_b" : "ca_subject_a");
@@ -1082,6 +1251,7 @@ static int print_status(void)
 	flow_entries = count_map_entries(flow_fd, sizeof(struct ca_flow_key));
 	printf("{\"backend_mode\":\"V4_BPF_BASIC\"," 
 	       "\"program_pinned\":true,\"maps_pinned\":true,"
+	       "\"bpf_schema_version\":%u,"
 	       "\"enabled\":%s,\"active_slot\":%u,"
 	       "\"app_policy_generation\":%u,\"classifier_generation\":%u,"
 	       "\"subject_entries\":%d,\"subject_count\":%d,"
@@ -1117,7 +1287,7 @@ static int print_status(void)
 	       "\"max_classification_age_ms\":%u,\"max_pending_entries\":%u,"
 	       "\"max_new_classifications_per_second\":%u,"
 	       "\"per_subject_new_classification_rate\":%u}\n",
-	       config.enabled ? "true" : "false", config.active_slot,
+	       schema, config.enabled ? "true" : "false", config.active_slot,
 	       config.app_policy_generation, config.classifier_generation,
 	       subject_entries, unique_subjects,
 	       policy_entries, policy_entries,
@@ -1169,6 +1339,8 @@ out:
 		close(runtime_fd);
 	if (stats_fd >= 0)
 		close(stats_fd);
+	if (schema_fd >= 0)
+		close(schema_fd);
 	return ret;
 }
 
@@ -1193,6 +1365,8 @@ int main(int argc, char **argv)
 		return disable_backend();
 	if (!strcmp(argv[1], "unload")) {
 		if (disable_backend())
+			return 1;
+		if (detach_pinned_program())
 			return 1;
 		unlink_pins();
 		return 0;

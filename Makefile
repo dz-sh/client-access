@@ -81,6 +81,8 @@ endef
 define Package/client-access-bpf/postinst
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}$${PKG_INSTROOT}" ] || {
+	/usr/sbin/client-access-bpfctl load /usr/lib/bpf/client-access-bpf.o \
+		>/dev/null 2>&1 || true
 	/etc/init.d/client-access restart >/dev/null 2>&1 || true
 }
 exit 0
@@ -89,7 +91,7 @@ endef
 define Package/client-access-bpf/prerm
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}$${PKG_INSTROOT}" ] || {
-	/usr/sbin/client-access-bpfctl disable >/dev/null 2>&1 || true
+	/usr/sbin/client-access-bpfctl unload >/dev/null 2>&1 || true
 }
 exit 0
 endef

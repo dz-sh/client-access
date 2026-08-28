@@ -209,6 +209,42 @@ jobs:
           sudo nsenter --net=/var/run/netns/ca-router-ns -- \
             "${RUNNER_TEMP}/client-access-bpfctl" attach ca-lan
 
+          # Exercise the pinned-object lifecycle in the namespace that owns
+          # the TC attachment. Ensure is idempotent, load detaches the old
+          # owned program before replacing its ABI, and unload removes both
+          # the attachment and all pins.
+          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+            "${RUNNER_TEMP}/client-access-bpfctl" ensure \
+            "${RUNNER_TEMP}/client-access-bpf.o"
+          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+            "${RUNNER_TEMP}/client-access-bpfctl" attach ca-lan
+          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+            "${RUNNER_TEMP}/client-access-bpfctl" load \
+            "${RUNNER_TEMP}/client-access-bpf.o"
+          if sudo ip netns exec ca-router-ns tc filter show dev ca-lan ingress \
+              | grep -q 'bpf'; then
+            echo 'load left the replaced TC program attached' >&2
+            exit 1
+          fi
+          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+            "${RUNNER_TEMP}/client-access-bpfctl" attach ca-lan
+          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+            "${RUNNER_TEMP}/client-access-bpfctl" unload
+          if sudo ip netns exec ca-router-ns tc filter show dev ca-lan ingress \
+              | grep -q 'bpf'; then
+            echo 'unload left the owned TC program attached' >&2
+            exit 1
+          fi
+          if sudo "${RUNNER_TEMP}/client-access-bpfctl" status; then
+            echo 'unload left a usable pinned backend' >&2
+            exit 1
+          fi
+          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+            "${RUNNER_TEMP}/client-access-bpfctl" ensure \
+            "${RUNNER_TEMP}/client-access-bpf.o"
+          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+            "${RUNNER_TEMP}/client-access-bpfctl" attach ca-lan
+
           # Establish that the namespace router works before adding the
           # application workflow's nft forward consumer.
           sudo ip netns exec ca-client-ns ping -c 1 -W 1 198.51.100.2
@@ -344,6 +380,7 @@ jobs:
             | tee "${RUNNER_TEMP}/client-access-bpf-status.json"
           jq -e '
             .enabled == true and
+            .bpf_schema_version == 2 and
             .app_policy_generation == 4 and
             .classifier_generation == 1 and
             .subject_entries == 1 and

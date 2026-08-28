@@ -7,6 +7,13 @@
 #define CA_PIN_ROOT "/sys/fs/bpf/client_access"
 #define CA_PROGRAM_PIN CA_PIN_ROOT "/ca_ingress"
 
+/* Bump whenever a pinned program or map ABI becomes incompatible. */
+#define CA_BPF_SCHEMA_VERSION 2U
+
+/* Reserved TC classifier coordinate owned by this application. */
+#define CA_TC_HANDLE 0xcaU
+#define CA_TC_PRIORITY 0xcaU
+
 #define CA_CLASS_DEFAULT 0
 #define CA_CLASS_UNCLASSIFIED 1
 

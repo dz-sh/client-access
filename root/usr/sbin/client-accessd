@@ -535,6 +535,28 @@ function apply_app_filter(config, app_compiled, subject_projection, sources,
 			warnings,
 		};
 	}
+	if (!stat(BPFCTL)) {
+		push(errors, 'The optional TC eBPF application backend is not installed');
+		app_attached_interfaces = [];
+		const scope = apply_app_nft_scope(false, [], []);
+		if (!scope.ok)
+			push(errors, scope.error);
+		app_applied_signature = null;
+		classifier_applied_signature = null;
+		clear_dns_queue();
+		return {
+			ok: false,
+			available: false,
+			enabled: false,
+			degraded: true,
+			retained_previous_snapshot: false,
+			backend_mode: 'V3_NFT_ONLY',
+			generation: app_policy_generation,
+			classifier_generation,
+			errors,
+			warnings,
+		};
+	}
 	if (config.flow_offloading || config.flow_offloading_hw) {
 		push(errors, 'Disable firewall software and hardware flow offloading before enabling application filtering');
 		const disabled = stat(BPFCTL)

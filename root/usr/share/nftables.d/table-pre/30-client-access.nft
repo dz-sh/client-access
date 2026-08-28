@@ -14,6 +14,17 @@ set client_access_destinations {
 	policy performance
 }
 
+# Application-filter scope is deliberately separate from the V3 access sets.
+set client_access_app_sources {
+	type ifname
+	policy performance
+}
+
+set client_access_app_destinations {
+	type ifname
+	policy performance
+}
+
 set client_access_whitelist_mode {
 	type nf_proto
 	policy performance
@@ -43,4 +54,11 @@ chain client_access_deny {
 	meta nfproto @client_access_drop_mode drop
 	meta l4proto tcp reject with tcp reset
 	reject with icmpx type admin-prohibited
+}
+
+# This chain consumes only the application workflow's reserved mark. It does
+# not read or combine the result of client_access_dispatch.
+chain client_access_app_filter {
+	meta mark & 0x60000000 == 0x60000000 counter drop
+	return
 }

@@ -114,7 +114,7 @@ jobs:
         run: >-
           sudo apt-get update && sudo apt-get install --yes
           clang llvm libbpf-dev libelf-dev zlib1g-dev
-          iproute2 iputils-ping netcat-openbsd
+          iproute2 iputils-ping netcat-openbsd nftables
 
       - name: Build the datapath and publisher on Linux
         shell: bash
@@ -140,6 +140,7 @@ jobs:
             sudo ip link del ca-wan || true
             sudo ip netns del ca-client-ns || true
             sudo ip netns del ca-server-ns || true
+            sudo nft delete table inet fw4 || true
             sudo "${RUNNER_TEMP}/client-access-bpfctl" unload || true
           }
           trap cleanup EXIT
@@ -197,6 +198,19 @@ jobs:
           udp_server_pid=$!
           sudo "${RUNNER_TEMP}/client-access-bpfctl" attach ca-lan
 
+          {
+            echo 'table inet fw4 {'
+            cat root/usr/share/nftables.d/table-pre/30-client-access.nft
+            echo 'chain forward {'
+            echo 'type filter hook forward priority filter; policy accept;'
+            cat root/usr/share/nftables.d/chain-pre/forward/30-client-access.nft
+            echo '}'
+            echo '}'
+          } > "${RUNNER_TEMP}/client-access-runtime.nft"
+          sudo nft --file "${RUNNER_TEMP}/client-access-runtime.nft"
+          sudo nft add element inet fw4 client_access_app_sources '{ "ca-lan" }'
+          sudo nft add element inet fw4 client_access_app_destinations '{ "ca-wan" }'
+
           # Warm route and neighbour state before enabling the application layer.
           sudo ip netns exec ca-client-ns ping -c 1 -W 1 198.51.100.2
 
@@ -205,7 +219,6 @@ jobs:
           printf '%s\n' \
             'CONFIG 1 1 1 0 0 1 256 200 256 512 64' \
             'SUBJECT 02:00:00:00:00:42 42' \
-            'DESTINATION ca-wan' \
             'PREFIX4 198.51.100.2/32 100 10 1' \
             'PREFIX6 2001:db8:2::2/128 100 10 1' \
             'PORT 17 443 10 10 2' \
@@ -216,7 +229,9 @@ jobs:
             | sudo "${RUNNER_TEMP}/client-access-bpfctl" sync
 
           # Router-local traffic is outside the app-filter workflow.
-          sudo ip netns exec ca-client-ns ping -c 1 -W 1 192.0.2.1
+          # The second packet has a cached UNCLASSIFIED DENY app verdict but
+          # must still bypass the forward-only nft application chain.
+          sudo ip netns exec ca-client-ns ping -c 2 -W 1 192.0.2.1
 
           # Port-only evidence resolves only the category and is cached for
           # the second datagram on the same socket.
@@ -239,7 +254,6 @@ jobs:
           printf '%s\n' \
             'CONFIG 1 2 1 0 0 1 256 200 256 512 64' \
             'SUBJECT 02:00:00:00:00:42 42' \
-            'DESTINATION ca-wan' \
             'PREFIX4 198.51.100.2/32 100 10 1' \
             'PREFIX6 2001:db8:2::2/128 100 10 1' \
             'PORT 17 443 10 10 2' \
@@ -257,7 +271,6 @@ jobs:
               'CONFIG 1 3 1 0 0 1 256 200 256 512 64' \
               'SUBJECT 02:00:00:00:00:42 42' \
               'SUBJECT 02:00:00:00:00:42 42' \
-              'DESTINATION ca-wan' \
               | sudo "${RUNNER_TEMP}/client-access-bpfctl" sync; then
             echo 'invalid atomic snapshot unexpectedly succeeded' >&2
             exit 1
@@ -275,7 +288,6 @@ jobs:
           printf '%s\n' \
             'CONFIG 1 3 1 0 0 1 256 200 256 512 64' \
             'SUBJECT 02:00:00:00:00:42 42' \
-            'DESTINATION ca-wan' \
             'PORT 17 443 10 10 2' \
             'POLICY 42 101 1' \
             'POLICY 42 10 1' \
@@ -294,7 +306,6 @@ jobs:
           printf '%s\n' \
             'CONFIG 1 4 1 0 0 1 256 200 256 1 1' \
             'SUBJECT 02:00:00:00:00:42 42' \
-            'DESTINATION ca-wan' \
             'POLICY 42 1 0' \
             'POLICY 42 0 0' \
             | sudo "${RUNNER_TEMP}/client-access-bpfctl" sync
@@ -311,13 +322,13 @@ jobs:
             .app_policy_generation == 4 and
             .classifier_generation == 1 and
             .subject_entries == 1 and
-            .destination_entries == 1 and
             .policy_entries == 2 and
             .flow_map_entries >= 4 and
             .flows_classified_exact >= 3 and
             .flows_classified_category >= 1 and
-            .flows_denied >= 1 and
-            .flows_allowed >= 1 and
+            .flow_app_deny_verdicts >= 1 and
+            .flow_app_allow_verdicts >= 1 and
+            .packet_app_deny_verdicts >= 1 and
             .classification_admission_denied >= 1 and
             .policy_reevaluations >= 1
           ' "${RUNNER_TEMP}/client-access-bpf-status.json"

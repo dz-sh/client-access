@@ -105,6 +105,8 @@ Network → Client Access
 
 The application currently targets firewall4/nftables on OpenWrt and
 ImmortalWrt. The firewall4 `auto_includes` option must remain enabled.
+The optional application backend reserves firewall mark mask `0x60000000`;
+custom VPN, QoS, or policy-routing rules must not use those two bits.
 
 ## License
 

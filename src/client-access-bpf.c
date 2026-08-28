@@ -8,7 +8,6 @@
 #include <linux/ip.h>
 #include <linux/ipv6.h>
 #include <linux/pkt_cls.h>
-#include <linux/socket.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <bpf/bpf_endian.h>
@@ -22,8 +21,6 @@ struct ca_vlan_hdr {
 };
 
 #define CA_IPV4_FRAGMENT_MASK 0x3fff
-#define CA_AF_INET 2
-#define CA_AF_INET6 10
 #define CA_NEXTHDR_HOP 0
 #define CA_NEXTHDR_ROUTING 43
 #define CA_NEXTHDR_FRAGMENT 44
@@ -47,6 +44,15 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } ca_config SEC(".maps");
 
+/* Presence of this pin distinguishes the mark-emitting backend schema. */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u32);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} ca_mark_schema SEC(".maps");
+
 #define CA_SUBJECT_MAP(name) \
 	struct { \
 		__uint(type, BPF_MAP_TYPE_HASH); \
@@ -59,19 +65,6 @@ struct {
 
 CA_SUBJECT_MAP(ca_subject_a);
 CA_SUBJECT_MAP(ca_subject_b);
-
-#define CA_DESTINATION_MAP(name) \
-	struct { \
-		__uint(type, BPF_MAP_TYPE_HASH); \
-		__uint(max_entries, CA_MAX_DESTINATIONS); \
-		__uint(map_flags, BPF_F_NO_PREALLOC); \
-		__type(key, __u32); \
-		__type(value, __u8); \
-		__uint(pinning, LIBBPF_PIN_BY_NAME); \
-	} name SEC(".maps")
-
-CA_DESTINATION_MAP(ca_destination_a);
-CA_DESTINATION_MAP(ca_destination_b);
 
 #define CA_POLICY_MAP(name) \
 	struct { \
@@ -215,14 +208,6 @@ static __always_inline __u8 *ca_policy_lookup_map(const struct ca_config *config
 	return bpf_map_lookup_elem(&ca_policy_a, key);
 }
 
-static __always_inline __u8 *
-ca_destination_lookup(const struct ca_config *config, const __u32 *ifindex)
-{
-	if (config->active_slot)
-		return bpf_map_lookup_elem(&ca_destination_b, ifindex);
-	return bpf_map_lookup_elem(&ca_destination_a, ifindex);
-}
-
 static __always_inline struct ca_class_hint *
 ca_port_lookup(const struct ca_config *config, const struct ca_port_key *key)
 {
@@ -263,13 +248,18 @@ static __always_inline __u8 ca_policy_verdict(const struct ca_config *config,
 	return verdict ? *verdict : CA_VERDICT_ALLOW;
 }
 
-static __always_inline int ca_enforce(__u8 verdict)
+static __always_inline int ca_emit_app_verdict(struct __sk_buff *skb, __u8 verdict)
 {
+	__u32 mark = skb->mark & ~CA_APP_MARK_MASK;
+
+	mark |= CA_APP_MARK_VALID;
 	if (verdict == CA_VERDICT_DENY) {
-		ca_stat_inc(CA_STAT_PACKETS_DENIED);
-		return TC_ACT_SHOT;
+		mark |= CA_APP_MARK_DENY;
+		ca_stat_inc(CA_STAT_PACKET_APP_DENY_VERDICTS);
 	}
-	ca_stat_inc(CA_STAT_PACKETS_ALLOWED);
+	else
+		ca_stat_inc(CA_STAT_PACKET_APP_ALLOW_VERDICTS);
+	skb->mark = mark;
 	return TC_ACT_UNSPEC;
 }
 
@@ -366,42 +356,6 @@ static __always_inline int ca_parse_flow(void *data, void *data_end,
 
 	*examined = offset > 0xffffffffULL ? 0xffffffffU : (__u32)offset;
 	return CA_PARSE_OK;
-}
-
-static __always_inline bool ca_is_scoped_forward(struct __sk_buff *skb,
-									 const struct ca_config *config,
-									 const struct ca_flow_key *key)
-{
-	struct bpf_fib_lookup fib = {
-		.ifindex = skb->ifindex,
-		.l4_protocol = key->ip_proto,
-		.sport = key->src_port,
-		.dport = key->dst_port,
-	};
-	int result;
-
-	if (key->eth_proto == bpf_htons(ETH_P_IP)) {
-		fib.family = CA_AF_INET;
-		fib.ipv4_src = key->addr.v4.src;
-		fib.ipv4_dst = key->addr.v4.dst;
-	}
-	else if (key->eth_proto == bpf_htons(ETH_P_IPV6)) {
-		fib.family = CA_AF_INET6;
-		__builtin_memcpy(fib.ipv6_src, key->addr.v6.src, 16);
-		__builtin_memcpy(fib.ipv6_dst, key->addr.v6.dst, 16);
-	}
-	else
-		return false;
-
-	result = bpf_fib_lookup(skb, &fib, sizeof(fib), 0);
-	if (result != BPF_FIB_LKUP_RET_SUCCESS) {
-		if (result != BPF_FIB_LKUP_RET_NOT_FWDED &&
-		    result != BPF_FIB_LKUP_RET_UNREACHABLE &&
-		    result != BPF_FIB_LKUP_RET_PROHIBIT)
-			ca_stat_inc(CA_STAT_SCOPE_LOOKUP_FAILED);
-		return false;
-	}
-	return ca_destination_lookup(config, &fib.ifindex) != NULL;
 }
 
 static __always_inline int ca_merge_hint(struct ca_class_hint *result,
@@ -623,9 +577,9 @@ static __always_inline void ca_record_terminal(const struct ca_flow_state *flow,
 			ca_stat_inc(CA_STAT_FLOWS_UNCLASSIFIED_BUDGET);
 	}
 	if (flow->app_verdict == CA_VERDICT_DENY)
-		ca_stat_inc(CA_STAT_FLOWS_DENIED);
+		ca_stat_inc(CA_STAT_FLOW_APP_DENY_VERDICTS);
 	else
-		ca_stat_inc(CA_STAT_FLOWS_ALLOWED);
+		ca_stat_inc(CA_STAT_FLOW_APP_ALLOW_VERDICTS);
 }
 
 static __always_inline bool ca_budget_exhausted(const struct ca_config *config,
@@ -662,7 +616,8 @@ static __always_inline bool ca_try_terminal(const struct ca_config *config,
 	return true;
 }
 
-static __always_inline int ca_load_shed(const struct ca_config *config,
+static __always_inline int ca_load_shed(struct __sk_buff *skb,
+									 const struct ca_config *config,
 									 __u32 subject_id)
 {
 	__u8 verdict = ca_policy_verdict(config, subject_id, CA_CLASS_UNCLASSIFIED);
@@ -670,10 +625,10 @@ static __always_inline int ca_load_shed(const struct ca_config *config,
 	ca_stat_inc(CA_STAT_CLASSIFICATION_ADMISSION_DENIED);
 	ca_stat_inc(CA_STAT_FLOWS_UNCLASSIFIED_LOAD_SHED);
 	if (verdict == CA_VERDICT_DENY)
-		ca_stat_inc(CA_STAT_FLOWS_DENIED);
+		ca_stat_inc(CA_STAT_FLOW_APP_DENY_VERDICTS);
 	else
-		ca_stat_inc(CA_STAT_FLOWS_ALLOWED);
-	return ca_enforce(verdict);
+		ca_stat_inc(CA_STAT_FLOW_APP_ALLOW_VERDICTS);
+	return ca_emit_app_verdict(skb, verdict);
 }
 
 SEC("tc")
@@ -694,6 +649,8 @@ int ca_ingress(struct __sk_buff *skb)
 	__u64 now;
 	int parsed;
 
+	/* The application workflow exclusively owns and rewrites these two bits. */
+	skb->mark &= ~CA_APP_MARK_MASK;
 	config_map = bpf_map_lookup_elem(&ca_config, &zero);
 	if (!config_map)
 		return TC_ACT_UNSPEC;
@@ -706,16 +663,14 @@ int ca_ingress(struct __sk_buff *skb)
 	parsed = ca_parse_flow(data, data_end, &flow_key, &mac, &examined);
 	if (parsed == CA_PARSE_NO_ETHERNET)
 		return TC_ACT_UNSPEC;
-	if (!ca_is_scoped_forward(skb, config, &flow_key))
-		return TC_ACT_UNSPEC;
 	subject_id = ca_subject_lookup(config, &mac);
 	if (!subject_id) {
 		ca_stat_inc(CA_STAT_UNKNOWN_SUBJECT_PACKETS);
-		return ca_enforce(config->unknown_subject_app_verdict);
+		return ca_emit_app_verdict(skb, config->unknown_subject_app_verdict);
 	}
 	if (parsed != CA_PARSE_OK) {
 		ca_stat_inc(CA_STAT_PARSE_UNSUPPORTED);
-		return ca_enforce(ca_policy_verdict(config, *subject_id,
+		return ca_emit_app_verdict(skb, ca_policy_verdict(config, *subject_id,
 										 CA_CLASS_UNCLASSIFIED));
 	}
 
@@ -725,19 +680,19 @@ int ca_ingress(struct __sk_buff *skb)
 	if (flow) {
 		flow->last_seen_ns = now;
 		if (flow->classification_state == CA_FLOW_PENDING)
-			return ca_enforce(config->provisional_app_verdict);
+			return ca_emit_app_verdict(skb, config->provisional_app_verdict);
 		if (flow->app_policy_generation != config->app_policy_generation) {
 			flow->app_verdict = ca_policy_verdict(config, *subject_id,
 											 flow->class_id);
 			flow->app_policy_generation = config->app_policy_generation;
 			ca_stat_inc(CA_STAT_POLICY_REEVALUATIONS);
 		}
-		return ca_enforce(flow->app_verdict);
+		return ca_emit_app_verdict(skb, flow->app_verdict);
 	}
 
 	if (!ca_admit_classification(config, *subject_id, now) ||
 	    !ca_pending_reserve(config->max_pending_entries))
-		return ca_load_shed(config, *subject_id);
+		return ca_load_shed(skb, config, *subject_id);
 
 	initial.first_seen_ns = now;
 	initial.last_seen_ns = now;
@@ -751,7 +706,7 @@ int ca_ingress(struct __sk_buff *skb)
 	if (bpf_map_update_elem(&ca_flows, &flow_key, &initial, BPF_NOEXIST)) {
 		ca_pending_release();
 		ca_stat_inc(CA_STAT_FLOW_MAP_FULL);
-		return ca_load_shed(config, *subject_id);
+		return ca_load_shed(skb, config, *subject_id);
 	}
 	ca_stat_inc(CA_STAT_FLOWS_TOTAL);
 	ca_stat_inc(CA_STAT_FLOWS_PENDING);
@@ -763,7 +718,7 @@ int ca_ingress(struct __sk_buff *skb)
 		ca_pending_release();
 		bpf_map_delete_elem(&ca_flows, &flow_key);
 		ca_stat_inc(CA_STAT_FLOW_MAP_FULL);
-		return ca_load_shed(config, *subject_id);
+		return ca_load_shed(skb, config, *subject_id);
 	}
 	if (terminal) {
 		ca_pending_release();
@@ -772,7 +727,7 @@ int ca_ingress(struct __sk_buff *skb)
 	}
 
 	/* The first admitted packet uses the explicit optimistic V4.1 verdict. */
-	return ca_enforce(config->provisional_app_verdict);
+	return ca_emit_app_verdict(skb, config->provisional_app_verdict);
 }
 
 char LICENSE[] SEC("license") = "Apache-2.0";

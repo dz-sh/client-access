@@ -28,21 +28,19 @@
 #define UPDATE_LOCK "/var/run/client-access-bpfctl.lock"
 
 static const char *const map_names[] = {
-	"ca_config", "ca_subject_a", "ca_subject_b",
-	"ca_destination_a", "ca_destination_b", "ca_policy_a",
+	"ca_config", "ca_mark_schema", "ca_subject_a", "ca_subject_b", "ca_policy_a",
 	"ca_policy_b", "ca_port_a", "ca_port_b", "ca_ipv4_a", "ca_ipv4_b",
 	"ca_ipv6_a", "ca_ipv6_b", "ca_dns4", "ca_dns6", "ca_flows",
 	"ca_global_rate", "ca_subject_rates", "ca_runtime", "ca_stats",
 };
 
+static const char *const legacy_map_names[] = {
+	"ca_destination_a", "ca_destination_b",
+};
+
 struct subject_entry {
 	struct ca_mac_key key;
 	__u32 subject_id;
-};
-
-struct destination_entry {
-	__u32 ifindex;
-	__u8 enabled;
 };
 
 struct policy_entry {
@@ -70,8 +68,6 @@ struct snapshot {
 	bool have_config;
 	struct subject_entry *subjects;
 	size_t subject_count;
-	struct destination_entry *destinations;
-	size_t destination_count;
 	struct policy_entry *policies;
 	size_t policy_count;
 	struct port_entry *ports;
@@ -163,6 +159,10 @@ static void unlink_pins(void)
 	unlink(CA_PROGRAM_PIN);
 	for (size_t i = 0; i < ARRAY_SIZE(map_names); i++) {
 		if (!pin_path(path, sizeof(path), map_names[i]))
+			unlink(path);
+	}
+	for (size_t i = 0; i < ARRAY_SIZE(legacy_map_names); i++) {
+		if (!pin_path(path, sizeof(path), legacy_map_names[i]))
 			unlink(path);
 	}
 }
@@ -291,22 +291,6 @@ static int append_subject(struct snapshot *snapshot, const struct subject_entry 
 		return -ENOMEM;
 	snapshot->subjects = items;
 	snapshot->subjects[snapshot->subject_count++] = *entry;
-	return 0;
-}
-
-static int append_destination(struct snapshot *snapshot,
-			      const struct destination_entry *entry)
-{
-	void *items;
-
-	if (snapshot->destination_count >= CA_MAX_DESTINATIONS)
-		return -E2BIG;
-	items = realloc(snapshot->destinations,
-			sizeof(*snapshot->destinations) * (snapshot->destination_count + 1));
-	if (!items)
-		return -ENOMEM;
-	snapshot->destinations = items;
-	snapshot->destinations[snapshot->destination_count++] = *entry;
 	return 0;
 }
 
@@ -506,19 +490,6 @@ static int parse_snapshot(struct snapshot *snapshot)
 			if (ret)
 				break;
 		}
-		else if (!strcmp(command, "DESTINATION")) {
-			struct destination_entry entry = { .enabled = 1 };
-			char ifname[IFNAMSIZ];
-
-			if (sscanf(line, "DESTINATION %15s", ifname) != 1 ||
-			    !(entry.ifindex = if_nametoindex(ifname))) {
-				ret = -EINVAL;
-				break;
-			}
-			ret = append_destination(snapshot, &entry);
-			if (ret)
-				break;
-		}
 		else if (!strcmp(command, "PORT")) {
 			struct port_entry entry = {};
 			unsigned int protocol, port, class_id, category_id, kind;
@@ -597,8 +568,6 @@ static int parse_snapshot(struct snapshot *snapshot)
 	free(line);
 	if (!ret && !snapshot->have_config)
 		ret = -EINVAL;
-	if (!ret && snapshot->config.enabled && !snapshot->destination_count)
-		ret = -EINVAL;
 	if (ret)
 		fprintf(stderr, "invalid snapshot at line %lu: %s\n",
 			line_number, strerror(-ret));
@@ -621,7 +590,7 @@ static int sync_snapshot(void)
 	struct snapshot snapshot = {};
 	struct ca_config current = {};
 	__u32 zero = 0;
-	int config_fd = -1, subject_fd = -1, destination_fd = -1, policy_fd = -1;
+	int config_fd = -1, subject_fd = -1, policy_fd = -1;
 	int port_fd = -1, ipv4_fd = -1, ipv6_fd = -1;
 	int dns4_fd = -1, dns6_fd = -1, rate_fd = -1;
 	int lock_fd = -1;
@@ -643,13 +612,11 @@ static int sync_snapshot(void)
 	}
 	snapshot.config.active_slot = current.active_slot ? 0 : 1;
 	subject_fd = open_map(snapshot.config.active_slot ? "ca_subject_b" : "ca_subject_a");
-	destination_fd = open_map(snapshot.config.active_slot
-		? "ca_destination_b" : "ca_destination_a");
 	policy_fd = open_map(snapshot.config.active_slot ? "ca_policy_b" : "ca_policy_a");
 	port_fd = open_map(snapshot.config.active_slot ? "ca_port_b" : "ca_port_a");
 	ipv4_fd = open_map(snapshot.config.active_slot ? "ca_ipv4_b" : "ca_ipv4_a");
 	ipv6_fd = open_map(snapshot.config.active_slot ? "ca_ipv6_b" : "ca_ipv6_a");
-	if (subject_fd < 0 || destination_fd < 0 || policy_fd < 0 || port_fd < 0 ||
+	if (subject_fd < 0 || policy_fd < 0 || port_fd < 0 ||
 	    ipv4_fd < 0 || ipv6_fd < 0) {
 		fprintf(stderr, "inactive application snapshot maps are unavailable: %s\n", strerror(errno));
 		goto out;
@@ -657,22 +624,12 @@ static int sync_snapshot(void)
 	/* Retain the prior slot beyond the maximum expected TC invocation. */
 	usleep(50000);
 	if (clear_map(subject_fd, sizeof(struct ca_mac_key)) ||
-	    clear_map(destination_fd, sizeof(__u32)) ||
 	    clear_map(policy_fd, sizeof(struct ca_policy_key)) ||
 	    clear_map(port_fd, sizeof(struct ca_port_key)) ||
 	    clear_map(ipv4_fd, sizeof(struct ca_ipv4_lpm_key)) ||
 	    clear_map(ipv6_fd, sizeof(struct ca_ipv6_lpm_key))) {
 		fprintf(stderr, "unable to clear inactive application snapshot\n");
 		goto out;
-	}
-	for (size_t i = 0; i < snapshot.destination_count; i++) {
-		if (bpf_map_update_elem(destination_fd,
-				&snapshot.destinations[i].ifindex,
-				&snapshot.destinations[i].enabled, BPF_NOEXIST)) {
-			fprintf(stderr, "unable to populate destination snapshot: %s\n",
-				strerror(errno));
-			goto out;
-		}
 	}
 	for (size_t i = 0; i < snapshot.subject_count; i++) {
 		if (bpf_map_update_elem(subject_fd, &snapshot.subjects[i].key,
@@ -736,8 +693,6 @@ out:
 		close(config_fd);
 	if (subject_fd >= 0)
 		close(subject_fd);
-	if (destination_fd >= 0)
-		close(destination_fd);
 	if (policy_fd >= 0)
 		close(policy_fd);
 	if (port_fd >= 0)
@@ -755,7 +710,6 @@ out:
 	if (lock_fd >= 0)
 		close(lock_fd);
 	free(snapshot.subjects);
-	free(snapshot.destinations);
 	free(snapshot.policies);
 	free(snapshot.ports);
 	free(snapshot.ipv4);
@@ -1071,7 +1025,7 @@ static int print_status(void)
 	struct ca_config config = {};
 	__u64 runtime = 0;
 	__u32 zero = 0;
-	int config_fd = -1, subject_fd = -1, destination_fd = -1, policy_fd = -1;
+	int config_fd = -1, subject_fd = -1, policy_fd = -1;
 	int port_fd = -1, ipv4_fd = -1, ipv6_fd = -1;
 	int dns4_fd = -1, dns6_fd = -1, flow_fd = -1;
 	int runtime_fd = -1, stats_fd = -1;
@@ -1080,7 +1034,7 @@ static int print_status(void)
 	uint64_t stats[CA_STATS_COUNT] = {};
 	uint64_t flow_memory = (uint64_t)CA_MAX_FLOWS *
 		(sizeof(struct ca_flow_key) + sizeof(struct ca_flow_state) + 72);
-	int subject_entries, unique_subjects, destination_entries, policy_entries;
+	int subject_entries, unique_subjects, policy_entries;
 	int flow_entries;
 	int port_entries, ipv4_entries, ipv6_entries, dns4_entries, dns6_entries;
 	int ret = 1;
@@ -1091,8 +1045,6 @@ static int print_status(void)
 		goto out;
 	}
 	subject_fd = open_map(config.active_slot ? "ca_subject_b" : "ca_subject_a");
-	destination_fd = open_map(config.active_slot
-		? "ca_destination_b" : "ca_destination_a");
 	policy_fd = open_map(config.active_slot ? "ca_policy_b" : "ca_policy_a");
 	port_fd = open_map(config.active_slot ? "ca_port_b" : "ca_port_a");
 	ipv4_fd = open_map(config.active_slot ? "ca_ipv4_b" : "ca_ipv4_a");
@@ -1102,7 +1054,7 @@ static int print_status(void)
 	flow_fd = open_map("ca_flows");
 	runtime_fd = open_map("ca_runtime");
 	stats_fd = open_map("ca_stats");
-	if (subject_fd < 0 || destination_fd < 0 || policy_fd < 0 || port_fd < 0 || ipv4_fd < 0 ||
+	if (subject_fd < 0 || policy_fd < 0 || port_fd < 0 || ipv4_fd < 0 ||
 	    ipv6_fd < 0 || dns4_fd < 0 || dns6_fd < 0 || flow_fd < 0 ||
 	    runtime_fd < 0 || stats_fd < 0 || cpus <= 0) {
 		fprintf(stderr, "one or more application BPF maps are unavailable\n");
@@ -1121,7 +1073,6 @@ static int print_status(void)
 	}
 	subject_entries = count_map_entries(subject_fd, sizeof(struct ca_mac_key));
 	unique_subjects = count_unique_subjects(subject_fd);
-	destination_entries = count_map_entries(destination_fd, sizeof(__u32));
 	policy_entries = count_map_entries(policy_fd, sizeof(struct ca_policy_key));
 	port_entries = count_map_entries(port_fd, sizeof(struct ca_port_key));
 	ipv4_entries = count_map_entries(ipv4_fd, sizeof(struct ca_ipv4_lpm_key));
@@ -1134,7 +1085,6 @@ static int print_status(void)
 	       "\"enabled\":%s,\"active_slot\":%u,"
 	       "\"app_policy_generation\":%u,\"classifier_generation\":%u,"
 	       "\"subject_entries\":%d,\"subject_count\":%d,"
-	       "\"destination_entries\":%d,"
 	       "\"app_policy_snapshot_entries\":%d,\"policy_entries\":%d,"
 	       "\"port_hint_entries\":%d,\"ipv4_prefix_entries\":%d,"
 	       "\"ipv6_prefix_entries\":%d,\"dns_hint_entries\":%d,"
@@ -1147,7 +1097,8 @@ static int print_status(void)
 	       "\"flows_unclassified\":%" PRIu64 ","
 	       "\"flows_unclassified_budget\":%" PRIu64 ","
 	       "\"flows_unclassified_load_shed\":%" PRIu64 ","
-	       "\"flows_allowed\":%" PRIu64 ",\"flows_denied\":%" PRIu64 ","
+	       "\"flow_app_allow_verdicts\":%" PRIu64 ","
+	       "\"flow_app_deny_verdicts\":%" PRIu64 ","
 	       "\"classification_packets\":%" PRIu64 ","
 	       "\"classification_bytes\":%" PRIu64 ","
 	       "\"classification_admission_denied\":%" PRIu64 ","
@@ -1159,15 +1110,16 @@ static int print_status(void)
 	       "\"parse_unsupported\":%" PRIu64 ","
 	       "\"classifier_conflicts\":%" PRIu64 ","
 	       "\"dns_hint_expired\":%" PRIu64 ","
-	       "\"forward_scope_lookup_failed\":%" PRIu64 ","
-	       "\"packets_allowed\":%" PRIu64 ",\"packets_denied\":%" PRIu64 ","
+	       "\"packet_app_allow_verdicts\":%" PRIu64 ","
+	       "\"packet_app_deny_verdicts\":%" PRIu64 ","
+	       "\"app_mark_mask\":%u,"
 	       "\"max_packets_inspected\":%u,\"max_bytes_examined\":%u,"
 	       "\"max_classification_age_ms\":%u,\"max_pending_entries\":%u,"
 	       "\"max_new_classifications_per_second\":%u,"
 	       "\"per_subject_new_classification_rate\":%u}\n",
 	       config.enabled ? "true" : "false", config.active_slot,
 	       config.app_policy_generation, config.classifier_generation,
-	       subject_entries, unique_subjects, destination_entries,
+	       subject_entries, unique_subjects,
 	       policy_entries, policy_entries,
 	       port_entries, ipv4_entries, ipv6_entries, dns4_entries + dns6_entries,
 	       flow_entries, flow_entries, CA_MAX_FLOWS, flow_memory,
@@ -1177,7 +1129,8 @@ static int print_status(void)
 	       stats[CA_STAT_FLOWS_UNCLASSIFIED],
 	       stats[CA_STAT_FLOWS_UNCLASSIFIED_BUDGET],
 	       stats[CA_STAT_FLOWS_UNCLASSIFIED_LOAD_SHED],
-	       stats[CA_STAT_FLOWS_ALLOWED], stats[CA_STAT_FLOWS_DENIED],
+	       stats[CA_STAT_FLOW_APP_ALLOW_VERDICTS],
+	       stats[CA_STAT_FLOW_APP_DENY_VERDICTS],
 	       stats[CA_STAT_CLASSIFICATION_PACKETS], stats[CA_STAT_CLASSIFICATION_BYTES],
 	       stats[CA_STAT_CLASSIFICATION_ADMISSION_DENIED],
 	       stats[CA_STAT_FLOW_MAP_EVICTIONS], stats[CA_STAT_FLOW_READMISSIONS],
@@ -1185,8 +1138,8 @@ static int print_status(void)
 	       stats[CA_STAT_FLOW_MAP_FULL], stats[CA_STAT_POLICY_REEVALUATIONS],
 	       stats[CA_STAT_UNKNOWN_SUBJECT_PACKETS], stats[CA_STAT_PARSE_UNSUPPORTED],
 	       stats[CA_STAT_CLASSIFIER_CONFLICTS], stats[CA_STAT_DNS_HINT_EXPIRED],
-	       stats[CA_STAT_SCOPE_LOOKUP_FAILED], stats[CA_STAT_PACKETS_ALLOWED],
-	       stats[CA_STAT_PACKETS_DENIED],
+	       stats[CA_STAT_PACKET_APP_ALLOW_VERDICTS],
+	       stats[CA_STAT_PACKET_APP_DENY_VERDICTS], CA_APP_MARK_MASK,
 	       config.max_packets_inspected, config.max_bytes_examined,
 	       config.max_classification_age_ms, config.max_pending_entries,
 	       config.max_new_classifications_per_second,
@@ -1198,8 +1151,6 @@ out:
 		close(config_fd);
 	if (subject_fd >= 0)
 		close(subject_fd);
-	if (destination_fd >= 0)
-		close(destination_fd);
 	if (policy_fd >= 0)
 		close(policy_fd);
 	if (port_fd >= 0)

@@ -1,2 +1,7 @@
-# Only new and related tuples are gated. Established/offloaded flows are intentionally untouched.
+# The V3 access policy gates only new and related tuples. Established/offloaded
+# flows are intentionally untouched by that workflow.
 ct state { new, related } iifname @client_access_sources oifname @client_access_destinations jump client_access_dispatch
+
+# Independent application-policy layer. Existing flows are intentionally
+# evaluated so policy-generation changes take effect on their next packet.
+iifname @client_access_app_sources oifname @client_access_app_destinations jump client_access_app_filter

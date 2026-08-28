@@ -284,7 +284,7 @@ function verdict_number(verdict) {
 }
 
 function app_snapshot(app_compiled, subject_projection, candidate_generation,
-		candidate_classifier_generation, destinations) {
+		candidate_classifier_generation) {
 	const limits = app_compiled.resource_limits;
 	let lines = [ sprintf('CONFIG %d %d %d %d %d %d %d %d %d %d %d',
 		app_compiled.enabled ? 1 : 0,
@@ -300,8 +300,6 @@ function app_snapshot(app_compiled, subject_projection, candidate_generation,
 		limits.per_subject_new_classification_rate) ];
 	for (let selector in subject_projection.selectors)
 		push(lines, sprintf('SUBJECT %s %d', selector.mac, selector.subject_id));
-	for (let ifname in destinations)
-		push(lines, sprintf('DESTINATION %s', ifname));
 	for (let entry in app_compiled.policies)
 		push(lines, sprintf('POLICY %d %d %d',
 			entry.subject_id, entry.class_id, verdict_number(entry.verdict)));
@@ -480,6 +478,28 @@ function detach_app_interfaces(keep) {
 	app_attached_interfaces = remaining;
 }
 
+function apply_app_nft_scope(enabled, sources, destinations) {
+	if (!enabled) {
+		sources = [];
+		destinations = [];
+	}
+
+	let script = '';
+	script += nft_elements('client_access_app_sources', sources, nft_quote);
+	script += nft_elements('client_access_app_destinations', destinations, nft_quote);
+	const proc = popen([ NFT, '-f', '-' ], 'w');
+	if (!proc)
+		return { ok: false, error: 'Unable to start nft for application-filter scope' };
+	if (proc.write(script) != length(script)) {
+		proc.close();
+		return { ok: false, error: 'Unable to write complete application-filter scope transaction' };
+	}
+	const code = proc.close();
+	return code == 0
+		? { ok: true, error: null }
+		: { ok: false, error: `Application-filter nft scope failed with exit code ${code}` };
+}
+
 function apply_app_filter(config, app_compiled, subject_projection, sources,
 		destinations, zone_errors, force) {
 	let errors = [ ...app_compiled.errors, ...subject_projection.errors, ...zone_errors ];
@@ -496,14 +516,17 @@ function apply_app_filter(config, app_compiled, subject_projection, sources,
 		if (disabled.code != null && disabled.code != 0)
 			push(errors, 'Unable to neutralize the application-filter datapath');
 		detach_app_interfaces([]);
+		const scope = apply_app_nft_scope(false, [], []);
+		if (!scope.ok)
+			push(errors, scope.error);
 		app_applied_signature = null;
 		classifier_applied_signature = null;
 		clear_dns_queue();
 		return {
-			ok: disabled.code == null || disabled.code == 0,
+			ok: (disabled.code == null || disabled.code == 0) && scope.ok,
 			available: false,
 			enabled: false,
-			degraded: disabled.code != null && disabled.code != 0,
+			degraded: (disabled.code != null && disabled.code != 0) || !scope.ok,
 			retained_previous_snapshot: false,
 			backend_mode: 'V3_NFT_ONLY',
 			generation: app_policy_generation,
@@ -518,6 +541,9 @@ function apply_app_filter(config, app_compiled, subject_projection, sources,
 			? run_capture([ BPFCTL, 'disable' ])
 			: { code: null, output: '' };
 		detach_app_interfaces([]);
+		const scope = apply_app_nft_scope(false, [], []);
+		if (!scope.ok)
+			push(errors, scope.error);
 		app_applied_signature = null;
 		classifier_applied_signature = null;
 		clear_dns_queue();
@@ -607,7 +633,7 @@ function apply_app_filter(config, app_compiled, subject_projection, sources,
 	if (force || changed || classifier_changed) {
 		const result = run_write([ BPFCTL, 'sync' ],
 			app_snapshot(app_compiled, subject_projection, candidate_generation,
-				candidate_classifier_generation, destinations));
+				candidate_classifier_generation));
 		if (!result.ok) {
 			push(errors, result.error);
 			for (let ifname in attached)
@@ -626,6 +652,32 @@ function apply_app_filter(config, app_compiled, subject_projection, sources,
 				warnings,
 			};
 		}
+	}
+	const scope = apply_app_nft_scope(true, sources, destinations);
+	if (!scope.ok) {
+		push(errors, scope.error);
+		const disabled = run_capture([ BPFCTL, 'disable' ]);
+		if (disabled.code != 0)
+			push(errors, 'Unable to neutralize the application-filter datapath after nft scope failure');
+		const cleared = apply_app_nft_scope(false, [], []);
+		if (!cleared.ok)
+			push(errors, cleared.error);
+		detach_app_interfaces([]);
+		app_applied_signature = null;
+		classifier_applied_signature = null;
+		clear_dns_queue();
+		return {
+			ok: false,
+			available: true,
+			enabled: false,
+			degraded: true,
+			retained_previous_snapshot: false,
+			backend_mode: 'V3_NFT_ONLY',
+			generation: app_policy_generation,
+			classifier_generation,
+			errors,
+			warnings,
+		};
 	}
 	detach_app_interfaces(sources);
 	app_attached_interfaces = [ ...sources ];
@@ -986,6 +1038,11 @@ if (!published) {
 	warn('client-accessd: unable to publish ubus object\n');
 	exit(1);
 }
+
+// Establish a known neutral cross-subsystem state before the first republish.
+if (stat(BPFCTL))
+	run_capture([ BPFCTL, 'disable' ]);
+apply_app_nft_scope(false, [], []);
 
 // The safety wakeup also repairs runtime set loss after an out-of-band fw4 reload.
 timer = uloop.timer(1, function() { reconcile('timer', true); });

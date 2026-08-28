@@ -536,15 +536,15 @@ static __always_inline bool ca_pending_reserve(__u32 limit)
 #pragma unroll
 	for (int i = 0; i < CA_CAS_ATTEMPTS; i++) {
 		__u64 old = __sync_fetch_and_add(state, 0);
-		__u32 current = old;
+		__u32 pending_count = old;
 		__u32 peak = old >> 32;
 		__u32 next_current;
 		__u32 next_peak;
 		__u64 next;
 
-		if (current >= limit)
+		if (pending_count >= limit)
 			return false;
-		next_current = current + 1;
+		next_current = pending_count + 1;
 		next_peak = next_current > peak ? next_current : peak;
 		next = ((__u64)next_peak << 32) | next_current;
 		if (__sync_val_compare_and_swap(state, old, next) == old)

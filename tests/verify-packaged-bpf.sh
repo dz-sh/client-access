@@ -86,6 +86,5 @@ jq -e '
 ' "$work_dir/status.json"
 sudo "$work_dir/client-access-bpfctl" detach ca-pkg-a
 sudo ip netns del ca-pkg-ns
-sudo ip link del ca-pkg-a
 sudo "$work_dir/client-access-bpfctl" unload
 trap - EXIT

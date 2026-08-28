@@ -403,7 +403,7 @@ export function compile(config, epoch) {
 				prefix, entry, errors, class_info.name);
 		}
 		for (let domain in class_info.domains) {
-			if (!match(domain, /^(\*\.)?[a-z0-9_*-]+(\.[a-z0-9_*-]+)+$/)) {
+			if (!match(domain, /^(\*\.)?[a-z0-9_-]+(\.[a-z0-9_-]+)+$/)) {
 				push(errors, `${class_info.name}: invalid domain pattern '${domain}'`);
 				continue;
 			}

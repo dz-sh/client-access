@@ -189,6 +189,12 @@ assert_equal(result.enabled, false,
 assert_equal(result.classifier.signature_memory_bytes > 4096, true,
 	'signature memory estimate reports the rejected footprint');
 
+let invalid_domain = config('1');
+invalid_domain.app_classes[1].domains = [ 'video*.example' ];
+result = app_policy.compile(invalid_domain, monday_0900);
+assert_equal(result.enabled, false,
+	'embedded domain wildcards rejected by the UI are also rejected by the compiler');
+
 if (failures)
 	exit(1);
 

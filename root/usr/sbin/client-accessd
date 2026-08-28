@@ -605,13 +605,23 @@ function apply_app_filter(config, app_compiled, subject_projection, sources,
 	const ensured = run_capture([ BPFCTL, 'ensure' ]);
 	if (ensured.code != 0) {
 		push(errors, 'Unable to load or verify the TC eBPF application backend');
+		const disabled = run_capture([ BPFCTL, 'disable' ]);
+		if (disabled.code != 0)
+			push(errors, 'Unable to neutralize unverifiable application BPF state');
+		detach_app_interfaces([]);
+		const scope = apply_app_nft_scope(false, [], []);
+		if (!scope.ok)
+			push(errors, scope.error);
+		app_applied_signature = null;
+		classifier_applied_signature = null;
+		clear_dns_queue();
 		return {
 			ok: false,
-			available: previously_enabled,
-			enabled: previously_enabled,
+			available: false,
+			enabled: false,
 			degraded: true,
-			retained_previous_snapshot: previously_enabled,
-			backend_mode: previously_enabled ? 'V4_BPF_BASIC' : 'V3_NFT_ONLY',
+			retained_previous_snapshot: false,
+			backend_mode: 'V3_NFT_ONLY',
 			generation: app_policy_generation,
 			classifier_generation,
 			errors,
@@ -852,11 +862,34 @@ function reconcile(reason, force) {
 	else
 		push(errors, apply.error);
 
-	const app_apply = apply_app_filter(config, app_compiled, subject_projection,
+	let app_apply = apply_app_filter(config, app_compiled, subject_projection,
 		source.interfaces, destination.interfaces,
 		[ ...source.errors, ...destination.errors ], force);
-	const app_runtime = app_runtime_snapshot(app_apply.enabled);
-	if (app_runtime.error)
+	let app_runtime = app_runtime_snapshot(app_apply.enabled);
+	if (app_apply.enabled && !app_runtime.available) {
+		push(app_apply.errors, app_runtime.error ??
+			'Application-filter runtime state became unavailable');
+		const disabled = run_capture([ BPFCTL, 'disable' ]);
+		if (disabled.code != 0)
+			push(app_apply.errors, 'Unable to neutralize unavailable application BPF state');
+		detach_app_interfaces([]);
+		const scope = apply_app_nft_scope(false, [], []);
+		if (!scope.ok)
+			push(app_apply.errors, scope.error);
+		app_applied_signature = null;
+		classifier_applied_signature = null;
+		clear_dns_queue();
+		app_apply = {
+			...app_apply,
+			ok: false,
+			available: false,
+			enabled: false,
+			degraded: true,
+			retained_previous_snapshot: false,
+			backend_mode: 'V3_NFT_ONLY',
+		};
+	}
+	else if (app_runtime.error)
 		push(app_apply.warnings, app_runtime.error);
 	for (let warning in runtime.consistency.warnings)
 		push(app_apply.warnings, warning);

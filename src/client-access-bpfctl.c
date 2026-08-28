@@ -154,6 +154,15 @@ static int tc_query_program(unsigned int ifindex, __u32 handle, __u32 priority,
 	return err;
 }
 
+static bool tc_query_absent(int err)
+{
+	/* Some kernels report a missing TC filter chain as EINVAL rather than
+	 * ENOENT. The hook and coordinates passed by this controller are fixed and
+	 * valid, so both results mean that our coordinate is currently empty.
+	 */
+	return err == -ENOENT || err == -EINVAL;
+}
+
 static int detach_program_from_all_interfaces(__u32 program_id)
 {
 	static const struct {
@@ -367,9 +376,10 @@ static int tc_action(const char *ifname, bool attach)
 		close(program_fd);
 		return 1;
 	}
-	err = tc_query_program(hook.ifindex, opts.handle, opts.priority, &attached_id);
 	if (!attach) {
-		if (err == -ENOENT) {
+		err = tc_query_program(hook.ifindex, opts.handle, opts.priority,
+				       &attached_id);
+		if (tc_query_absent(err)) {
 			close(program_fd);
 			return 0;
 		}
@@ -410,7 +420,7 @@ static int tc_action(const char *ifname, bool attach)
 		close(program_fd);
 		return 1;
 	}
-	if (err != -ENOENT) {
+	if (!tc_query_absent(err)) {
 		fprintf(stderr, "unable to query TC coordinate on %s: %s\n",
 			ifname, strerror(-err));
 		close(program_fd);

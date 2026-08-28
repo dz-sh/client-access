@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #define KBUILD_MODNAME "client_access"
 
+#include <stdbool.h>
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/in.h>
@@ -21,6 +22,8 @@ struct ca_vlan_hdr {
 };
 
 #define CA_IPV4_FRAGMENT_MASK 0x3fff
+#define CA_AF_INET 2
+#define CA_AF_INET6 10
 #define CA_NEXTHDR_HOP 0
 #define CA_NEXTHDR_ROUTING 43
 #define CA_NEXTHDR_FRAGMENT 44
@@ -378,12 +381,12 @@ static __always_inline bool ca_is_scoped_forward(struct __sk_buff *skb,
 	int result;
 
 	if (key->eth_proto == bpf_htons(ETH_P_IP)) {
-		fib.family = AF_INET;
+		fib.family = CA_AF_INET;
 		fib.ipv4_src = key->addr.v4.src;
 		fib.ipv4_dst = key->addr.v4.dst;
 	}
 	else if (key->eth_proto == bpf_htons(ETH_P_IPV6)) {
-		fib.family = AF_INET6;
+		fib.family = CA_AF_INET6;
 		__builtin_memcpy(fib.ipv6_src, key->addr.v6.src, 16);
 		__builtin_memcpy(fib.ipv6_dst, key->addr.v6.dst, 16);
 	}

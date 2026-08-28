@@ -113,7 +113,7 @@ jobs:
       - name: Install eBPF build and runtime dependencies
         run: >-
           sudo apt-get update && sudo apt-get install --yes
-          clang llvm libbpf-dev libelf-dev zlib1g-dev bpftool
+          clang llvm libbpf-dev libelf-dev zlib1g-dev
           iproute2 iputils-ping
 
       - name: Build the datapath and publisher on Linux

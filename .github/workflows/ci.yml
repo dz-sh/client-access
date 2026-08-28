@@ -413,7 +413,7 @@ jobs:
             "${RUNNER_TEMP}/client-access-feed/luci-app-client-access/"
 
       - name: Build with the official OpenWrt SDK
-        uses: openwrt/gh-action-sdk@main
+        uses: openwrt/gh-action-sdk@f5813d30eeef3534b58ac7e79c5d8842b6035434
         env:
           ARCH: x86_64-24.10.8
           ARTIFACTS_DIR: ${{ runner.temp }}/openwrt-artifacts
@@ -455,9 +455,9 @@ jobs:
             "${RUNNER_TEMP}/client-access-feed/luci-app-client-access/"
 
       - name: Build with the official ImmortalWrt SDK
-        uses: immortalwrt/gh-action-sdk@master
+        uses: immortalwrt/gh-action-sdk@c4848d7f7d899d80e6d98630f0a21ab2e9c4724f
         env:
-          ARCH: x86_64-24.10.6
+          ARCH: x86_64-openwrt-24.10.6
           ARTIFACTS_DIR: ${{ runner.temp }}/immortalwrt-artifacts
           BUILD_LOG: 1
           FEED_DIR: ${{ runner.temp }}/client-access-feed

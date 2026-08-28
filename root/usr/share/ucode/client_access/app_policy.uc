@@ -16,6 +16,26 @@ const RESOURCE_DEFAULTS = {
 	max_pending_entries: 256,
 	max_new_classifications_per_second: 512,
 	per_subject_new_classification_rate: 64,
+	signature_table_memory_limit: 262144,
+};
+
+/* Conservative admission estimates include allocator/map metadata, alignment,
+ * and both classifier snapshot slots. They are intentionally larger than the
+ * bare key/value structs so configuration cannot promise impossible memory
+ * usage on a small router.
+ */
+const SIGNATURE_MEMORY = {
+	port: 128,
+	ipv4_prefix: 160,
+	ipv6_prefix: 192,
+	domain_base: 128,
+};
+
+const SIGNATURE_CAPACITY = {
+	ports: 1024,
+	ipv4_prefixes: 4096,
+	ipv6_prefixes: 4096,
+	domains: 4096,
 };
 
 function as_list(value) {
@@ -232,6 +252,10 @@ export function compile(config, epoch) {
 			config.per_subject_new_classification_rate,
 			RESOURCE_DEFAULTS.per_subject_new_classification_rate, 1, 100000,
 			'per_subject_new_classification_rate', errors),
+		signature_table_memory_limit: bounded_uint(
+			config.signature_table_memory_limit,
+			RESOURCE_DEFAULTS.signature_table_memory_limit, 4096, 8388608,
+			'signature_table_memory_limit', errors),
 	};
 	if (resource_limits.per_subject_new_classification_rate >
 	    resource_limits.max_new_classifications_per_second) {
@@ -391,6 +415,22 @@ export function compile(config, epoch) {
 	classifier.signature_count = length(classifier.ports) +
 		length(classifier.ipv4_prefixes) + length(classifier.ipv6_prefixes) +
 		length(classifier.domains);
+	classifier.signature_memory_bytes =
+		length(classifier.ports) * SIGNATURE_MEMORY.port +
+		length(classifier.ipv4_prefixes) * SIGNATURE_MEMORY.ipv4_prefix +
+		length(classifier.ipv6_prefixes) * SIGNATURE_MEMORY.ipv6_prefix;
+	for (let entry in classifier.domains)
+		classifier.signature_memory_bytes += SIGNATURE_MEMORY.domain_base +
+			length(entry.pattern);
+
+	for (let kind, maximum in SIGNATURE_CAPACITY) {
+		if (length(classifier[kind]) > maximum)
+			push(errors, `Classifier ${kind} exceeds capacity ${maximum}`);
+	}
+	if (classifier.signature_memory_bytes >
+	    resource_limits.signature_table_memory_limit)
+		push(errors,
+			`Classifier signature table requires an estimated ${classifier.signature_memory_bytes} bytes, exceeding limit ${resource_limits.signature_table_memory_limit}`);
 
 	let rules = [], rules_by_identity = {}, fail_closed_identity = {};
 	for (let rule in (config.app_rules ?? [])) {
@@ -511,4 +551,6 @@ export const constants = {
 	CLASS_KIND_EXACT,
 	CLASS_KIND_CATEGORY,
 	RESOURCE_DEFAULTS,
+	SIGNATURE_MEMORY,
+	SIGNATURE_CAPACITY,
 };

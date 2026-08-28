@@ -71,6 +71,7 @@ assert_equal(result.resource_limits, {
 	max_pending_entries: 256,
 	max_new_classifications_per_second: 512,
 	per_subject_new_classification_rate: 64,
+	signature_table_memory_limit: 262144,
 }, 'V4.1 compiles explicit bounded resource defaults');
 assert_equal(result.classifier.ports, [ {
 	protocol: 6,
@@ -85,6 +86,8 @@ assert_equal(result.classifier.domains, [ {
 	pattern: '*.youtube.example',
 	hint: { class_id: 100, category_id: 10, kind: 1 },
 } ], 'domain evidence compiles for bounded DNS correlation');
+assert_equal(result.classifier.signature_memory_bytes, 433,
+	'signature admission accounts for map overhead and domain storage');
 
 result = app_policy.compile(config('1', [
 	{ identity: 'alice', class: '10', verdict: 'deny', activation: 'always_active' },
@@ -174,6 +177,17 @@ let invalid_limits = config('1');
 invalid_limits.max_packets_inspected = '2';
 result = app_policy.compile(invalid_limits, monday_0900);
 assert_equal(result.enabled, false, 'V4.1 rejects multi-packet inspection configuration');
+
+let oversized_signatures = config('1');
+oversized_signatures.signature_table_memory_limit = '4096';
+oversized_signatures.app_classes[1].domains = [];
+for (let i = 0; i < 32; i++)
+	push(oversized_signatures.app_classes[1].domains, `host-${i}.youtube.example`);
+result = app_policy.compile(oversized_signatures, monday_0900);
+assert_equal(result.enabled, false,
+	'signature table exceeding its explicit memory budget is not published');
+assert_equal(result.classifier.signature_memory_bytes > 4096, true,
+	'signature memory estimate reports the rejected footprint');
 
 if (failures)
 	exit(1);

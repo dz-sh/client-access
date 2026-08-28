@@ -189,6 +189,7 @@ function runtimeStatus(appStatus) {
 function applicationStatusPanel(status) {
 	const appStatus = status.app_filter || {};
 	const runtime = runtimeStatus(appStatus);
+	const resourceLimits = appStatus.resource_limits || {};
 	const disabled = !appStatus.requested_enabled;
 	const healthy = appStatus.enabled && !appStatus.degraded;
 	const exact = runtime.flows_classified_exact || 0;
@@ -234,6 +235,12 @@ function applicationStatusPanel(status) {
 					E('div', { 'class': 'td left' }, [ appStatus.dns_subscribed ? _('Subscribed') : _('Unavailable') ]),
 					E('div', { 'class': 'td left' }, [ _('DNS events accepted / dropped') ]),
 					E('div', { 'class': 'td left' }, [ '%s / %s'.format(appStatus.dns_events_accepted || 0, appStatus.dns_events_dropped || 0) ])
+				]),
+				E('div', { 'class': 'tr' }, [
+					E('div', { 'class': 'td left' }, [ _('Signature table estimate') ]),
+					E('div', { 'class': 'td left' }, [ '%s / %s B'.format(appStatus.classifier_signature_memory_bytes || 0, resourceLimits.signature_table_memory_limit || 0) ]),
+					E('div', { 'class': 'td left' }, [ _('Backend schema') ]),
+					E('div', { 'class': 'td left' }, [ String(runtime.bpf_schema_version || _('Unavailable')) ])
 				])
 			]),
 			(appStatus.errors || []).length

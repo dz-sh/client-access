@@ -415,11 +415,20 @@ jobs:
       - name: Build with the official OpenWrt SDK
         uses: openwrt/gh-action-sdk@main
         env:
-          ARCH: x86_64
+          ARCH: x86_64-24.10.8
           ARTIFACTS_DIR: ${{ runner.temp }}/openwrt-artifacts
           BUILD_LOG: 1
           FEED_DIR: ${{ runner.temp }}/client-access-feed
           V: s
+
+      - name: Verifier-load the packaged OpenWrt BPF object
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes binutils libbpf-dev libelf-dev zlib1g-dev zstd
+          sh tests/verify-packaged-bpf.sh \
+            "${RUNNER_TEMP}/openwrt-artifacts" \
+            "${RUNNER_TEMP}/openwrt-packaged-bpf"
 
       - name: Upload OpenWrt packages and logs
         if: always()
@@ -448,11 +457,20 @@ jobs:
       - name: Build with the official ImmortalWrt SDK
         uses: immortalwrt/gh-action-sdk@master
         env:
-          ARCH: x86_64
+          ARCH: x86_64-24.10.6
           ARTIFACTS_DIR: ${{ runner.temp }}/immortalwrt-artifacts
           BUILD_LOG: 1
           FEED_DIR: ${{ runner.temp }}/client-access-feed
           V: s
+
+      - name: Verifier-load the packaged ImmortalWrt BPF object
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes binutils libbpf-dev libelf-dev zlib1g-dev zstd
+          sh tests/verify-packaged-bpf.sh \
+            "${RUNNER_TEMP}/immortalwrt-artifacts" \
+            "${RUNNER_TEMP}/immortalwrt-packaged-bpf"
 
       - name: Upload ImmortalWrt packages and logs
         if: always()

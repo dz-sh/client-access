@@ -54,6 +54,20 @@ function randomIdentityId() {
 	}).join('');
 }
 
+function randomSubjectId() {
+	const configured = {};
+	uci.sections('client_access', 'identity').forEach(function(identity) {
+		configured[String(identity.subject_id || '')] = true;
+	});
+	let value;
+	do {
+		const bytes = new Uint32Array(1);
+		window.crypto.getRandomValues(bytes);
+		value = bytes[0] || 1;
+	} while (configured[String(value)]);
+	return String(value);
+}
+
 function saveChanges() {
 	return uci.save()
 		.then(L.bind(ui.changes.init, ui.changes))
@@ -282,6 +296,7 @@ function createIdentity(observation) {
 					const identityId = randomIdentityId();
 					uci.add('client_access', 'identity', identityId);
 					uci.set('client_access', identityId, 'name', name);
+					uci.set('client_access', identityId, 'subject_id', randomSubjectId());
 					uci.set('client_access', identityId, 'activation', 'inactive');
 					const binding = uci.add('client_access', 'binding');
 					uci.set('client_access', binding, 'identity', identityId);
@@ -489,7 +504,10 @@ return view.extend({
 		};
 		const addIdentity = s.handleAdd;
 		s.handleAdd = function(ev) {
-			return addIdentity.call(this, ev, randomIdentityId());
+			const identityId = randomIdentityId();
+			const result = addIdentity.call(this, ev, identityId);
+			uci.set('client_access', identityId, 'subject_id', randomSubjectId());
+			return result;
 		};
 		const removeIdentity = s.handleRemove;
 		s.handleRemove = function(sectionId, ev) {

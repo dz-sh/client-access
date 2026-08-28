@@ -104,3 +104,58 @@ export function project(compiled, bindings) {
 		warnings,
 	};
 }
+
+export function project_subjects(app_compiled, bindings) {
+	let subjects = {}, subject_counts = {};
+	for (let identity in (app_compiled.identities ?? [])) {
+		subject_counts[identity.id] = (subject_counts[identity.id] ?? 0) + 1;
+		subjects[identity.id] = identity;
+	}
+
+	let by_mac = {}, details = [], selectors = [], errors = [];
+	for (let binding in (bindings ?? [])) {
+		const type_name = binding.type ?? 'mac';
+		const identity_id = trim('' + (binding.identity ?? ''));
+		const label = binding.section ?? binding.value ?? 'binding';
+		if (type_name != 'mac') {
+			push(errors, `${label}: unsupported application selector type '${type_name}'`);
+			continue;
+		}
+		const mac = normalize_mac(binding.value);
+		if (!mac) {
+			push(errors, `${label}: invalid application selector MAC '${binding.value ?? ''}'`);
+			continue;
+		}
+		by_mac[mac] ??= [];
+		push(by_mac[mac], { section: binding.section, identity_id, mac });
+	}
+
+	for (let mac, owners in by_mac) {
+		if (length(owners) != 1) {
+			push(errors, `${mac}: application selector belongs to ${length(owners)} identities`);
+			continue;
+		}
+		const owner = owners[0];
+		const identity = subjects[owner.identity_id];
+		if (!identity || subject_counts[owner.identity_id] != 1 || !identity.valid) {
+			push(errors, `${mac}: application selector references invalid Identity '${owner.identity_id}'`);
+			continue;
+		}
+		const detail = {
+			section: owner.section,
+			identity_id: owner.identity_id,
+			subject_id: identity.subject_id,
+			mac,
+		};
+		push(details, detail);
+		push(selectors, { mac, subject_id: identity.subject_id });
+	}
+
+	sort(selectors, (a, b) => a.mac < b.mac ? -1 : (a.mac > b.mac ? 1 : 0));
+	return {
+		selectors: app_compiled.enabled ? selectors : [],
+		preview_selectors: selectors,
+		details,
+		errors,
+	};
+}

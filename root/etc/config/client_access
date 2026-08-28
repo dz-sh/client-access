@@ -1,7 +1,10 @@
 config client_access 'main'
-	option schema_version '2'
+	option schema_version '4'
 	option enabled '0'
 	option mode 'blacklist'
+	option app_filter_enabled '0'
+	option unknown_app_verdict 'allow'
+	option provisional_app_verdict 'allow'
 	option deny_action 'reject'
 	list source_zone 'lan'
 	list destination_zone 'wan'
@@ -12,6 +15,7 @@ config client_access 'main'
 #
 # config identity 'identity_example_tablet'
 #	option name 'Example tablet'
+#	option subject_id '1001'
 #	option activation 'active_during'
 #	list schedule 'mon,tue,wed,thu,fri@08:00-21:30'
 #	list schedule 'sat,sun@09:00-23:00'
@@ -20,3 +24,19 @@ config client_access 'main'
 #	option identity 'identity_example_tablet'
 #	option type 'mac'
 #	option value '02:00:00:00:00:01'
+#
+# Application classes and rules are independent from the nftables workflow.
+# class_id 0 is APP_POLICY_DEFAULT and class_id 1 is UNCLASSIFIED.
+#
+# config app_class
+#	option class_id '100'
+#	option name 'Example video application'
+#	option kind 'application'
+#	option parent_id '10'
+#	list domain '*.example.invalid'
+#
+# config app_rule
+#	option identity 'identity_example_tablet'
+#	option class_id '100'
+#	option verdict 'deny'
+#	option activation 'always_active'

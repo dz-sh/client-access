@@ -78,13 +78,21 @@ jobs:
             -DULOOP_SUPPORT=OFF
           cmake --build "${RUNNER_TEMP}/ucode-build" --parallel 2
 
-      - name: Run policy tests
+      - name: Run nftables policy tests
         env:
           TZ: UTC
         run: >-
           "${RUNNER_TEMP}/ucode-build/ucode"
           -L "${GITHUB_WORKSPACE}/root/usr/share/ucode"
           "${GITHUB_WORKSPACE}/tests/policy.uc"
+
+      - name: Run application policy tests
+        env:
+          TZ: UTC
+        run: >-
+          "${RUNNER_TEMP}/ucode-build/ucode"
+          -L "${GITHUB_WORKSPACE}/root/usr/share/ucode"
+          "${GITHUB_WORKSPACE}/tests/app_policy.uc"
 
       - name: Compile-check the daemon with stub target modules
         run: >-

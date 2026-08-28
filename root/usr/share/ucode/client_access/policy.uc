@@ -111,6 +111,36 @@ function next_boundary(intervals, minute) {
 	return best;
 }
 
+export function evaluate_schedule(values, epoch) {
+	epoch ??= clock()[0];
+	const clock_valid = epoch >= CLOCK_VALID_AFTER;
+	const windows = compile_windows(values);
+	let errors = [ ...windows.errors ];
+	if (!length(windows.intervals))
+		push(errors, 'Schedule has no valid windows');
+	if (!clock_valid)
+		push(errors, 'Clock is not valid');
+	if (length(errors)) {
+		return {
+			active: false,
+			next_epoch: null,
+			clock_valid,
+			errors,
+		};
+	}
+
+	const tm = localtime(epoch);
+	const minute = weekly_minute(tm);
+	const active = schedule_state(windows.intervals, minute);
+	const delta = next_boundary(windows.intervals, minute);
+	return {
+		active,
+		next_epoch: delta == null ? null : epoch - tm.sec + delta * 60,
+		clock_valid,
+		errors,
+	};
+}
+
 function fail_closed(default_verdict, schedule_active, next_epoch, reason, errors) {
 	return {
 		verdict: 'deny',
@@ -185,7 +215,7 @@ function compile_identity(identity, default_verdict, exception_verdict, epoch, c
 
 export function compile(config, epoch) {
 	epoch ??= clock()[0];
-	const schema_supported = '' + (config.schema_version ?? '') == '2';
+	const schema_supported = '' + (config.schema_version ?? '') == '4';
 	const requested_enabled = flag(config.enabled, false);
 	const mode_valid = config.mode == 'blacklist' || config.mode == 'whitelist';
 	const mode = config.mode == 'whitelist' ? 'whitelist' : 'blacklist';

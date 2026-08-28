@@ -23,7 +23,7 @@ function epoch(year, mon, mday, hour, min, sec) {
 
 function config(mode, identities, enabled) {
 	return {
-		schema_version: '2',
+		schema_version: '4',
 		enabled: enabled ?? '1',
 		mode,
 		identities: identities ?? [],

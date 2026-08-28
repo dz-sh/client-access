@@ -486,8 +486,8 @@ static int print_status(void)
 	int config_fd = -1, subject_fd = -1, policy_fd = -1;
 	int flow_fd = -1, stats_fd = -1;
 	int cpus = libbpf_num_possible_cpus();
-	__u64 *percpu = NULL;
-	__u64 stats[CA_STATS_COUNT] = {};
+	uint64_t *percpu = NULL;
+	uint64_t stats[CA_STATS_COUNT] = {};
 	int ret = 1;
 
 	config_fd = open_map("ca_config");

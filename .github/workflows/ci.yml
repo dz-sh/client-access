@@ -340,8 +340,10 @@ jobs:
           # neither replaced by attach nor removed by detach.
           sudo bpftool prog load "${RUNNER_TEMP}/foreign-tc-bpf.o" \
             /sys/fs/bpf/ca-foreign-tc type classifier
-          sudo ip netns exec ca-router-ns tc qdisc add dev ca-wan clsact
-          sudo ip netns exec ca-router-ns tc filter add dev ca-wan ingress \
+          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+            tc qdisc add dev ca-wan clsact
+          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+            tc filter add dev ca-wan ingress \
             protocol all pref 202 handle 202 bpf direct-action \
             pinned /sys/fs/bpf/ca-foreign-tc
           if sudo nsenter --net=/var/run/netns/ca-router-ns -- \

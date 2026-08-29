@@ -18,28 +18,47 @@ find_package() {
 	printf '%s\n' "$package"
 }
 
-extract_member() {
-	package=$1
-	member=$2
-	destination=$3
-	case "$member" in
-		*.gz) ar p "$package" "$member" | tar -xz -C "$destination" ;;
-		*.zst) ar p "$package" "$member" | zstd -dc | tar -x -C "$destination" ;;
-		*) ar p "$package" "$member" | tar -x -C "$destination" ;;
+extract_archive() {
+	archive=$1
+	destination=$2
+	case "$archive" in
+		*.gz) tar -xzf "$archive" -C "$destination" ;;
+		*.zst) zstd -dc "$archive" | tar -x -C "$destination" ;;
+		*.xz) tar -xJf "$archive" -C "$destination" ;;
+		*) tar -xf "$archive" -C "$destination" ;;
 	esac
+}
+
+extract_container() {
+	package=$1
+	destination=$2
+	if tar -tf "$package" >/dev/null 2>&1; then
+		tar -xf "$package" -C "$destination"
+	elif ar t "$package" >/dev/null 2>&1; then
+		(
+			cd "$destination"
+			ar x "$package"
+		)
+	else
+		echo "unsupported IPK container format: $package" >&2
+		exit 1
+	fi
 }
 
 extract_package() {
 	name=$1
 	package=$2
 	directory="$work_dir/$name"
-	mkdir -p "$directory/control" "$directory/root"
-	control_member=$(ar t "$package" | sed -n '/^control\.tar/{p;q;}')
-	data_member=$(ar t "$package" | sed -n '/^data\.tar/{p;q;}')
-	test -n "$control_member"
-	test -n "$data_member"
-	extract_member "$package" "$control_member" "$directory/control"
-	extract_member "$package" "$data_member" "$directory/root"
+	mkdir -p "$directory/container" "$directory/control" "$directory/root"
+	extract_container "$package" "$directory/container"
+	control_archive=$(find "$directory/container" -maxdepth 1 -type f \
+		-name 'control.tar*' -print -quit)
+	data_archive=$(find "$directory/container" -maxdepth 1 -type f \
+		-name 'data.tar*' -print -quit)
+	test -n "$control_archive"
+	test -n "$data_archive"
+	extract_archive "$control_archive" "$directory/control"
+	extract_archive "$data_archive" "$directory/root"
 	(
 		cd "$directory/root"
 		find . \( -type f -o -type l \) -print | sed 's#^\.#/#' | sort

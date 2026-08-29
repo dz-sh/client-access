@@ -89,6 +89,8 @@ jobs:
           test -f htdocs/luci-static/resources/client-access/common.js
           test -f htdocs/luci-static/resources/client-access/status.js
           test -f htdocs/luci-static/resources/client-access/approvals.js
+          grep -Fq 'CLIENT_ACCESS_PACKAGE_SET?=full' Makefile
+          grep -Fq 'ifneq ($(CLIENT_ACCESS_PACKAGE_SET),core-luci)' Makefile
 
       - name: Check the generated nftables fragment
         shell: bash
@@ -870,6 +872,7 @@ jobs:
           ARCH: x86_64-24.10.8
           ARTIFACTS_DIR: ${{ runner.temp }}/openwrt-core-luci-artifacts
           BUILD_LOG: 1
+          CLIENT_ACCESS_PACKAGE_SET: core-luci
           FEED_DIR: ${{ runner.temp }}/client-access-feed
           PACKAGES: luci-app-client-access
           V: s

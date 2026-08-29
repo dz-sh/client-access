@@ -7,10 +7,17 @@ PKG_LICENSE:=Apache-2.0
 PKG_LICENSE_FILES:=LICENSE
 PKG_MAINTAINER:=luci-app-client-access contributors
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)
+
+CLIENT_ACCESS_PACKAGE_SET?=full
+
+ifneq ($(CLIENT_ACCESS_PACKAGE_SET),core-luci)
 PKG_BUILD_DEPENDS:=HAS_BPF_TOOLCHAIN:bpf-headers
+endif
 
 include $(INCLUDE_DIR)/package.mk
+ifneq ($(CLIENT_ACCESS_PACKAGE_SET),core-luci)
 include $(INCLUDE_DIR)/bpf.mk
+endif
 
 define Package/luci-app-client-access
   SECTION:=luci
@@ -188,4 +195,6 @@ endef
 
 $(eval $(call BuildPackage,client-access-core))
 $(eval $(call BuildPackage,luci-app-client-access))
+ifneq ($(CLIENT_ACCESS_PACKAGE_SET),core-luci)
 $(eval $(call BuildPackage,client-access-bpf))
+endif

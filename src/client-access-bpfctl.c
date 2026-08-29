@@ -723,7 +723,7 @@ static int parse_snapshot(struct snapshot *snapshot)
 			    max_age < 1 || max_age > 10000 ||
 			    max_pending < 1 || max_pending > CA_MAX_FLOWS ||
 			    max_new < 1 || max_new > 100000 ||
-			    per_subject < 1 || per_subject > max_new) {
+			    per_subject < 1 || per_subject > 100000) {
 				ret = -EINVAL;
 				break;
 			}

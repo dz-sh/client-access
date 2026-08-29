@@ -89,6 +89,15 @@ assert_equal(result.classifier.domains, [ {
 assert_equal(result.classifier.signature_memory_bytes, 433,
 	'signature admission accounts for map overhead and domain storage');
 
+let independent_limits = config('1');
+independent_limits.max_new_classifications_per_second = '1';
+independent_limits.per_subject_new_classification_rate = '100';
+result = app_policy.compile(independent_limits, monday_0900);
+assert_equal(result.enabled, true,
+	'per-subject classification rate is independent of the global rate');
+assert_equal(result.resource_limits.per_subject_new_classification_rate, 100,
+	'compiler preserves a per-subject rate above the global aggregate rate');
+
 result = app_policy.compile(config('1', [
 	{ identity: 'alice', class: '10', verdict: 'deny', activation: 'always_active' },
 	{ identity: 'alice', class: '100', verdict: 'allow', activation: 'always_active' },

@@ -257,13 +257,6 @@ export function compile(config, epoch) {
 			RESOURCE_DEFAULTS.signature_table_memory_limit, 4096, 8388608,
 			'signature_table_memory_limit', errors),
 	};
-	if (resource_limits.per_subject_new_classification_rate >
-	    resource_limits.max_new_classifications_per_second) {
-		push(errors, 'per_subject_new_classification_rate cannot exceed the global classification rate');
-		resource_limits.per_subject_new_classification_rate =
-			resource_limits.max_new_classifications_per_second;
-	}
-
 	if (!schema_supported)
 		push(errors, `Unsupported configuration schema '${config.schema_version ?? 'missing'}'`);
 

@@ -94,6 +94,26 @@ assert_excludes() {
 	fi
 }
 
+assert_control_depends() {
+	file=$1
+	pattern=$2
+	dependencies=$(sed -n 's/^Depends:[[:space:]]*//p' "$file")
+	printf '%s\n' "$dependencies" | grep -Eq "$pattern" || {
+		echo "$file dependencies do not contain required pattern: $pattern" >&2
+		exit 1
+	}
+}
+
+assert_control_excludes() {
+	file=$1
+	pattern=$2
+	dependencies=$(sed -n 's/^Depends:[[:space:]]*//p' "$file")
+	if printf '%s\n' "$dependencies" | grep -Eq "$pattern"; then
+		echo "$file dependencies contain forbidden pattern: $pattern" >&2
+		exit 1
+	fi
+}
+
 core_package=$(find_package client-access-core)
 luci_package=$(find_package luci-app-client-access)
 bpf_package=$(find_package client-access-bpf)
@@ -127,10 +147,10 @@ assert_contains "$bpf_files" '^/usr/sbin/client-access-bpfctl$'
 assert_contains "$bpf_files" '^/usr/lib/bpf/client-access-bpf\.o$'
 assert_excludes "$bpf_files" '^/(etc/config|www|usr/share/ucode|usr/share/nftables\.d)'
 
-assert_contains "$luci_control" '^Depends:.*client-access-core'
-assert_contains "$bpf_control" '^Depends:.*client-access-core'
-assert_excludes "$bpf_control" 'luci-app-client-access'
-assert_excludes "$core_control" 'luci-|libbpf|kmod-sched-bpf'
+assert_control_depends "$luci_control" '(^|, )client-access-core(,|$)'
+assert_control_depends "$bpf_control" '(^|, )client-access-core(,|$)'
+assert_control_excludes "$bpf_control" '(^|, )luci-app-client-access(,|$)'
+assert_control_excludes "$core_control" '(^|, )(luci-|libbpf|kmod-sched-bpf)'
 
 for left in client-access-core luci-app-client-access client-access-bpf; do
 	for right in client-access-core luci-app-client-access client-access-bpf; do

@@ -83,7 +83,7 @@ function read_result(argv) {
 		let keep = {};
 		for (let index = 2; index < length(argv); index++)
 			keep[argv[index]] = true;
-		for (let name in attachments)
+		for (let name in keys(attachments))
 			if (!keep[name])
 				delete attachments[name];
 		return { code: 0, output: '' };

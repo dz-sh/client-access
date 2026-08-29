@@ -302,6 +302,7 @@ static __always_inline int ca_parse_flow(void *data, void *data_end,
 	key->eth_proto = proto;
 	if (proto == bpf_htons(ETH_P_IP)) {
 		struct iphdr *ip = data + offset;
+		const volatile __u8 *length_bytes;
 		__u32 ihl, total_len;
 
 		if ((void *)(ip + 1) > data_end || ip->version != 4)
@@ -309,7 +310,12 @@ static __always_inline int ca_parse_flow(void *data, void *data_end,
 		ihl = ip->ihl * 4;
 		if (ihl < sizeof(*ip) || data + offset + ihl > data_end)
 			return CA_PARSE_UNSUPPORTED;
-		total_len = bpf_ntohs(ip->tot_len);
+		/* Assemble protocol-declared lengths from bounded packet bytes. Some
+		 * verifier versions lose the unsigned 16-bit range through BPF_END,
+		 * which makes the subsequent packet-bound proof unnecessarily fail.
+		 */
+		length_bytes = (const volatile __u8 *)&ip->tot_len;
+		total_len = ((__u32)length_bytes[0] << 8) | length_bytes[1];
 		if (total_len < ihl || data + offset + total_len > data_end)
 			return CA_PARSE_UNSUPPORTED;
 		key->ip_proto = ip->protocol;
@@ -322,11 +328,13 @@ static __always_inline int ca_parse_flow(void *data, void *data_end,
 	}
 	else if (proto == bpf_htons(ETH_P_IPV6)) {
 		struct ipv6hdr *ip6 = data + offset;
+		const volatile __u8 *length_bytes;
 		__u32 payload_len;
 
 		if ((void *)(ip6 + 1) > data_end || ip6->version != 6)
 			return CA_PARSE_UNSUPPORTED;
-		payload_len = bpf_ntohs(ip6->payload_len);
+		length_bytes = (const volatile __u8 *)&ip6->payload_len;
+		payload_len = ((__u32)length_bytes[0] << 8) | length_bytes[1];
 		if (!payload_len ||
 		    data + offset + sizeof(*ip6) + payload_len > data_end)
 			return CA_PARSE_UNSUPPORTED;

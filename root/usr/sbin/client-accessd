@@ -16,7 +16,7 @@ const NFT = '/usr/sbin/nft';
 const FW4 = '/sbin/fw4';
 const BPFCTL = '/usr/sbin/client-access-bpfctl';
 
-let timer, published;
+let timer, published, conn;
 let generation = 0;
 let applied_signature = null;
 let app_policy_generation = 0;
@@ -1111,7 +1111,7 @@ function observation_inventory() {
 }
 
 uloop.init();
-const conn = ubus.connect();
+conn = ubus.connect();
 if (!conn) {
 	warn('client-accessd: unable to connect to ubus\n');
 	exit(1);

@@ -56,20 +56,23 @@ jobs:
           ! grep -Eiq 'lease|approval' src/client-access-bpf.c src/client-access-bpf.h \
             root/usr/share/nftables.d/table-pre/30-client-access.nft \
             root/usr/share/nftables.d/chain-pre/forward/30-client-access.nft
-          ! grep -Eiq 'conntrack-tools|\+conntrack' Makefile
+          ! grep -Eiq 'conntrack-tools|\+conntrack' client-access-*/Makefile luci-app-client-access/Makefile
 
       - name: Enforce the V4.5 package and source boundaries
         shell: bash
         run: |
-          grep -Fq 'define Package/client-access-core' Makefile
-          grep -Eq 'Package/luci-app-client-access.*|DEPENDS:=\+client-access-core' Makefile
-          grep -Fq 'DEPENDS:=+client-access-core +libbpf' Makefile
-          ! sed -n '/define Package\/client-access-core/,/endef/p' Makefile \
+          test ! -f Makefile
+          grep -Fq 'define Package/client-access-core' client-access-core/Makefile
+          grep -Fq 'DEPENDS:=+client-access-core +luci-base' luci-app-client-access/Makefile
+          grep -Fq 'DEPENDS:=+client-access-core +libbpf' client-access-bpf/Makefile
+          ! sed -n '/define Package\/client-access-core/,/endef/p' client-access-core/Makefile \
             | grep -Eq 'luci|libbpf|kmod-sched-bpf'
-          ! sed -n '/define Package\/client-access-core\/install/,/endef/p' Makefile \
+          ! sed -n '/define Package\/client-access-core\/install/,/endef/p' client-access-core/Makefile \
             | grep -Eq 'htdocs|luci/menu|rpcd/acl|client-access-bpf'
-          ! sed -n '/define Package\/luci-app-client-access\/install/,/endef/p' Makefile \
+          ! sed -n '/define Package\/luci-app-client-access\/install/,/endef/p' luci-app-client-access/Makefile \
             | grep -Eq 'etc/config|client-accessd|ucode/client_access|nftables|lib/bpf'
+          ! grep -Eq 'bpf\.mk|bpf-headers|CompileBPF|client-access-bpf' \
+            client-access-core/Makefile luci-app-client-access/Makefile
           test -f root/usr/share/ucode/client_access/config.uc
           test -f root/usr/share/ucode/client_access/lease_store.uc
           test -f root/usr/share/ucode/client_access/firewall.uc
@@ -89,8 +92,8 @@ jobs:
           test -f htdocs/luci-static/resources/client-access/common.js
           test -f htdocs/luci-static/resources/client-access/status.js
           test -f htdocs/luci-static/resources/client-access/approvals.js
-          grep -Fq 'CLIENT_ACCESS_PACKAGE_SET?=full' Makefile
-          grep -Fq 'ifneq ($(CLIENT_ACCESS_PACKAGE_SET),core-luci)' Makefile
+          test "$(find client-access-core client-access-bpf luci-app-client-access \
+            -mindepth 1 -maxdepth 1 -name Makefile | wc -l)" -eq 3
 
       - name: Check the generated nftables fragment
         shell: bash
@@ -113,7 +116,9 @@ jobs:
         shell: bash
         run: |
           mkdir -p "${RUNNER_TEMP}/luci/applications/luci-app-client-access"
-          cp -a htdocs root Makefile "${RUNNER_TEMP}/luci/applications/luci-app-client-access/"
+          cp -a htdocs root "${RUNNER_TEMP}/luci/applications/luci-app-client-access/"
+          cp luci-app-client-access/Makefile \
+            "${RUNNER_TEMP}/luci/applications/luci-app-client-access/Makefile"
           cd "${RUNNER_TEMP}/luci"
           npm install --ignore-scripts
           npx eslint \
@@ -872,7 +877,6 @@ jobs:
           ARCH: x86_64-24.10.8
           ARTIFACTS_DIR: ${{ runner.temp }}/openwrt-core-luci-artifacts
           BUILD_LOG: 1
-          CLIENT_ACCESS_PACKAGE_SET: core-luci
           FEED_DIR: ${{ runner.temp }}/client-access-feed
           PACKAGES: luci-app-client-access
           V: s

@@ -91,7 +91,7 @@ endef
 define Package/client-access-bpf/prerm
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}$${PKG_INSTROOT}" ] || {
-	/usr/sbin/client-access-bpfctl unload >/dev/null 2>&1 || true
+	/usr/sbin/client-access-bpfctl unload >/dev/null 2>&1 || exit 1
 }
 exit 0
 endef

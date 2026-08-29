@@ -95,7 +95,9 @@ Network → Client Access
   flows. Application-policy changes are re-evaluated on the next software-path
   packet of a cached flow.
 - Application classification is outbound-only and does not provide full DPI,
-  TLS interception, QUIC decryption, quota, or bandwidth limiting.
+  TLS inspection, TCP reconstruction, QUIC parsing/decryption, quota, or
+  bandwidth limiting. Return-only traffic is not associated with its outbound
+  flow.
 - Bandwidth limiting, quota, traffic accounting, private-MAC correlation, and
   unknown-client notifications are not implemented.
 - Names and addresses are best-effort discovery information and may be stale or
@@ -107,6 +109,12 @@ The application currently targets firewall4/nftables on OpenWrt and
 ImmortalWrt. The firewall4 `auto_includes` option must remain enabled.
 The optional application backend reserves firewall mark mask `0x60000000`;
 custom VPN, QoS, or policy-routing rules must not use those two bits.
+
+The reproducible V4.1 package baselines are OpenWrt 24.10.8 x86_64 and
+ImmortalWrt 24.10.6 x86_64. Automated datapath coverage includes a Linux
+bridge, 802.1Q VLAN, IPv4 forwarding, and routed IPv6 forwarding. This does not
+claim validation of DSA, PPPoE, big-endian targets, vendor-specific hardware,
+or router throughput; those require separate target evidence.
 
 ## License
 

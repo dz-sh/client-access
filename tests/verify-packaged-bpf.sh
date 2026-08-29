@@ -73,11 +73,12 @@ printf '%s\n' \
 	'POLICY 42 1 0' \
 	'POLICY 42 0 0' \
 	| sudo "$work_dir/client-access-bpfctl" sync
+sudo "$work_dir/client-access-bpfctl" health 1 1 ca-pkg-a
 sudo ip netns exec ca-pkg-ns ping -c 1 -W 1 192.0.2.1
 sudo "$work_dir/client-access-bpfctl" status >"$work_dir/status.json"
 jq -e '
 	.backend_mode == "V4_BPF_BASIC" and
-	.bpf_schema_version == 2 and
+	.bpf_schema_version == 3 and
 	.program_pinned == true and
 	.maps_pinned == true and
 	.flow_map_entries >= 1 and

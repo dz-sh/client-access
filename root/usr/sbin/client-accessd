@@ -10,6 +10,7 @@ import * as uloop from 'uloop';
 import * as policy from 'client_access.policy';
 import * as app_policy from 'client_access.app_policy';
 import * as model from 'client_access.model';
+import * as runtime_policy from 'client_access.runtime';
 
 const NFT = '/usr/sbin/nft';
 const FW4 = '/sbin/fw4';
@@ -22,6 +23,8 @@ let app_policy_generation = 0;
 let classifier_generation = 0;
 let app_applied_signature = null;
 let classifier_applied_signature = null;
+let app_applied_sources = [];
+let app_applied_destinations = [];
 let generation_floors_loaded = false;
 let app_attached_interfaces = [];
 let dns_subscriber, dns_flush_timer;
@@ -465,18 +468,15 @@ function ensure_dns_subscription() {
 		dns_subscribed = !!dns_subscriber.subscribe('dnsmasq.dns');
 }
 
-function detach_app_interfaces(keep) {
-	let keep_set = {}, remaining = [];
-	for (let ifname in keep)
-		keep_set[ifname] = true;
-	for (let ifname in app_attached_interfaces) {
-		if (keep_set[ifname]) {
-			push(remaining, ifname);
-			continue;
-		}
-		run_capture([ BPFCTL, 'detach', ifname ]);
+function prune_app_interfaces(keep) {
+	if (!stat(BPFCTL)) {
+		app_attached_interfaces = [];
+		return { code: null, output: '' };
 	}
-	app_attached_interfaces = remaining;
+	const result = run_capture([ BPFCTL, 'prune', ...keep ]);
+	if (result.code == 0)
+		app_attached_interfaces = [ ...keep ];
+	return result;
 }
 
 function apply_app_nft_scope(enabled, sources, destinations) {
@@ -501,6 +501,48 @@ function apply_app_nft_scope(enabled, sources, destinations) {
 		: { ok: false, error: `Application-filter nft scope failed with exit code ${code}` };
 }
 
+function neutralize_app_runtime(errors) {
+	const disabled = stat(BPFCTL)
+		? run_capture([ BPFCTL, 'disable' ])
+		: { code: null, output: '' };
+	if (disabled.code != null && disabled.code != 0)
+		push(errors, 'Unable to disable application BPF state');
+	const pruned = prune_app_interfaces([]);
+	if (pruned.code != null && pruned.code != 0)
+		push(errors, 'Unable to detach all owned application BPF filters');
+	const scope = apply_app_nft_scope(false, [], []);
+	if (!scope.ok)
+		push(errors, scope.error);
+	app_applied_signature = null;
+	classifier_applied_signature = null;
+	app_applied_sources = [];
+	app_applied_destinations = [];
+	clear_dns_queue();
+	return {
+		ok: (disabled.code == null || disabled.code == 0) &&
+			(pruned.code == null || pruned.code == 0) && scope.ok,
+		backend_present: disabled.code != null,
+	};
+}
+
+function restore_app_scope(errors) {
+	const scope = apply_app_nft_scope(true, app_applied_sources,
+		app_applied_destinations);
+	if (scope.ok)
+		return true;
+	push(errors, scope.error);
+	neutralize_app_runtime(errors);
+	return false;
+}
+
+function runtime_flow_offload() {
+	const result = run_capture([ NFT, 'list', 'ruleset' ]);
+	return {
+		checked: result.code == 0,
+		ruleset: result.output,
+	};
+}
+
 function apply_app_filter(config, app_compiled, subject_projection, sources,
 		destinations, zone_errors, force) {
 	let errors = [ ...app_compiled.errors, ...subject_projection.errors, ...zone_errors ];
@@ -511,23 +553,12 @@ function apply_app_filter(config, app_compiled, subject_projection, sources,
 		previous_interfaces[ifname] = true;
 
 	if (!app_compiled.requested_enabled) {
-		const disabled = stat(BPFCTL)
-			? run_capture([ BPFCTL, 'disable' ])
-			: { code: null, output: '' };
-		if (disabled.code != null && disabled.code != 0)
-			push(errors, 'Unable to neutralize the application-filter datapath');
-		detach_app_interfaces([]);
-		const scope = apply_app_nft_scope(false, [], []);
-		if (!scope.ok)
-			push(errors, scope.error);
-		app_applied_signature = null;
-		classifier_applied_signature = null;
-		clear_dns_queue();
+		const neutral = neutralize_app_runtime(errors);
 		return {
-			ok: (disabled.code == null || disabled.code == 0) && scope.ok,
+			ok: neutral.ok,
 			available: false,
 			enabled: false,
-			degraded: (disabled.code != null && disabled.code != 0) || !scope.ok,
+			degraded: !neutral.ok,
 			retained_previous_snapshot: false,
 			backend_mode: 'V3_NFT_ONLY',
 			generation: app_policy_generation,
@@ -538,13 +569,7 @@ function apply_app_filter(config, app_compiled, subject_projection, sources,
 	}
 	if (!stat(BPFCTL)) {
 		push(errors, 'The optional TC eBPF application backend is not installed');
-		app_attached_interfaces = [];
-		const scope = apply_app_nft_scope(false, [], []);
-		if (!scope.ok)
-			push(errors, scope.error);
-		app_applied_signature = null;
-		classifier_applied_signature = null;
-		clear_dns_queue();
+		neutralize_app_runtime(errors);
 		return {
 			ok: false,
 			available: false,
@@ -558,21 +583,17 @@ function apply_app_filter(config, app_compiled, subject_projection, sources,
 			warnings,
 		};
 	}
-	if (config.flow_offloading || config.flow_offloading_hw) {
-		push(errors, 'Disable firewall software and hardware flow offloading before enabling application filtering');
-		const disabled = stat(BPFCTL)
-			? run_capture([ BPFCTL, 'disable' ])
-			: { code: null, output: '' };
-		detach_app_interfaces([]);
-		const scope = apply_app_nft_scope(false, [], []);
-		if (!scope.ok)
-			push(errors, scope.error);
-		app_applied_signature = null;
-		classifier_applied_signature = null;
-		clear_dns_queue();
+	const runtime_offload = runtime_flow_offload();
+	const offload_refusal = runtime_policy.offload_refusal(config,
+		runtime_offload.checked, runtime_offload.ruleset);
+	if (offload_refusal) {
+		push(errors, offload_refusal == 'unverifiable_ruleset'
+			? 'Unable to verify that the active nftables ruleset has no flow offload path'
+			: 'Disable firewall and custom nftables flow offloading before enabling application filtering');
+		const neutral = neutralize_app_runtime(errors);
 		return {
 			ok: false,
-			available: disabled.code != null,
+			available: neutral.backend_present,
 			enabled: false,
 			degraded: true,
 			retained_previous_snapshot: false,
@@ -588,13 +609,29 @@ function apply_app_filter(config, app_compiled, subject_projection, sources,
 	if (!length(destinations))
 		push(errors, 'No Internet destination interfaces resolved for the application filter');
 	if (!app_compiled.enabled || length(errors)) {
+		if (!previously_enabled) {
+			neutralize_app_runtime(errors);
+			return {
+				ok: false,
+				available: false,
+				enabled: false,
+				degraded: true,
+				retained_previous_snapshot: false,
+				backend_mode: 'V3_NFT_ONLY',
+				generation: app_policy_generation,
+				classifier_generation,
+				errors,
+				warnings,
+			};
+		}
+		const retained = restore_app_scope(errors);
 		return {
 			ok: false,
-			available: previously_enabled,
-			enabled: previously_enabled,
+			available: retained,
+			enabled: retained,
 			degraded: true,
-			retained_previous_snapshot: previously_enabled,
-			backend_mode: previously_enabled ? 'V4_BPF_BASIC' : 'V3_NFT_ONLY',
+			retained_previous_snapshot: retained,
+			backend_mode: retained ? 'V4_BPF_BASIC' : 'V3_NFT_ONLY',
 			generation: app_policy_generation,
 			classifier_generation,
 			errors,
@@ -605,16 +642,7 @@ function apply_app_filter(config, app_compiled, subject_projection, sources,
 	const ensured = run_capture([ BPFCTL, 'ensure' ]);
 	if (ensured.code != 0) {
 		push(errors, 'Unable to load or verify the TC eBPF application backend');
-		const disabled = run_capture([ BPFCTL, 'disable' ]);
-		if (disabled.code != 0)
-			push(errors, 'Unable to neutralize unverifiable application BPF state');
-		detach_app_interfaces([]);
-		const scope = apply_app_nft_scope(false, [], []);
-		if (!scope.ok)
-			push(errors, scope.error);
-		app_applied_signature = null;
-		classifier_applied_signature = null;
-		clear_dns_queue();
+		neutralize_app_runtime(errors);
 		return {
 			ok: false,
 			available: false,
@@ -642,13 +670,14 @@ function apply_app_filter(config, app_compiled, subject_projection, sources,
 		for (let ifname in attached)
 			if (!previous_interfaces[ifname])
 				run_capture([ BPFCTL, 'detach', ifname ]);
+		const retained = previously_enabled && restore_app_scope(errors);
 		return {
 			ok: false,
 			available: true,
-			enabled: previously_enabled,
+			enabled: retained,
 			degraded: true,
-			retained_previous_snapshot: previously_enabled,
-			backend_mode: 'V4_BPF_BASIC',
+			retained_previous_snapshot: retained,
+			backend_mode: retained ? 'V4_BPF_BASIC' : 'V3_NFT_ONLY',
 			generation: app_policy_generation,
 			classifier_generation,
 			errors,
@@ -672,33 +701,31 @@ function apply_app_filter(config, app_compiled, subject_projection, sources,
 			for (let ifname in attached)
 				if (!previous_interfaces[ifname])
 					run_capture([ BPFCTL, 'detach', ifname ]);
+			const retained = previously_enabled && restore_app_scope(errors);
 			return {
 				ok: false,
 				available: true,
-				enabled: previously_enabled,
+				enabled: retained,
 				degraded: true,
-				retained_previous_snapshot: previously_enabled,
-				backend_mode: 'V4_BPF_BASIC',
+				retained_previous_snapshot: retained,
+				backend_mode: retained ? 'V4_BPF_BASIC' : 'V3_NFT_ONLY',
 				generation: app_policy_generation,
 				classifier_generation,
 				errors,
 				warnings,
 			};
 		}
+		if (changed)
+			app_policy_generation = candidate_generation;
+		if (classifier_changed) {
+			classifier_generation = candidate_classifier_generation;
+			clear_dns_queue();
+		}
 	}
 	const scope = apply_app_nft_scope(true, sources, destinations);
 	if (!scope.ok) {
 		push(errors, scope.error);
-		const disabled = run_capture([ BPFCTL, 'disable' ]);
-		if (disabled.code != 0)
-			push(errors, 'Unable to neutralize the application-filter datapath after nft scope failure');
-		const cleared = apply_app_nft_scope(false, [], []);
-		if (!cleared.ok)
-			push(errors, cleared.error);
-		detach_app_interfaces([]);
-		app_applied_signature = null;
-		classifier_applied_signature = null;
-		clear_dns_queue();
+		neutralize_app_runtime(errors);
 		return {
 			ok: false,
 			available: true,
@@ -712,14 +739,28 @@ function apply_app_filter(config, app_compiled, subject_projection, sources,
 			warnings,
 		};
 	}
-	detach_app_interfaces(sources);
+	const pruned = prune_app_interfaces(sources);
+	if (pruned.code != 0) {
+		push(errors, 'Unable to establish the exact application-filter TC interface set');
+		neutralize_app_runtime(errors);
+		return {
+			ok: false,
+			available: true,
+			enabled: false,
+			degraded: true,
+			retained_previous_snapshot: false,
+			backend_mode: 'V3_NFT_ONLY',
+			generation: app_policy_generation,
+			classifier_generation,
+			errors,
+			warnings,
+		};
+	}
 	app_attached_interfaces = [ ...sources ];
-	if (changed)
-		app_policy_generation = candidate_generation;
+	app_applied_sources = [ ...sources ];
+	app_applied_destinations = [ ...destinations ];
 	if (classifier_changed) {
-		classifier_generation = candidate_classifier_generation;
 		classifier_applied_signature = current_classifier_signature;
-		clear_dns_queue();
 	}
 	app_applied_signature = signature;
 	return {
@@ -736,18 +777,20 @@ function apply_app_filter(config, app_compiled, subject_projection, sources,
 	};
 }
 
-function app_runtime_snapshot(enabled) {
+function app_runtime_snapshot(enabled, policy_generation,
+		classifier_generation, interfaces) {
 	if (!enabled || !stat(BPFCTL))
 		return { available: false, status_json: null, error: null };
 
 	const gc = run_capture([ BPFCTL, 'gc', '300' ]);
-	const status = run_capture([ BPFCTL, 'status' ]);
+	const health = run_capture([ BPFCTL, 'health', '' + policy_generation,
+		'' + classifier_generation, ...interfaces ]);
 	return {
-		available: status.code == 0,
-		status_json: status.code == 0 ? trim(status.output) : null,
-		error: status.code == 0
-			? (gc.code == 0 ? null : 'Unable to reclaim idle application flows')
-			: 'Unable to read application-filter runtime diagnostics',
+		available: health.code == 0,
+		status_json: health.code == 0 ? trim(health.output) : null,
+		error: health.code != 0
+			? 'Application-filter generations or TC attachments do not match the published snapshot'
+			: (gc.code == 0 ? null : 'Unable to reclaim idle application flows'),
 	};
 }
 
@@ -760,10 +803,31 @@ function current_status() {
 	result.app_filter.dns_hint_conflicts = dns_hint_conflicts;
 	result.app_filter.dns_publish_errors = dns_publish_errors;
 	if (result.app_filter.enabled && stat(BPFCTL)) {
-		const runtime = run_capture([ BPFCTL, 'status' ]);
+		const runtime = run_capture([ BPFCTL, 'health',
+			'' + result.app_filter.app_policy_generation,
+			'' + result.app_filter.classifier_generation,
+			...app_attached_interfaces ]);
 		result.app_filter.runtime_available = runtime.code == 0;
 		result.app_filter.runtime_status_json = runtime.code == 0
 			? trim(runtime.output) : null;
+		if (runtime.code != 0) {
+			let errors = [ ...(result.app_filter.errors ?? []),
+				'Application-filter runtime health no longer matches the published snapshot' ];
+			neutralize_app_runtime(errors);
+			result.app_filter = {
+				...result.app_filter,
+				backend_mode: 'V3_NFT_ONLY',
+				enabled: false,
+				available: false,
+				applied: false,
+				degraded: true,
+				retained_previous_snapshot: false,
+				runtime_available: false,
+				runtime_status_json: null,
+				errors,
+			};
+			state = result;
+		}
 	}
 	return result;
 }
@@ -865,20 +929,13 @@ function reconcile(reason, force) {
 	let app_apply = apply_app_filter(config, app_compiled, subject_projection,
 		source.interfaces, destination.interfaces,
 		[ ...source.errors, ...destination.errors ], force);
-	let app_runtime = app_runtime_snapshot(app_apply.enabled);
+	let app_runtime = app_runtime_snapshot(app_apply.enabled,
+		app_apply.generation, app_apply.classifier_generation,
+		app_attached_interfaces);
 	if (app_apply.enabled && !app_runtime.available) {
 		push(app_apply.errors, app_runtime.error ??
 			'Application-filter runtime state became unavailable');
-		const disabled = run_capture([ BPFCTL, 'disable' ]);
-		if (disabled.code != 0)
-			push(app_apply.errors, 'Unable to neutralize unavailable application BPF state');
-		detach_app_interfaces([]);
-		const scope = apply_app_nft_scope(false, [], []);
-		if (!scope.ok)
-			push(app_apply.errors, scope.error);
-		app_applied_signature = null;
-		classifier_applied_signature = null;
-		clear_dns_queue();
+		neutralize_app_runtime(app_apply.errors);
 		app_apply = {
 			...app_apply,
 			ok: false,

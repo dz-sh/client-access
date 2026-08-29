@@ -30,6 +30,8 @@ jobs:
           find root/etc -type f \( -path '*/init.d/*' -o -path '*/hotplug.d/*' \) -print0 \
             | xargs -0 -n1 sh -n
           sh -n tests/verify-packaged-bpf.sh
+          sh -n tests/measure-bpf-performance.sh
+          python3 -m py_compile tests/send-malformed-frames.py
 
       - name: Check the generated nftables fragment
         shell: bash
@@ -95,6 +97,14 @@ jobs:
           -L "${GITHUB_WORKSPACE}/root/usr/share/ucode"
           "${GITHUB_WORKSPACE}/tests/app_policy.uc"
 
+      - name: Run runtime policy tests
+        env:
+          TZ: UTC
+        run: >-
+          "${RUNNER_TEMP}/ucode-build/ucode"
+          -L "${GITHUB_WORKSPACE}/root/usr/share/ucode"
+          "${GITHUB_WORKSPACE}/tests/runtime.uc"
+
       - name: Compile-check the daemon with stub target modules
         run: >-
           "${RUNNER_TEMP}/ucode-build/ucode"
@@ -103,6 +113,35 @@ jobs:
           -L "${GITHUB_WORKSPACE}/tests/stubs"
           -L "${GITHUB_WORKSPACE}/root/usr/share/ucode"
           "${GITHUB_WORKSPACE}/root/usr/sbin/client-accessd"
+
+      - name: Exercise daemon lifecycle and failure semantics
+        shell: bash
+        run: |
+          for scenario in \
+            restart_prune \
+            fw4_restore \
+            generation_nonreuse \
+            health_failure \
+            status_health_failure \
+            ensure_failure \
+            attach_failure \
+            sync_failure \
+            nft_scope_failure \
+            prune_failure \
+            offload_software \
+            offload_hardware \
+            offload_custom
+          do
+            CA_DAEMON_TEST_SCENARIO="${scenario}" \
+              "${RUNNER_TEMP}/ucode-build/ucode" \
+              -L "${GITHUB_WORKSPACE}/tests/stubs" \
+              -L "${GITHUB_WORKSPACE}/root/usr/share/ucode" \
+              "${GITHUB_WORKSPACE}/root/usr/sbin/client-accessd" \
+              >"${RUNNER_TEMP}/client-accessd-${scenario}.json"
+            jq -e --arg scenario "${scenario}" \
+              '.scenario == $scenario' \
+              "${RUNNER_TEMP}/client-accessd-${scenario}.json"
+          done
 
   bpf-datapath:
     name: Remote TC eBPF datapath
@@ -114,7 +153,7 @@ jobs:
       - name: Install eBPF build and runtime dependencies
         run: >-
           sudo apt-get update && sudo apt-get install --yes
-          clang llvm libbpf-dev libelf-dev zlib1g-dev
+          bpftool clang llvm libbpf-dev libelf-dev zlib1g-dev
           iproute2 iputils-ping netcat-openbsd nftables util-linux
 
       - name: Build the datapath and publisher on Linux
@@ -124,6 +163,10 @@ jobs:
             -I/usr/include/x86_64-linux-gnu \
             -c src/client-access-bpf.c \
             -o "${RUNNER_TEMP}/client-access-bpf.o"
+          clang -O2 -g -target bpf -D__TARGET_ARCH_x86 \
+            -I/usr/include/x86_64-linux-gnu \
+            -c tests/foreign-tc-bpf.c \
+            -o "${RUNNER_TEMP}/foreign-tc-bpf.o"
           cc -O2 -Wall -Wextra -Werror -std=gnu11 \
             src/client-access-bpfctl.c \
             -o "${RUNNER_TEMP}/client-access-bpfctl" \
@@ -255,6 +298,72 @@ jobs:
           sudo nsenter --net=/var/run/netns/ca-router-ns -- \
             "${RUNNER_TEMP}/client-access-bpfctl" attach ca-br-lan
 
+          # V41-LIFE-001/002: a partial pin set and an incompatible schema are
+          # replaced as a complete unit, detaching the old owned program first.
+          sudo rm /sys/fs/bpf/client_access/ca_policy_a
+          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+            "${RUNNER_TEMP}/client-access-bpfctl" ensure \
+            "${RUNNER_TEMP}/client-access-bpf.o"
+          if sudo ip netns exec ca-router-ns tc filter show dev ca-br-lan ingress \
+              | grep -q 'bpf'; then
+            echo 'partial backend replacement left the old program attached' >&2
+            exit 1
+          fi
+          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+            "${RUNNER_TEMP}/client-access-bpfctl" attach ca-br-lan
+          sudo bpftool map update pinned \
+            /sys/fs/bpf/client_access/ca_mark_schema \
+            key hex 00 00 00 00 value hex 02 00 00 00
+          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+            "${RUNNER_TEMP}/client-access-bpfctl" ensure \
+            "${RUNNER_TEMP}/client-access-bpf.o"
+          if sudo ip netns exec ca-router-ns tc filter show dev ca-br-lan ingress \
+              | grep -q 'bpf'; then
+            echo 'schema replacement left the incompatible program attached' >&2
+            exit 1
+          fi
+          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+            "${RUNNER_TEMP}/client-access-bpfctl" attach ca-br-lan
+
+          # V41-LIFE-004/005: a foreign program at the reserved coordinate is
+          # neither replaced by attach nor removed by detach.
+          sudo bpftool prog load "${RUNNER_TEMP}/foreign-tc-bpf.o" \
+            /sys/fs/bpf/ca-foreign-tc type classifier
+          sudo ip netns exec ca-router-ns tc qdisc add dev ca-wan clsact
+          sudo ip netns exec ca-router-ns tc filter add dev ca-wan ingress \
+            protocol all pref 202 handle 202 bpf direct-action \
+            pinned /sys/fs/bpf/ca-foreign-tc
+          if sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+              "${RUNNER_TEMP}/client-access-bpfctl" attach ca-wan; then
+            echo 'attach replaced a foreign TC program' >&2
+            exit 1
+          fi
+          if sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+              "${RUNNER_TEMP}/client-access-bpfctl" detach ca-wan; then
+            echo 'detach removed or accepted a foreign TC program' >&2
+            exit 1
+          fi
+          sudo ip netns exec ca-router-ns tc filter show dev ca-wan ingress \
+            | grep -q 'ca-foreign-tc\|foreign_tc\|bpf'
+          sudo ip netns exec ca-router-ns tc filter del dev ca-wan ingress \
+            pref 202 handle 202 bpf
+          sudo rm /sys/fs/bpf/ca-foreign-tc
+
+          # A daemon restart loses its in-memory attachment list. Pruning by
+          # pinned program ID keeps the desired interface and removes only a
+          # stale attachment owned by this application.
+          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+            "${RUNNER_TEMP}/client-access-bpfctl" attach ca-wan
+          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+            "${RUNNER_TEMP}/client-access-bpfctl" prune ca-br-lan
+          sudo ip netns exec ca-router-ns tc filter show dev ca-br-lan ingress \
+            | grep -q 'bpf'
+          if sudo ip netns exec ca-router-ns tc filter show dev ca-wan ingress \
+              | grep -q 'bpf'; then
+            echo 'prune left a stale owned TC program attached' >&2
+            exit 1
+          fi
+
           # Establish that the namespace router works before adding the
           # application workflow's nft forward consumer.
           sudo ip netns exec ca-client-ns ping -c 1 -W 1 198.51.100.2
@@ -298,6 +407,55 @@ jobs:
             'POLICY 42 1 1' \
             'POLICY 42 0 0' \
             | sudo "${RUNNER_TEMP}/client-access-bpfctl" sync
+          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+            "${RUNNER_TEMP}/client-access-bpfctl" health 1 1 ca-br-lan
+          if sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+              "${RUNNER_TEMP}/client-access-bpfctl" health 2 1 ca-br-lan; then
+            echo 'health accepted a stale application-policy generation' >&2
+            exit 1
+          fi
+          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+            "${RUNNER_TEMP}/client-access-bpfctl" detach ca-br-lan
+          if sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+              "${RUNNER_TEMP}/client-access-bpfctl" health 1 1 ca-br-lan; then
+            echo 'health accepted a missing expected TC attachment' >&2
+            exit 1
+          fi
+          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+            "${RUNNER_TEMP}/client-access-bpfctl" attach ca-br-lan
+          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+            "${RUNNER_TEMP}/client-access-bpfctl" health 1 1 ca-br-lan
+
+          # V41-LIFE-003: multi-object reads and GC contend on the same
+          # controller lock without exposing a partial runtime snapshot.
+          pids=''
+          for attempt in $(seq 1 8); do
+            sudo "${RUNNER_TEMP}/client-access-bpfctl" status >/dev/null &
+            pids="${pids} $!"
+            sudo "${RUNNER_TEMP}/client-access-bpfctl" generations >/dev/null &
+            pids="${pids} $!"
+            sudo "${RUNNER_TEMP}/client-access-bpfctl" gc 86400 >/dev/null &
+            pids="${pids} $!"
+          done
+          for pid in ${pids}; do
+            wait "${pid}"
+          done
+          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+            "${RUNNER_TEMP}/client-access-bpfctl" health 1 1 ca-br-lan
+
+          # Health describes the exact owned attachment set, not merely a
+          # minimum list of interfaces that must contain the program.
+          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+            "${RUNNER_TEMP}/client-access-bpfctl" attach ca-wan
+          if sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+              "${RUNNER_TEMP}/client-access-bpfctl" health 1 1 ca-br-lan; then
+            echo 'health accepted an extra owned TC attachment' >&2
+            exit 1
+          fi
+          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+            "${RUNNER_TEMP}/client-access-bpfctl" prune ca-br-lan
+          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
+            "${RUNNER_TEMP}/client-access-bpfctl" health 1 1 ca-br-lan
 
           # Router-local traffic is outside the app-filter workflow.
           # The second packet has a cached UNCLASSIFIED DENY app verdict but
@@ -337,9 +495,33 @@ jobs:
           # existing flow without reopening provisional classification.
           sudo ip netns exec ca-client-ns ping -c 1 -W 1 198.51.100.2
 
-          # A failed inactive-slot build must leave generation 2 active.
+          # V41-FLOW-008: classifier generation changes apply to new flows.
+          # The existing ICMP flow keeps class 100, while a different source
+          # address creates a new flow and observes the new class 101 mapping.
+          printf '%s\n' \
+            'CONFIG 1 3 2 0 0 1 256 200 256 512 64' \
+            'SUBJECT 02:00:00:00:00:42 42' \
+            'PREFIX4 198.51.100.2/32 101 10 1' \
+            'POLICY 42 100 0' \
+            'POLICY 42 101 1' \
+            'POLICY 42 10 0' \
+            'POLICY 42 1 0' \
+            'POLICY 42 0 0' \
+            | sudo "${RUNNER_TEMP}/client-access-bpfctl" sync
+          sudo ip netns exec ca-client-ns ping -c 1 -W 1 198.51.100.2
+          sudo ip netns exec ca-client-ns ip address add \
+            192.0.2.3/24 dev ca-client.42
+          sudo ip netns exec ca-client-ns ping -I 192.0.2.3 -c 1 -W 1 \
+            198.51.100.2
+          if sudo ip netns exec ca-client-ns ping -I 192.0.2.3 -c 1 -W 1 \
+              198.51.100.2; then
+            echo 'new flow ignored the new classifier generation' >&2
+            exit 1
+          fi
+
+          # A failed inactive-slot build must leave generation 3 active.
           if printf '%s\n' \
-              'CONFIG 1 3 1 0 0 1 256 200 256 512 64' \
+              'CONFIG 1 4 2 0 0 1 256 200 256 512 64' \
               'SUBJECT 02:00:00:00:00:42 42' \
               'SUBJECT 02:00:00:00:00:42 42' \
               | sudo "${RUNNER_TEMP}/client-access-bpfctl" sync; then
@@ -350,14 +532,14 @@ jobs:
           # DNS hints are generation scoped. Conflicting hints for one shared
           # IP degrade to UNCLASSIFIED rather than last-writer-wins.
           printf '%s\n' \
-            'DNSGEN 1' \
+            'DNSGEN 2' \
             'DNS4 198.51.100.3 101 10 1 60' \
             'DNS4 198.51.100.4 100 10 1 60' \
             'DNS4 198.51.100.4 101 10 1 60' \
             | sudo "${RUNNER_TEMP}/client-access-bpfctl" dns-sync
 
           printf '%s\n' \
-            'CONFIG 1 3 1 0 0 1 256 200 256 512 64' \
+            'CONFIG 1 4 2 0 0 1 256 200 256 512 64' \
             'SUBJECT 02:00:00:00:00:42 42' \
             'PORT 17 443 10 10 2' \
             'POLICY 42 101 1' \
@@ -376,7 +558,7 @@ jobs:
           # They receive the independent UNCLASSIFIED app verdict immediately
           # and remain per-packet bounded rather than entering flow state.
           printf '%s\n' \
-            'CONFIG 1 4 1 0 0 1 256 200 256 512 64' \
+            'CONFIG 1 5 2 0 0 1 256 200 256 512 64' \
             'SUBJECT 02:00:00:00:00:42 42' \
             'POLICY 42 1 1' \
             'POLICY 42 0 1' \
@@ -391,23 +573,88 @@ jobs:
             echo 'fragmented IPv6 unexpectedly bypassed UNCLASSIFIED DENY' >&2
             exit 1
           fi
+          router_mac=$(sudo ip netns exec ca-router-ns \
+            cat /sys/class/net/ca-br-lan/address)
+          parse_before=$(sudo "${RUNNER_TEMP}/client-access-bpfctl" status \
+            | jq -r '.parse_unsupported')
+          malformed_count=$(sudo ip netns exec ca-client-ns python3 \
+            tests/send-malformed-frames.py ca-client.42 "${router_mac}")
+          parse_after=$(sudo "${RUNNER_TEMP}/client-access-bpfctl" status \
+            | jq -r '.parse_unsupported')
+          # Truncated Ethernet returns before a selector can be resolved. Every
+          # other adversarial frame must take the explicit unsupported path.
+          test "$((parse_after - parse_before))" -eq "$((malformed_count - 1))"
 
-          # Five-tuple churn is load-shed by aggregate and per-subject
-          # admission limits without creating userspace flow work.
+          # V41-SEC-002: isolate per-subject admission pressure from the
+          # higher global limit.
+          sleep 1.1
           printf '%s\n' \
-            'CONFIG 1 5 1 0 0 1 256 200 256 1 1' \
+            'CONFIG 1 6 2 0 0 1 256 200 256 100 1' \
             'SUBJECT 02:00:00:00:00:42 42' \
             'POLICY 42 1 0' \
             'POLICY 42 0 0' \
             | sudo "${RUNNER_TEMP}/client-access-bpfctl" sync
+          admission_before=$(sudo "${RUNNER_TEMP}/client-access-bpfctl" status \
+            | jq -r '.classification_admission_denied')
           sudo ip netns exec ca-client-ns bash -c '
             for port in $(seq 5000 5031); do
               echo pressure >"/dev/udp/198.51.100.3/${port}" || true
             done
           '
+          admission_after=$(sudo "${RUNNER_TEMP}/client-access-bpfctl" status \
+            | jq -r '.classification_admission_denied')
+          test "$((admission_after - admission_before))" -ge 30
+
+          # Isolate global admission pressure while the per-subject allowance
+          # is high enough not to be the limiting dimension.
+          sleep 1.1
+          printf '%s\n' \
+            'CONFIG 1 7 2 0 0 1 256 200 256 1 100' \
+            'SUBJECT 02:00:00:00:00:42 42' \
+            'POLICY 42 1 0' \
+            'POLICY 42 0 0' \
+            | sudo "${RUNNER_TEMP}/client-access-bpfctl" sync
+          admission_before=$(sudo "${RUNNER_TEMP}/client-access-bpfctl" status \
+            | jq -r '.classification_admission_denied')
+          sudo ip netns exec ca-client-ns bash -c '
+            for port in $(seq 6000 6031); do
+              echo pressure >"/dev/udp/198.51.100.3/${port}" || true
+            done
+          '
+          admission_after=$(sudo "${RUNNER_TEMP}/client-access-bpfctl" status \
+            | jq -r '.classification_admission_denied')
+          test "$((admission_after - admission_before))" -ge 30
+
+          # Force the bounded pending counter to its configured ceiling, then
+          # prove that a new flow is load-shed without entering classification.
+          sleep 1.1
+          printf '%s\n' \
+            'CONFIG 1 8 2 0 0 1 256 200 1 100 100' \
+            'SUBJECT 02:00:00:00:00:42 42' \
+            'POLICY 42 1 0' \
+            'POLICY 42 0 0' \
+            | sudo "${RUNNER_TEMP}/client-access-bpfctl" sync
+          sudo bpftool map update pinned /sys/fs/bpf/client_access/ca_runtime \
+            key hex 00 00 00 00 value hex 01 00 00 00 01 00 00 00
+          admission_before=$(sudo "${RUNNER_TEMP}/client-access-bpfctl" status \
+            | jq -r '.classification_admission_denied')
+          sudo ip netns exec ca-client-ns bash -c \
+            'echo pending > /dev/udp/198.51.100.3/7000'
+          admission_after=$(sudo "${RUNNER_TEMP}/client-access-bpfctl" status \
+            | jq -r '.classification_admission_denied')
+          test "$((admission_after - admission_before))" -ge 1
+          sudo bpftool map update pinned /sys/fs/bpf/client_access/ca_runtime \
+            key hex 00 00 00 00 value hex 00 00 00 00 01 00 00 00
 
           # The fixed-capacity HASH deliberately refuses excess flow state;
           # it must not evict an active terminal flow and reopen leakage.
+          sleep 1.1
+          printf '%s\n' \
+            'CONFIG 1 9 2 0 0 1 256 200 256 100000 100000' \
+            'SUBJECT 02:00:00:00:00:42 42' \
+            'POLICY 42 1 0' \
+            'POLICY 42 0 0' \
+            | sudo "${RUNNER_TEMP}/client-access-bpfctl" sync
           sudo ip netns exec ca-client-ns bash -c '
             for port in $(seq 10000 28000); do
               echo full >"/dev/udp/198.51.100.3/${port}" || true
@@ -418,9 +665,9 @@ jobs:
             | tee "${RUNNER_TEMP}/client-access-bpf-status.json"
           jq -e '
             .enabled == true and
-            .bpf_schema_version == 2 and
-            .app_policy_generation == 5 and
-            .classifier_generation == 1 and
+            .bpf_schema_version == 3 and
+            .app_policy_generation == 9 and
+            .classifier_generation == 2 and
             .subject_entries == 1 and
             .policy_entries == 2 and
             .flow_map_entries >= 4 and
@@ -435,9 +682,47 @@ jobs:
             .flow_map_entries == .flow_capacity and
             .flow_map_full >= 1 and
             .flow_map_evictions == 0 and
-            .parse_unsupported >= 2 and
+            .parse_unsupported >= 19 and
             .policy_reevaluations >= 1
           ' "${RUNNER_TEMP}/client-access-bpf-status.json"
+
+  bpf-performance:
+    name: Remote TC eBPF performance evidence
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out client-access
+        uses: actions/checkout@v6
+
+      - name: Install eBPF and measurement dependencies
+        run: >-
+          sudo apt-get update &&
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install --yes
+          bpftool clang iperf3 iproute2 jq libbpf-dev libelf-dev llvm zlib1g-dev
+
+      - name: Build on Linux and record informational measurements
+        shell: bash
+        run: |
+          clang -O2 -g -target bpf -D__TARGET_ARCH_x86 \
+            -I/usr/include/x86_64-linux-gnu \
+            -c src/client-access-bpf.c \
+            -o "${RUNNER_TEMP}/client-access-bpf.o"
+          cc -O2 -Wall -Wextra -Werror -std=gnu11 \
+            src/client-access-bpfctl.c \
+            -o "${RUNNER_TEMP}/client-access-bpfctl" \
+            -lbpf -lelf -lz
+          sh tests/measure-bpf-performance.sh \
+            "${RUNNER_TEMP}/client-access-bpf.o" \
+            "${RUNNER_TEMP}/client-access-bpfctl" \
+            "${RUNNER_TEMP}/client-access-performance"
+
+      - name: Upload performance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bpf-performance-evidence
+          path: ${{ runner.temp }}/client-access-performance
+          if-no-files-found: error
+          retention-days: 14
 
   openwrt-package:
     name: OpenWrt SDK package

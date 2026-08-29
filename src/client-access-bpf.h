@@ -2,13 +2,14 @@
 #ifndef CLIENT_ACCESS_BPF_H
 #define CLIENT_ACCESS_BPF_H
 
+#include <linux/bpf.h>
 #include <linux/types.h>
 
 #define CA_PIN_ROOT "/sys/fs/bpf/client_access"
 #define CA_PROGRAM_PIN CA_PIN_ROOT "/ca_ingress"
 
 /* Bump whenever a pinned program or map ABI becomes incompatible. */
-#define CA_BPF_SCHEMA_VERSION 2U
+#define CA_BPF_SCHEMA_VERSION 3U
 
 /* Reserved TC classifier coordinate owned by this application. */
 #define CA_TC_HANDLE 0xcaU
@@ -84,6 +85,7 @@ enum ca_stat_id {
 };
 
 struct ca_config {
+	struct bpf_spin_lock lock;
 	__u32 enabled;
 	__u32 active_slot;
 	__u32 app_policy_generation;

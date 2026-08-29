@@ -277,6 +277,7 @@ static __always_inline int ca_parse_flow(void *data, void *data_end,
 {
 	struct ethhdr *eth = data;
 	__u64 offset = sizeof(*eth);
+	__u32 l4_len = 0;
 	__be16 proto;
 
 	if ((void *)(eth + 1) > data_end)
@@ -301,30 +302,40 @@ static __always_inline int ca_parse_flow(void *data, void *data_end,
 	key->eth_proto = proto;
 	if (proto == bpf_htons(ETH_P_IP)) {
 		struct iphdr *ip = data + offset;
-		__u32 ihl;
+		__u32 ihl, total_len;
 
 		if ((void *)(ip + 1) > data_end || ip->version != 4)
 			return CA_PARSE_UNSUPPORTED;
 		ihl = ip->ihl * 4;
 		if (ihl < sizeof(*ip) || data + offset + ihl > data_end)
 			return CA_PARSE_UNSUPPORTED;
+		total_len = bpf_ntohs(ip->tot_len);
+		if (total_len < ihl || data + offset + total_len > data_end)
+			return CA_PARSE_UNSUPPORTED;
 		key->ip_proto = ip->protocol;
 		key->addr.v4.src = ip->saddr;
 		key->addr.v4.dst = ip->daddr;
 		if (ip->frag_off & bpf_htons(CA_IPV4_FRAGMENT_MASK))
 			return CA_PARSE_UNSUPPORTED;
+		l4_len = total_len - ihl;
 		offset += ihl;
 	}
 	else if (proto == bpf_htons(ETH_P_IPV6)) {
 		struct ipv6hdr *ip6 = data + offset;
+		__u32 payload_len;
 
 		if ((void *)(ip6 + 1) > data_end || ip6->version != 6)
+			return CA_PARSE_UNSUPPORTED;
+		payload_len = bpf_ntohs(ip6->payload_len);
+		if (!payload_len ||
+		    data + offset + sizeof(*ip6) + payload_len > data_end)
 			return CA_PARSE_UNSUPPORTED;
 		key->ip_proto = ip6->nexthdr;
 		__builtin_memcpy(key->addr.v6.src, &ip6->saddr, 16);
 		__builtin_memcpy(key->addr.v6.dst, &ip6->daddr, 16);
 		if (ca_is_ipv6_extension(ip6->nexthdr))
 			return CA_PARSE_UNSUPPORTED;
+		l4_len = payload_len;
 		offset += sizeof(*ip6);
 	}
 	else {
@@ -335,10 +346,11 @@ static __always_inline int ca_parse_flow(void *data, void *data_end,
 		struct tcphdr *tcp = data + offset;
 		__u32 tcp_len;
 
-		if ((void *)(tcp + 1) > data_end || tcp->doff < 5)
+		if (l4_len < sizeof(*tcp) || (void *)(tcp + 1) > data_end ||
+		    tcp->doff < 5)
 			return CA_PARSE_UNSUPPORTED;
 		tcp_len = tcp->doff * 4;
-		if (data + offset + tcp_len > data_end)
+		if (tcp_len > l4_len || data + offset + tcp_len > data_end)
 			return CA_PARSE_UNSUPPORTED;
 		key->src_port = tcp->source;
 		key->dst_port = tcp->dest;
@@ -346,8 +358,12 @@ static __always_inline int ca_parse_flow(void *data, void *data_end,
 	}
 	else if (key->ip_proto == IPPROTO_UDP) {
 		struct udphdr *udp = data + offset;
+		__u32 udp_len;
 
-		if ((void *)(udp + 1) > data_end)
+		if (l4_len < sizeof(*udp) || (void *)(udp + 1) > data_end)
+			return CA_PARSE_UNSUPPORTED;
+		udp_len = bpf_ntohs(udp->len);
+		if (udp_len < sizeof(*udp) || udp_len > l4_len)
 			return CA_PARSE_UNSUPPORTED;
 		key->src_port = udp->source;
 		key->dst_port = udp->dest;
@@ -688,8 +704,29 @@ int ca_ingress(struct __sk_buff *skb)
 	config_map = bpf_map_lookup_elem(&ca_config, &zero);
 	if (!config_map)
 		return TC_ACT_UNSPEC;
-	/* Keep slot and generation reads coherent across one packet invocation. */
-	config_snapshot = *config_map;
+	/* V41-PUB-003: map replacement alone does not make a multi-field value a
+	 * coherent packet-time snapshot. Pair BPF_F_LOCK userspace updates with a
+	 * locked field copy so slot, generations, limits, and fallbacks are from one
+	 * published control record.
+	 */
+	bpf_spin_lock(&config_map->lock);
+	config_snapshot.enabled = config_map->enabled;
+	config_snapshot.active_slot = config_map->active_slot;
+	config_snapshot.app_policy_generation = config_map->app_policy_generation;
+	config_snapshot.classifier_generation = config_map->classifier_generation;
+	config_snapshot.unknown_subject_app_verdict =
+		config_map->unknown_subject_app_verdict;
+	config_snapshot.provisional_app_verdict = config_map->provisional_app_verdict;
+	config_snapshot.max_packets_inspected = config_map->max_packets_inspected;
+	config_snapshot.max_bytes_examined = config_map->max_bytes_examined;
+	config_snapshot.max_classification_age_ms =
+		config_map->max_classification_age_ms;
+	config_snapshot.max_pending_entries = config_map->max_pending_entries;
+	config_snapshot.max_new_classifications_per_second =
+		config_map->max_new_classifications_per_second;
+	config_snapshot.per_subject_new_classification_rate =
+		config_map->per_subject_new_classification_rate;
+	bpf_spin_unlock(&config_map->lock);
 	if (!config->enabled)
 		return TC_ACT_UNSPEC;
 	ca_stat_inc(CA_STAT_PACKETS);

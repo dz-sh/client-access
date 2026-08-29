@@ -88,10 +88,13 @@ static void usage(FILE *out)
 		"  unload                 remove this application's pinned objects\n"
 		"  attach IFNAME          attach the pinned program at TC ingress\n"
 		"  detach IFNAME          detach this application's TC ingress filter\n"
+		"  prune [IFNAME ...]     keep owned filters only on listed interfaces\n"
 		"  sync                   validate stdin snapshot and atomically publish it\n"
 		"  dns-sync               publish a bounded batch of DNS classification hints\n"
 		"  gc [IDLE_SECONDS]      expire idle cached flows\n"
 		"  generations            print policy and classifier generation floors\n"
+		"  health POLICY CLASSIFIER IFNAME [IFNAME ...]\n"
+		"                         verify enabled generations and attachments\n"
 		"  status                 print runtime state and counters as JSON\n");
 }
 
@@ -109,6 +112,17 @@ static int open_map(const char *name)
 	if (pin_path(path, sizeof(path), name))
 		return -1;
 	return bpf_obj_get(path);
+}
+
+static int lookup_config(int fd, struct ca_config *config)
+{
+	__u32 zero = 0;
+
+	/* ca_config contains a top-level bpf_spin_lock. BPF_F_LOCK is mandatory
+	 * for userspace lookups so every controller command observes the same
+	 * coherent record used by the packet datapath.
+	 */
+	return bpf_map_lookup_elem_flags(fd, &zero, config, BPF_F_LOCK);
 }
 
 static int acquire_update_lock(void)
@@ -163,7 +177,61 @@ static bool tc_query_absent(int err)
 	return err == -ENOENT || err == -EINVAL;
 }
 
-static int detach_program_from_all_interfaces(__u32 program_id)
+static bool keep_interface(const char *ifname, int keep_count, char **keep_names)
+{
+	for (int i = 0; i < keep_count; i++)
+		if (!strcmp(ifname, keep_names[i]))
+			return true;
+	return false;
+}
+
+static int verify_program_interfaces(__u32 program_id, int keep_count,
+				     char **keep_names)
+{
+	static const struct {
+		__u32 handle;
+		__u32 priority;
+	} coordinates[] = {
+		{ CA_TC_HANDLE, CA_TC_PRIORITY },
+		{ 1, 1 },
+	};
+	struct if_nameindex *interfaces = if_nameindex();
+	int ret = 1;
+
+	if (!interfaces) {
+		fprintf(stderr, "unable to enumerate interfaces: %s\n", strerror(errno));
+		return 1;
+	}
+	for (struct if_nameindex *entry = interfaces; entry->if_index; entry++) {
+		for (size_t i = 0; i < ARRAY_SIZE(coordinates); i++) {
+			__u32 attached_id = 0;
+			int err = tc_query_program(entry->if_index, coordinates[i].handle,
+						   coordinates[i].priority, &attached_id);
+
+			if (tc_query_absent(err))
+				continue;
+			if (err) {
+				fprintf(stderr, "unable to inspect TC attachment on %s: %s\n",
+					entry->if_name, strerror(-err));
+				goto out;
+			}
+			if (attached_id != program_id)
+				continue;
+			if (i == 0 && keep_interface(entry->if_name, keep_count, keep_names))
+				continue;
+			fprintf(stderr, "unexpected owned TC attachment on %s\n",
+				entry->if_name);
+			goto out;
+		}
+	}
+	ret = 0;
+out:
+	if_freenameindex(interfaces);
+	return ret;
+}
+
+static int detach_program_from_interfaces(__u32 program_id, int keep_count,
+					  char **keep_names)
 {
 	static const struct {
 		__u32 handle;
@@ -194,7 +262,19 @@ static int detach_program_from_all_interfaces(__u32 program_id)
 			int err = tc_query_program(entry->if_index, opts.handle,
 						   opts.priority, &attached_id);
 
-			if (err || attached_id != program_id)
+			if (tc_query_absent(err))
+				continue;
+			if (err) {
+				fprintf(stderr, "unable to inspect TC attachment on %s: %s\n",
+					entry->if_name, strerror(-err));
+				failures++;
+				continue;
+			}
+			if (attached_id != program_id)
+				continue;
+			if (coordinates[i].handle == CA_TC_HANDLE &&
+			    coordinates[i].priority == CA_TC_PRIORITY &&
+			    keep_interface(entry->if_name, keep_count, keep_names))
 				continue;
 			err = bpf_tc_detach(&hook, &opts);
 			if (err && err != -ENOENT) {
@@ -208,12 +288,18 @@ static int detach_program_from_all_interfaces(__u32 program_id)
 	return failures ? 1 : 0;
 }
 
-static int detach_pinned_program(void)
+static int prune_pinned_program(int keep_count, char **keep_names)
 {
 	__u32 program_id;
 	int fd = bpf_obj_get(CA_PROGRAM_PIN);
 	int ret;
 
+	for (int i = 0; i < keep_count; i++) {
+		if (!if_nametoindex(keep_names[i])) {
+			fprintf(stderr, "unknown keep interface %s\n", keep_names[i]);
+			return 1;
+		}
+	}
 	if (fd < 0)
 		return errno == ENOENT ? 0 : 1;
 	ret = program_id_from_fd(fd, &program_id);
@@ -223,7 +309,12 @@ static int detach_pinned_program(void)
 			strerror(-ret));
 		return 1;
 	}
-	return detach_program_from_all_interfaces(program_id);
+	return detach_program_from_interfaces(program_id, keep_count, keep_names);
+}
+
+static int detach_pinned_program(void)
+{
+	return prune_pinned_program(0, NULL);
 }
 
 static bool pinned_backend_available(void)
@@ -780,7 +871,7 @@ static int sync_snapshot(void)
 		fprintf(stderr, "application BPF config map is unavailable: %s\n", strerror(errno));
 		goto out;
 	}
-	if (bpf_map_lookup_elem(config_fd, &zero, &current) && errno != ENOENT) {
+	if (lookup_config(config_fd, &current) && errno != ENOENT) {
 		fprintf(stderr, "unable to read active application snapshot: %s\n", strerror(errno));
 		goto out;
 	}
@@ -853,7 +944,8 @@ static int sync_snapshot(void)
 			goto out;
 		}
 	}
-	if (bpf_map_update_elem(config_fd, &zero, &snapshot.config, BPF_ANY)) {
+	if (bpf_map_update_elem(config_fd, &zero, &snapshot.config,
+				BPF_ANY | BPF_F_LOCK)) {
 		fprintf(stderr, "unable to publish application snapshot: %s\n", strerror(errno));
 		goto out;
 	}
@@ -943,7 +1035,6 @@ static int sync_dns_hints(void)
 	bool have_generation = false;
 	struct timespec now;
 	__u64 now_ns;
-	__u32 zero = 0;
 	int config_fd = -1, dns4_fd = -1, dns6_fd = -1;
 	int lock_fd = -1;
 	int ret = 1;
@@ -1001,7 +1092,7 @@ static int sync_dns_hints(void)
 	line = NULL;
 
 	config_fd = open_map("ca_config");
-	if (config_fd < 0 || bpf_map_lookup_elem(config_fd, &zero, &config)) {
+	if (config_fd < 0 || lookup_config(config_fd, &config)) {
 		fprintf(stderr, "application BPF config map is unavailable\n");
 		goto out;
 	}
@@ -1063,28 +1154,25 @@ out:
 	return ret;
 }
 
-static int disable_backend(void)
+static int disable_backend_unlocked(void)
 {
 	struct ca_config config = {};
 	__u32 zero = 0;
-	int lock_fd = acquire_update_lock();
 	int fd;
 	int ret = 0;
 
-	if (lock_fd < 0)
-		return 1;
 	fd = open_map("ca_config");
 	if (fd < 0)
 		ret = errno == ENOENT ? 0 : 1;
 	if (fd < 0)
 		goto out;
-	if (bpf_map_lookup_elem(fd, &zero, &config)) {
+	if (lookup_config(fd, &config)) {
 		if (errno != ENOENT)
 			ret = 1;
 	}
 	else {
 		config.enabled = 0;
-		if (bpf_map_update_elem(fd, &zero, &config, BPF_ANY))
+		if (bpf_map_update_elem(fd, &zero, &config, BPF_ANY | BPF_F_LOCK))
 			ret = 1;
 	}
 	if (ret)
@@ -1092,6 +1180,17 @@ static int disable_backend(void)
 out:
 	if (fd >= 0)
 		close(fd);
+	return ret;
+}
+
+static int disable_backend(void)
+{
+	int lock_fd = acquire_update_lock();
+	int ret;
+
+	if (lock_fd < 0)
+		return 1;
+	ret = disable_backend_unlocked();
 	close(lock_fd);
 	return ret;
 }
@@ -1099,10 +1198,9 @@ out:
 static int print_generations(void)
 {
 	struct ca_config config = {};
-	__u32 zero = 0;
 	int fd = open_map("ca_config");
 
-	if (fd < 0 || bpf_map_lookup_elem(fd, &zero, &config)) {
+	if (fd < 0 || lookup_config(fd, &config)) {
 		if (fd >= 0)
 			close(fd);
 		fprintf(stderr, "application BPF config map is unavailable\n");
@@ -1112,6 +1210,62 @@ static int print_generations(void)
 	printf("%u %u\n", config.app_policy_generation,
 	       config.classifier_generation);
 	return 0;
+}
+
+static int verify_health(__u32 policy_generation, __u32 classifier_generation,
+			 int interface_count, char **interfaces)
+{
+	struct ca_config config = {};
+	__u32 program_id = 0;
+	int config_fd = -1, program_fd = -1;
+	int ret = 1;
+
+	if (!pinned_backend_available()) {
+		fprintf(stderr, "application BPF pins or schema are incompatible\n");
+		return 1;
+	}
+	config_fd = open_map("ca_config");
+	program_fd = bpf_obj_get(CA_PROGRAM_PIN);
+	if (config_fd < 0 || program_fd < 0 ||
+	    lookup_config(config_fd, &config) ||
+	    program_id_from_fd(program_fd, &program_id)) {
+		fprintf(stderr, "unable to inspect application BPF health\n");
+		goto out;
+	}
+	if (!config.enabled || config.app_policy_generation != policy_generation ||
+	    config.classifier_generation != classifier_generation) {
+		fprintf(stderr,
+			"application BPF generation mismatch: enabled=%u policy=%u classifier=%u\n",
+			config.enabled, config.app_policy_generation,
+			config.classifier_generation);
+		goto out;
+	}
+	for (int i = 0; i < interface_count; i++) {
+		__u32 attached_id = 0;
+		unsigned int ifindex = if_nametoindex(interfaces[i]);
+		int err;
+
+		if (!ifindex) {
+			fprintf(stderr, "unknown health interface %s\n", interfaces[i]);
+			goto out;
+		}
+		err = tc_query_program(ifindex, CA_TC_HANDLE, CA_TC_PRIORITY,
+					       &attached_id);
+		if (err || attached_id != program_id) {
+			fprintf(stderr, "application BPF attachment mismatch on %s\n",
+				interfaces[i]);
+			goto out;
+		}
+	}
+	if (verify_program_interfaces(program_id, interface_count, interfaces))
+		goto out;
+	ret = 0;
+out:
+	if (config_fd >= 0)
+		close(config_fd);
+	if (program_fd >= 0)
+		close(program_fd);
+	return ret;
 }
 
 static int count_map_entries(int fd, size_t key_size)
@@ -1214,7 +1368,7 @@ static int print_status(void)
 	int ret = 1;
 
 	config_fd = open_map("ca_config");
-	if (config_fd < 0 || bpf_map_lookup_elem(config_fd, &zero, &config)) {
+	if (config_fd < 0 || lookup_config(config_fd, &config)) {
 		fprintf(stderr, "application BPF state is unavailable\n");
 		goto out;
 	}
@@ -1354,6 +1508,124 @@ out:
 	return ret;
 }
 
+static int parse_u32_argument(const char *text, __u32 *value)
+{
+	char *end;
+	unsigned long parsed;
+
+	errno = 0;
+	parsed = strtoul(text, &end, 10);
+	if (errno || *end || parsed > UINT32_MAX)
+		return -1;
+	*value = (__u32)parsed;
+	return 0;
+}
+
+static int load_object_command(const char *path, bool replace)
+{
+	int lock_fd = acquire_update_lock();
+	int ret;
+
+	if (lock_fd < 0)
+		return 1;
+	ret = load_object(path, replace);
+	close(lock_fd);
+	return ret;
+}
+
+static int unload_backend_command(void)
+{
+	int lock_fd = acquire_update_lock();
+	int ret;
+
+	if (lock_fd < 0)
+		return 1;
+	ret = disable_backend_unlocked();
+	if (!ret)
+		ret = detach_pinned_program();
+	if (!ret)
+		unlink_pins();
+	close(lock_fd);
+	return ret;
+}
+
+static int tc_action_command(const char *ifname, bool attach)
+{
+	int lock_fd = acquire_update_lock();
+	int ret;
+
+	if (lock_fd < 0)
+		return 1;
+	ret = tc_action(ifname, attach);
+	close(lock_fd);
+	return ret;
+}
+
+static int prune_command(int keep_count, char **keep_names)
+{
+	int lock_fd = acquire_update_lock();
+	int ret;
+
+	if (lock_fd < 0)
+		return 1;
+	ret = prune_pinned_program(keep_count, keep_names);
+	close(lock_fd);
+	return ret;
+}
+
+static int health_command(__u32 policy_generation,
+			  __u32 classifier_generation,
+			  int interface_count, char **interfaces)
+{
+	int lock_fd = acquire_update_lock();
+	int ret;
+
+	if (lock_fd < 0)
+		return 1;
+	ret = verify_health(policy_generation, classifier_generation,
+			    interface_count, interfaces);
+	if (!ret)
+		ret = print_status();
+	close(lock_fd);
+	return ret;
+}
+
+static int status_command(void)
+{
+	int lock_fd = acquire_update_lock();
+	int ret;
+
+	if (lock_fd < 0)
+		return 1;
+	ret = print_status();
+	close(lock_fd);
+	return ret;
+}
+
+static int generations_command(void)
+{
+	int lock_fd = acquire_update_lock();
+	int ret;
+
+	if (lock_fd < 0)
+		return 1;
+	ret = print_generations();
+	close(lock_fd);
+	return ret;
+}
+
+static int gc_command(unsigned long idle)
+{
+	int lock_fd = acquire_update_lock();
+	int ret;
+
+	if (lock_fd < 0)
+		return 1;
+	ret = gc_flows(idle);
+	close(lock_fd);
+	return ret;
+}
+
 int main(int argc, char **argv)
 {
 	const char *object = argc > 2 ? argv[2] : DEFAULT_OBJECT;
@@ -1365,34 +1637,41 @@ int main(int argc, char **argv)
 	}
 	if (!strcmp(argv[1], "ensure")) {
 		raise_memlock_limit();
-		return load_object(object, false);
+		return load_object_command(object, false);
 	}
 	if (!strcmp(argv[1], "load")) {
 		raise_memlock_limit();
-		return load_object(object, true);
+		return load_object_command(object, true);
 	}
 	if (!strcmp(argv[1], "disable") && argc == 2)
 		return disable_backend();
-	if (!strcmp(argv[1], "unload")) {
-		if (disable_backend())
-			return 1;
-		if (detach_pinned_program())
-			return 1;
-		unlink_pins();
-		return 0;
-	}
+	if (!strcmp(argv[1], "unload"))
+		return unload_backend_command();
 	if (!strcmp(argv[1], "attach") && argc == 3)
-		return tc_action(argv[2], true);
+		return tc_action_command(argv[2], true);
 	if (!strcmp(argv[1], "detach") && argc == 3)
-		return tc_action(argv[2], false);
+		return tc_action_command(argv[2], false);
+	if (!strcmp(argv[1], "prune"))
+		return prune_command(argc - 2, argv + 2);
 	if (!strcmp(argv[1], "sync") && argc == 2)
 		return sync_snapshot();
 	if (!strcmp(argv[1], "dns-sync") && argc == 2)
 		return sync_dns_hints();
 	if (!strcmp(argv[1], "generations") && argc == 2)
-		return print_generations();
+		return generations_command();
+	if (!strcmp(argv[1], "health") && argc >= 5) {
+		__u32 policy_generation, classifier_generation;
+
+		if (parse_u32_argument(argv[2], &policy_generation) ||
+		    parse_u32_argument(argv[3], &classifier_generation)) {
+			fprintf(stderr, "health generations must be unsigned 32-bit integers\n");
+			return 2;
+		}
+		return health_command(policy_generation, classifier_generation,
+				      argc - 4, argv + 4);
+	}
 	if (!strcmp(argv[1], "status") && argc == 2)
-		return print_status();
+		return status_command();
 	if (!strcmp(argv[1], "gc")) {
 		if (argc == 3) {
 			char *end;
@@ -1406,7 +1685,7 @@ int main(int argc, char **argv)
 		}
 		else if (argc != 2)
 			return 2;
-		return gc_flows(idle);
+		return gc_command(idle);
 	}
 	usage(stderr);
 	return 2;

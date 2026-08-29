@@ -596,7 +596,11 @@ jobs:
             | jq -r '.parse_unsupported')
           # Every frame in the AF_PACKET-reachable adversarial corpus must take
           # the explicit unsupported path.
-          test "$((parse_after - parse_before))" -eq "${malformed_count}"
+          malformed_delta=$((parse_after - parse_before))
+          if test "${malformed_delta}" -ne "${malformed_count}"; then
+            echo "malformed parser count mismatch: expected=${malformed_count} observed=${malformed_delta}" >&2
+            exit 1
+          fi
 
           # V41-SEC-002: isolate per-subject admission pressure from the
           # higher global limit.

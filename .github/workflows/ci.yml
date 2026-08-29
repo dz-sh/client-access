@@ -871,7 +871,7 @@ jobs:
           ARTIFACTS_DIR: ${{ runner.temp }}/openwrt-core-luci-artifacts
           BUILD_LOG: 1
           FEED_DIR: ${{ runner.temp }}/client-access-feed
-          PACKAGES: client-access-core luci-app-client-access
+          PACKAGES: luci-app-client-access
           V: s
 
       - name: Verify the BPF package was not built
@@ -917,7 +917,6 @@ jobs:
           ARTIFACTS_DIR: ${{ runner.temp }}/openwrt-artifacts
           BUILD_LOG: 1
           FEED_DIR: ${{ runner.temp }}/client-access-feed
-          PACKAGES: client-access-core luci-app-client-access client-access-bpf
           V: s
 
       - name: Verifier-load the packaged OpenWrt BPF object
@@ -964,7 +963,6 @@ jobs:
           ARTIFACTS_DIR: ${{ runner.temp }}/immortalwrt-artifacts
           BUILD_LOG: 1
           FEED_DIR: ${{ runner.temp }}/client-access-feed
-          PACKAGES: client-access-core luci-app-client-access client-access-bpf
           V: s
 
       - name: Verifier-load the packaged ImmortalWrt BPF object

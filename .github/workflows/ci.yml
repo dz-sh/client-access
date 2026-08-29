@@ -699,7 +699,7 @@ jobs:
             .flow_map_entries == .flow_capacity and
             .flow_map_full >= 1 and
             .flow_map_evictions == 0 and
-            .parse_unsupported >= 19 and
+            .parse_unsupported >= 18 and
             .policy_reevaluations >= 1
           ' "${RUNNER_TEMP}/client-access-bpf-status.json"
 

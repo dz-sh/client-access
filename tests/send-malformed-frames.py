@@ -59,10 +59,10 @@ def main():
     udp_long_length = struct.pack("!HHHH", 12345, 443, 20, 0)
     ipv6_fragment = struct.pack("!BBHI", 6, 0, 0, 1)
     frames = [
-        # V41-SEC-001: truncated VLAN and IPv4 headers. AF_PACKET rejects a
-        # frame shorter than the Ethernet header before it reaches TC, so the
-        # runtime corpus starts at the first truncation observable by the hook.
-        ethernet(destination, 0x8100, b"\x00\x2a"),
+        # V41-SEC-001: AF_PACKET rejects a short Ethernet envelope and veth
+        # discards a truncated VLAN envelope before TC ingress. The runtime
+        # corpus therefore starts at the first truncation observable by the
+        # hook: an incomplete IPv4 header.
         ethernet(destination, 0x0800, b"\x45" + b"\x00" * 9),
         # Invalid IPv4 IHL and protocol-declared total lengths.
         ethernet(destination, 0x0800, ipv4(6, ihl=4)),

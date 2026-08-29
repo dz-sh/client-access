@@ -54,7 +54,7 @@ export function run() {
 
 	if (scenario == 'restart_prune') {
 		if (app.backend_mode != 'V4_BPF_BASIC' || !app.enabled ||
-		    sprintf('%J', runtime.attachments) != '["lan0"]')
+		    length(runtime.attachments) != 1 || runtime.attachments[0] != 'lan0')
 			fail(`restart did not reconcile the exact attachment set: app=${sprintf('%J', app)} runtime=${sprintf('%J', runtime)}`);
 	}
 	else if (scenario == 'fw4_restore') {
@@ -84,7 +84,7 @@ export function run() {
 	else if (scenario == 'prune_failure') {
 		if (!status.applied || app.backend_mode != 'V3_NFT_ONLY' || app.enabled ||
 		    !app.degraded || runtime.bpf_enabled || runtime.scope_active ||
-		    sprintf('%J', runtime.attachments) != '["lan0"]')
+		    length(runtime.attachments) != 1 || runtime.attachments[0] != 'lan0')
 			fail('stale attachment failure was not made neutral and visible');
 	}
 	else {

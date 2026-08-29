@@ -31,6 +31,7 @@ jobs:
             | xargs -0 -n1 sh -n
           sh -n tests/verify-packaged-bpf.sh
           sh -n tests/measure-bpf-performance.sh
+          sh -n tests/measure-v44-continuous-authorization.sh
           python3 -m py_compile tests/send-malformed-frames.py
 
       - name: Enforce the V4.2 classification boundary
@@ -42,6 +43,19 @@ jobs:
           ! grep -Eq 'ca_dns4|ca_dns6' src/client-access-bpfctl.c
           grep -Fq 'classification.resolve' root/usr/sbin/client-accessd
           grep -Fq 'runtime_projection' root/usr/sbin/client-accessd
+
+      - name: Enforce the V4.4 authorization boundary
+        shell: bash
+        run: |
+          grep -Fq 'import * as temporary_approval' root/usr/sbin/client-accessd
+          grep -Fq 'iifname @client_access_sources oifname @client_access_destinations jump client_access_dispatch' \
+            root/usr/share/nftables.d/chain-pre/forward/30-client-access.nft
+          ! grep -Fq 'ct state { new, related }' \
+            root/usr/share/nftables.d/chain-pre/forward/30-client-access.nft
+          ! grep -Eiq 'lease|approval' src/client-access-bpf.c src/client-access-bpf.h \
+            root/usr/share/nftables.d/table-pre/30-client-access.nft \
+            root/usr/share/nftables.d/chain-pre/forward/30-client-access.nft
+          ! grep -Eiq 'conntrack-tools|\+conntrack' Makefile
 
       - name: Check the generated nftables fragment
         shell: bash
@@ -123,6 +137,14 @@ jobs:
           -L "${GITHUB_WORKSPACE}/root/usr/share/ucode"
           "${GITHUB_WORKSPACE}/tests/runtime.uc"
 
+      - name: Run V4.4 temporary authorization tests
+        env:
+          TZ: UTC
+        run: >-
+          "${RUNNER_TEMP}/ucode-build/ucode"
+          -L "${GITHUB_WORKSPACE}/root/usr/share/ucode"
+          "${GITHUB_WORKSPACE}/tests/lease.uc"
+
       - name: Compile-check the daemon with stub target modules
         run: >-
           "${RUNNER_TEMP}/ucode-build/ucode"
@@ -149,7 +171,16 @@ jobs:
             prune_failure \
             offload_software \
             offload_hardware \
-            offload_custom
+            offload_custom \
+            access_approval \
+            access_revoke \
+            application_approval \
+            application_revoke \
+            approval_journal_restart \
+            router_reboot \
+            journal_corruption \
+            journal_write_failure \
+            approval_noop
           do
             CA_DAEMON_TEST_SCENARIO="${scenario}" \
               "${RUNNER_TEMP}/ucode-build/ucode" \
@@ -161,6 +192,33 @@ jobs:
               '.scenario == $scenario' \
               "${RUNNER_TEMP}/client-accessd-${scenario}.json"
           done
+
+  v44-continuous-authorization:
+    name: Remote V4.4 continuous authorization
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out client-access
+        uses: actions/checkout@v6
+
+      - name: Install isolated datapath and measurement dependencies
+        run: >-
+          sudo apt-get update &&
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install --yes
+          iperf3 iproute2 iputils-ping jq netcat-openbsd nftables
+
+      - name: Verify established-flow revocation and record V3 measurements
+        run: >-
+          sh tests/measure-v44-continuous-authorization.sh
+          "${RUNNER_TEMP}/v44-continuous-authorization"
+
+      - name: Upload V4.4 authorization evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v44-continuous-authorization-evidence
+          path: ${{ runner.temp }}/v44-continuous-authorization
+          if-no-files-found: error
+          retention-days: 14
 
   bpf-datapath:
     name: Remote TC eBPF datapath

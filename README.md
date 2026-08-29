@@ -18,6 +18,9 @@ controlling their Internet access with firewall4/nftables.
   client.
 - Optionally add independent, best-effort application rules based on domains,
   IP prefixes, protocol, and destination ports.
+- Temporarily approve a blocked identity or blocked application/category for
+  one hour or until local midnight, then automatically restore the saved
+  policy.
 
 ## Internet access policy
 
@@ -80,6 +83,19 @@ unclassified. LuCI reports classification coverage and resource shedding.
 Software and hardware flow offloading must be disabled while this layer is
 enabled.
 
+## Temporary approvals
+
+Temporary approvals are runtime-only ALLOW overrides. They do not edit saved
+identity policy, application rules, or weekly schedules. A blocked identity or
+application/category can be approved for one hour or until the end of the
+router's local day, extended by choosing another duration, or revoked
+immediately. LuCI shows the base result, expiry, remaining time, and effective
+result separately.
+
+Active approvals survive a service restart through volatile runtime state, but
+intentionally disappear after a router reboot. Default and unclassified
+application traffic cannot receive a temporary approval.
+
 ## Usage
 
 After installation, open:
@@ -92,13 +108,15 @@ Network → Client Access
 2. Under **Managed**, choose when the policy applies to each identity.
 3. Select the global Internet access policy.
 4. Optionally enable application filtering and add identity application rules.
-5. Review the displayed current result and apply the configuration.
+5. When a saved rule currently blocks a target, optionally create a temporary
+   approval from the identity or application-rule editor.
+6. Review the displayed current result and apply the configuration.
 
 ## Current limitations
 
-- The nftables workflow does not disconnect existing conntrack or offloaded
-  flows. Application-policy changes are re-evaluated on the next software-path
-  packet of a cached flow.
+- Normal-path nftables and application-policy changes are re-evaluated on the
+  next scoped packet of an existing flow. Flow-offloaded traffic is unsupported;
+  no conntrack, software-flowtable, or hardware-flow eviction is implemented.
 - Application classification is outbound-only and does not provide full DPI,
   TLS inspection, TCP reconstruction, QUIC parsing/decryption, quota, or
   bandwidth limiting. Return-only traffic is not associated with its outbound

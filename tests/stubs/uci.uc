@@ -29,6 +29,17 @@ function main_option(option) {
 	return values[option];
 }
 
+function access_denied_scenario(name) {
+	return name == 'access_approval' || name == 'access_revoke' ||
+		name == 'approval_journal_restart' || name == 'router_reboot' ||
+		name == 'journal_corruption' || name == 'journal_write_failure';
+}
+
+function application_denied_scenario(name) {
+	return name == 'access_approval' || name == 'application_approval' ||
+		name == 'application_revoke';
+}
+
 export function cursor() {
 	return {
 		get: function(package_name, section, option) {
@@ -40,7 +51,8 @@ export function cursor() {
 			const scenario = getenv('CA_DAEMON_TEST_SCENARIO');
 			if (package_name == 'client_access' && section_type == 'identity')
 				callback({ '.name': 'alice', name: 'Alice', subject_id: '42',
-					activation: 'inactive' });
+					activation: access_denied_scenario(scenario)
+						? 'always_active' : 'inactive' });
 			else if (package_name == 'client_access' && section_type == 'binding')
 				callback({ '.name': 'alice_mac', identity: 'alice', type: 'mac',
 					value: '02:00:00:00:00:42' });
@@ -55,6 +67,10 @@ export function cursor() {
 						profile_schema_version: '1', profile_source: 'native',
 						profile_license: 'Apache-2.0', profile_provenance: 'test:social' });
 			}
+			else if (package_name == 'client_access' && section_type == 'app_rule' &&
+			         application_denied_scenario(scenario))
+				callback({ '.name': 'block_video', identity: 'alice', class_id: '10',
+					verdict: 'deny', activation: 'always_active' });
 			else if (package_name == 'firewall' && section_type == 'defaults')
 				callback({
 					flow_offloading: scenario == 'offload_software' ? '1' : '0',

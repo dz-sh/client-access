@@ -4,7 +4,7 @@
 'use strict';
 
 import { cursor } from 'uci';
-import { popen, stat } from 'fs';
+import { open, popen, rename, stat, unlink } from 'fs';
 import * as ubus from 'ubus';
 import * as uloop from 'uloop';
 import * as policy from 'client_access.policy';
@@ -12,10 +12,13 @@ import * as app_policy from 'client_access.app_policy';
 import * as classification from 'client_access.classification';
 import * as model from 'client_access.model';
 import * as runtime_policy from 'client_access.runtime';
+import * as temporary_approval from 'client_access.lease';
 
 const NFT = '/usr/sbin/nft';
 const FW4 = '/sbin/fw4';
 const BPFCTL = '/usr/sbin/client-access-bpfctl';
+const LEASE_JOURNAL = getenv('CA_LEASE_JOURNAL') ??
+	'/tmp/client-access-approvals.json';
 
 let timer, published, conn;
 let generation = 0;
@@ -42,6 +45,13 @@ let projection_publish_errors = 0;
 let observations_expired = 0;
 let observations_stale = 0;
 let last_app_compiled = null;
+let lease_database = temporary_approval.empty_database();
+let lease_journal_loaded = false;
+let lease_journal_dirty = false;
+let lease_transaction_active = false;
+let lease_journal_errors = [];
+let effective_authorization_snapshot = null;
+let latest_authorization_transitions = [];
 let state = {
 	running: true,
 	applied: false,
@@ -63,6 +73,14 @@ let state = {
 	destination_interfaces: [],
 	errors: [],
 	warnings: [],
+	temporary_approvals: {
+		active_count: 0,
+		capacity: temporary_approval.constants.MAX_ACTIVE_LEASES,
+		next_expiry: null,
+		journal_available: true,
+		latest_transitions: [],
+		errors: [],
+	},
 	app_filter: {
 		backend_mode: 'V3_NFT_ONLY',
 		requested_enabled: false,
@@ -195,6 +213,90 @@ function run_write(argv, content) {
 		: { ok: false, error: `${argv[0]} exited with code ${code}` };
 }
 
+function lease_context(base_app_compiled) {
+	return {
+		identities: base_app_compiled.identities,
+		classes: base_app_compiled.classes,
+	};
+}
+
+function record_lease_errors(values) {
+	for (let value in values) {
+		if (length(lease_journal_errors) >= 16)
+			break;
+		let seen = false;
+		for (let existing in lease_journal_errors)
+			if (existing == value) {
+				seen = true;
+				break;
+			}
+		if (!seen)
+			push(lease_journal_errors, value);
+	}
+}
+
+function read_lease_journal(context, epoch, monotonic_now) {
+	lease_journal_errors = [];
+	let value = temporary_approval.empty_database();
+	const fp = open(LEASE_JOURNAL, 'r');
+	if (fp) {
+		const content = fp.read('all');
+		fp.close();
+		if (content != null && length(content) <= 262144) {
+			try {
+				value = json(content);
+			}
+			catch (error) {
+				value = null;
+				record_lease_errors([ 'Temporary Approval journal contains invalid JSON and was ignored' ]);
+			}
+		}
+		else if (content != null)
+			record_lease_errors([ 'Temporary Approval journal exceeded 262144 bytes and was ignored' ]);
+	}
+	const parsed = temporary_approval.parse_database(value, context, epoch,
+		monotonic_now);
+	lease_database = parsed.database;
+	record_lease_errors(parsed.errors);
+	lease_journal_dirty = length(lease_journal_errors) > 0 ||
+		!parsed.valid || parsed.expired_count > 0;
+	lease_journal_loaded = true;
+}
+
+function refresh_lease_database(context, epoch, monotonic_now) {
+	if (!lease_journal_loaded)
+		read_lease_journal(context, epoch, monotonic_now);
+	const before = sprintf('%J', lease_database);
+	const parsed = temporary_approval.parse_database(lease_database, context,
+		epoch, monotonic_now);
+	lease_database = parsed.database;
+	record_lease_errors(parsed.errors);
+	if (before != sprintf('%J', lease_database) || parsed.expired_count > 0)
+		lease_journal_dirty = true;
+	return parsed;
+}
+
+function write_lease_journal(database) {
+	const temporary = `${LEASE_JOURNAL}.new`;
+	const content = sprintf('%J\n', database);
+	const fp = open(temporary, 'w', 384);
+	if (!fp)
+		return { ok: false, error: 'Unable to create Temporary Approval journal' };
+	const written = fp.write(content) == length(content);
+	const flushed = written && fp.flush();
+	const closed = fp.close();
+	if (!written || !flushed || !closed) {
+		unlink(temporary);
+		return { ok: false, error: 'Unable to write Temporary Approval journal' };
+	}
+	if (!rename(temporary, LEASE_JOURNAL)) {
+		unlink(temporary);
+		return { ok: false, error: 'Unable to atomically replace Temporary Approval journal' };
+	}
+	lease_journal_dirty = false;
+	return { ok: true, error: null };
+}
+
 function unique_strings(values) {
 	let result = [], seen = {};
 	for (let value in values) {
@@ -253,12 +355,20 @@ function desired_signature(compiled, projection, sources, destinations) {
 }
 
 function app_signature(app_compiled, subject_projection, sources, destinations) {
+	let effective_policies = [];
+	for (let entry in app_compiled.policies)
+		push(effective_policies, {
+			identity_id: entry.identity_id,
+			subject_id: entry.subject_id,
+			class_id: entry.class_id,
+			verdict: entry.verdict,
+		});
 	return sprintf('%J', {
 		enabled: app_compiled.enabled,
 		unknown_subject_app_verdict: app_compiled.unknown_subject_app_verdict,
 		provisional_app_verdict: app_compiled.provisional_app_verdict,
 		selectors: subject_projection.selectors,
-		policies: app_compiled.policies,
+		policies: effective_policies,
 		resource_limits: app_compiled.resource_limits,
 		sources,
 		destinations,
@@ -849,9 +959,16 @@ function count_active(identities) {
 }
 
 function compile_runtime(config, epoch) {
-	const compiled = policy.compile(config, epoch);
+	const monotonic_now = clock(true);
+	const base_compiled = policy.compile(config, epoch);
+	const base_app_compiled = app_policy.compile(config, epoch);
+	const context = lease_context(base_app_compiled);
+	const lease_state = refresh_lease_database(context, epoch, monotonic_now);
+	const compiled = temporary_approval.overlay_access(base_compiled,
+		lease_database);
+	const app_compiled = temporary_approval.overlay_application(base_app_compiled,
+		lease_database);
 	const projection = model.project(compiled, config.bindings);
-	const app_compiled = app_policy.compile(config, epoch);
 	const observation_context = prepare_observations(
 		app_compiled.classification_model.signature);
 	const classification_state = classification.resolve(
@@ -862,8 +979,9 @@ function compile_runtime(config, epoch) {
 		app_compiled.resource_limits);
 	const subject_projection = model.project_subjects(app_compiled, config.bindings);
 	const consistency = app_policy.consistency(compiled, app_compiled);
-	return { compiled, projection, app_compiled, classification_state,
-		observation_context, subject_projection, consistency };
+	return { base_compiled, compiled, projection, base_app_compiled,
+		app_compiled, classification_state, observation_context,
+		subject_projection, consistency, lease_state, context, monotonic_now };
 }
 
 function reconcile(reason, force) {
@@ -876,6 +994,17 @@ function reconcile(reason, force) {
 	const app_compiled = runtime.app_compiled;
 	const classification_state = runtime.classification_state;
 	const subject_projection = runtime.subject_projection;
+	const authorization_snapshot = temporary_approval.effective_snapshot(
+		compiled, app_compiled);
+	const transition_reason = runtime.lease_state.expired_count > 0
+		? 'lease_expired'
+		: (runtime.lease_state.invalid_count > 0
+			? 'lease_invalidated'
+			: (reason == 'timer' ? 'schedule_transition' : (reason ?? 'unknown')));
+	const planned_transitions = effective_authorization_snapshot == null
+		? [] : temporary_approval.plan_transitions(
+			effective_authorization_snapshot, authorization_snapshot,
+			transition_reason);
 	const source = compiled.enabled || app_compiled.requested_enabled
 		? resolve_zones(config.source_zone)
 		: { interfaces: [], errors: [] };
@@ -930,6 +1059,40 @@ function reconcile(reason, force) {
 	if (app_apply.ok && app_apply.enabled)
 		commit_observations(runtime.observation_context, epoch);
 
+	const app_publication_ok = !app_compiled.requested_enabled ||
+		(app_apply.ok && app_apply.enabled);
+	let published_transitions = [], next_authorization_snapshot = {
+		...(effective_authorization_snapshot ?? {}),
+	};
+	for (let key, entry in authorization_snapshot) {
+		if ((entry.scope == 'access' && apply.ok) ||
+		    (entry.scope == 'application' && app_publication_ok))
+			next_authorization_snapshot[key] = entry;
+	}
+	for (let transition in planned_transitions) {
+		const published_ok = transition.scope == 'access'
+			? apply.ok : app_publication_ok;
+		push(published_transitions, {
+			...transition,
+			policy_generation: transition.scope == 'access'
+				? generation : app_policy_generation,
+			revocation_state: transition.restrictive
+				? (published_ok ? 'complete' : 'failed') : 'not_required',
+		});
+		if (transition.restrictive && !published_ok)
+			push(errors,
+				`Restrictive ${transition.scope} authorization transition could not be published`);
+	}
+	if (apply.ok || app_publication_ok)
+		effective_authorization_snapshot = next_authorization_snapshot;
+	if (length(published_transitions))
+		latest_authorization_transitions = published_transitions;
+	if (!lease_transaction_active && lease_journal_dirty && apply.ok && app_publication_ok) {
+		const journal = write_lease_journal(lease_database);
+		if (!journal.ok)
+			record_lease_errors([ journal.error ]);
+	}
+
 	const configuration_ready = compiled.schema_supported && compiled.mode_valid;
 	const synchronized = apply.ok && configuration_ready && !length(readiness_errors);
 	const state_error = apply.error ??
@@ -963,6 +1126,14 @@ function reconcile(reason, force) {
 		destination_interfaces: destination.interfaces,
 		errors,
 		warnings,
+		temporary_approvals: {
+			active_count: length(lease_database.leases),
+			capacity: temporary_approval.constants.MAX_ACTIVE_LEASES,
+			next_expiry: temporary_approval.next_expiry(lease_database),
+			journal_available: !lease_journal_dirty,
+			latest_transitions: latest_authorization_transitions,
+			errors: lease_journal_errors,
+		},
 		app_filter: {
 			backend_mode: app_apply.backend_mode,
 			requested_enabled: app_compiled.requested_enabled,
@@ -1069,7 +1240,11 @@ function identity_inventory() {
 			id: identity.id,
 			name: identity.name,
 			activation: identity.activation,
+			base_verdict: identity.base_verdict,
 			verdict: identity.verdict,
+			verdict_source: identity.verdict_source,
+			lease_id: identity.lease_id,
+			lease_expires_at: identity.lease_expires_at,
 			effective_active: identity.effective_active,
 			reason: identity.reason,
 			schedule_active: identity.schedule_active,
@@ -1092,6 +1267,157 @@ function observation_inventory() {
 	const config = read_config();
 	const observed = observation_snapshot(config);
 	return { observations: observed.observations, clock: clock()[0], error: observed.error };
+}
+
+function approval_plane_published(result, scope) {
+	if (scope == 'access')
+		return result.applied;
+	return result.app_filter.requested_enabled
+		? result.app_filter.applied && result.app_filter.enabled
+		: result.app_filter.applied;
+}
+
+function approval_inventory() {
+	const epoch = clock()[0];
+	const config = read_config();
+	const runtime = compile_runtime(config, epoch);
+	let effective_access = {};
+	for (let identity in runtime.compiled.identities)
+		effective_access[identity.id] = identity;
+	let access_targets = [];
+	for (let identity in runtime.base_compiled.identities) {
+		const effective = effective_access[identity.id] ?? identity;
+		let subject_id = null;
+		for (let candidate in runtime.context.identities)
+			if (candidate.id == identity.id)
+				subject_id = candidate.subject_id;
+		push(access_targets, {
+			identity_id: identity.id,
+			identity_name: identity.name,
+			subject_id,
+			base_verdict: identity.verdict,
+			effective_verdict: effective.verdict,
+			verdict_source: effective.verdict_source,
+			lease_id: effective.lease_id,
+			lease_expires_at: effective.lease_expires_at,
+		});
+	}
+
+	let identity_names = {};
+	for (let identity in runtime.base_app_compiled.identities)
+		identity_names[identity.id] = identity.name;
+	let application_targets = [], target_limit = 1024, truncated = false;
+	for (let entry in runtime.app_compiled.policies) {
+		if (entry.class_id <= temporary_approval.constants.CLASS_UNCLASSIFIED)
+			continue;
+		if (length(application_targets) >= target_limit) {
+			truncated = true;
+			break;
+		}
+		const class_info = runtime.app_compiled.classes['' + entry.class_id];
+		push(application_targets, {
+			identity_id: entry.identity_id,
+			identity_name: identity_names[entry.identity_id],
+			subject_id: entry.subject_id,
+			class_id: entry.class_id,
+			class_name: class_info ? class_info.name : null,
+			class_kind: class_info ? class_info.kind : null,
+			base_verdict: entry.base_verdict,
+			effective_verdict: entry.verdict,
+			verdict_source: entry.verdict_source,
+			lease_id: entry.lease_id,
+			lease_expires_at: entry.lease_expires_at,
+		});
+	}
+	return {
+		approvals: temporary_approval.list(lease_database, epoch,
+			runtime.monotonic_now),
+		active_count: length(lease_database.leases),
+		capacity: temporary_approval.constants.MAX_ACTIVE_LEASES,
+		next_expiry: temporary_approval.next_expiry(lease_database),
+		journal_available: !lease_journal_dirty,
+		access_available: runtime.base_compiled.enabled,
+		application_available: runtime.base_app_compiled.enabled,
+		access_targets,
+		application_targets,
+		application_targets_truncated: truncated,
+		latest_transitions: latest_authorization_transitions,
+		clock: epoch,
+		clock_valid: runtime.base_compiled.clock_valid,
+		errors: lease_journal_errors,
+	};
+}
+
+function create_approval(message) {
+	const epoch = clock()[0];
+	const config = read_config();
+	const runtime = compile_runtime(config, epoch);
+	const scope = message.scope;
+	if (scope == 'access' && !runtime.base_compiled.enabled)
+		return { ok: false, errors: [ 'Internet access control is not active' ] };
+	if (scope == 'application' && !runtime.base_app_compiled.enabled)
+		return { ok: false, errors: [ 'Application filtering is not active' ] };
+
+	const candidate = temporary_approval.create(lease_database, message,
+		runtime.context, epoch, runtime.monotonic_now);
+	if (!candidate.ok)
+		return { ok: false, errors: candidate.errors };
+
+	const previous = lease_database;
+	lease_database = candidate.database;
+	lease_journal_dirty = true;
+	lease_transaction_active = true;
+	const applied = reconcile(candidate.replacing ? 'lease_extended' : 'lease_created', false);
+	const published_ok = approval_plane_published(applied, scope);
+	let journal = { ok: false, error: 'Temporary Approval was not published' };
+	if (published_ok)
+		journal = write_lease_journal(lease_database);
+	if (!published_ok || !journal.ok) {
+		lease_database = previous;
+		lease_journal_dirty = true;
+		const rollback = reconcile('lease_rollback', false);
+		const restored = approval_plane_published(rollback, scope);
+		const restored_journal = write_lease_journal(previous);
+		lease_transaction_active = false;
+		return {
+			ok: false,
+			degraded: !restored || !restored_journal.ok,
+			errors: [ journal.error ?? 'Temporary Approval projection failed' ],
+		};
+	}
+	lease_transaction_active = false;
+	return {
+		ok: true,
+		replacing: candidate.replacing,
+		approval: temporary_approval.inspect(lease_database,
+			candidate.lease.id, epoch, runtime.monotonic_now),
+	};
+}
+
+function revoke_approval(lease_id) {
+	const epoch = clock()[0];
+	const runtime = compile_runtime(read_config(), epoch);
+	const existing = temporary_approval.inspect(lease_database, lease_id,
+		epoch, runtime.monotonic_now);
+	if (!existing)
+		return { ok: false, errors: [ `Unknown Temporary Approval '${lease_id}'` ] };
+	const candidate = temporary_approval.revoke(lease_database, lease_id);
+	if (!candidate.ok)
+		return { ok: false, errors: candidate.errors };
+
+	// Persist the restrictive source-of-truth change before publishing DENY.
+	const journal = write_lease_journal(candidate.database);
+	if (!journal.ok)
+		return { ok: false, errors: [ journal.error ] };
+	lease_database = candidate.database;
+	lease_transaction_active = true;
+	const applied = reconcile('lease_revoked', false);
+	lease_transaction_active = false;
+	const published_ok = approval_plane_published(applied, existing.scope);
+	return published_ok
+		? { ok: true, revoked: existing, transitions: latest_authorization_transitions }
+		: { ok: false, revoked: existing, degraded: true,
+			errors: [ 'Approval was removed, but restrictive policy publication failed' ] };
 }
 
 uloop.init();
@@ -1126,6 +1452,34 @@ published = conn.publish('client_access', {
 	},
 	observations: {
 		call: function() { return observation_inventory(); },
+	},
+	approvals: {
+		call: function() { return approval_inventory(); },
+	},
+	approval: {
+		args: { lease_id: 'string' },
+		call: function(req, msg) {
+			const epoch = clock()[0];
+			const runtime = compile_runtime(read_config(), epoch);
+			const value = temporary_approval.inspect(lease_database, msg.lease_id,
+				epoch, runtime.monotonic_now);
+			return value
+				? { ok: true, approval: value }
+				: { ok: false, errors: [ `Unknown Temporary Approval '${msg.lease_id}'` ] };
+		},
+	},
+	approve: {
+		args: {
+			scope: 'string',
+			identity_id: 'string',
+			class_id: 'integer',
+			duration: 'string',
+		},
+		call: function(req, msg) { return create_approval(msg); },
+	},
+	revoke_approval: {
+		args: { lease_id: 'string' },
+		call: function(req, msg) { return revoke_approval(msg.lease_id); },
 	},
 	reconcile: {
 		args: { reason: 'string' },

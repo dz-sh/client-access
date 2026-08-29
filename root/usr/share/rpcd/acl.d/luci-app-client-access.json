@@ -3,13 +3,13 @@
 		"description": "View LAN observations, identities, bindings, and Internet access policy",
 		"read": {
 			"ubus": {
-				"client_access": [ "status", "preview", "identities", "observations" ]
+				"client_access": [ "status", "preview", "identities", "observations", "approvals", "approval" ]
 			},
 			"uci": [ "client_access", "network", "firewall", "dhcp" ]
 		},
 		"write": {
 			"ubus": {
-				"client_access": [ "reconcile" ]
+				"client_access": [ "reconcile", "approve", "revoke_approval" ]
 			},
 			"uci": [ "client_access" ]
 		}

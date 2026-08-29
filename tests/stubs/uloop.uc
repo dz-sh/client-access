@@ -25,6 +25,16 @@ function reconcile(reason) {
 	return service.reconcile.call(null, { reason });
 }
 
+function target(inventory, scope, class_id) {
+	const values = scope == 'access'
+		? inventory.access_targets : inventory.application_targets;
+	for (let value in values)
+		if (value.identity_id == 'alice' &&
+		    (scope == 'access' || value.class_id == class_id))
+			return value;
+	return null;
+}
+
 export function run() {
 	const scenario = getenv('CA_DAEMON_TEST_SCENARIO');
 	if (!scenario)
@@ -52,10 +62,53 @@ export function run() {
 		fs_stub.advance();
 		reconcile('projection-failure-test');
 	}
+	else if (scenario == 'access_approval' || scenario == 'access_revoke' ||
+	         scenario == 'journal_write_failure') {
+		const approved = service.approve.call(null, {
+			scope: 'access', identity_id: 'alice', duration: 'one_hour',
+		});
+		if (scenario == 'journal_write_failure') {
+			if (approved.ok || !approved.degraded)
+				fail(`journal failure did not fail and roll back approval: ${sprintf('%J', approved)}`);
+		}
+		else if (!approved.ok)
+			fail(`access approval failed: ${sprintf('%J', approved)}`);
+		if (scenario == 'access_revoke') {
+			const revoked = service.revoke_approval.call(null, {
+				lease_id: approved.approval.id,
+			});
+			if (!revoked.ok)
+				fail(`access revocation failed: ${sprintf('%J', revoked)}`);
+		}
+	}
+	else if (scenario == 'application_approval' || scenario == 'application_revoke') {
+		const approved = service.approve.call(null, {
+			scope: 'application', identity_id: 'alice', class_id: 10,
+			duration: 'one_hour',
+		});
+		if (!approved.ok)
+			fail(`application approval failed: ${sprintf('%J', approved)}`);
+		if (scenario == 'application_revoke') {
+			const revoked = service.revoke_approval.call(null, {
+				lease_id: approved.approval.id,
+			});
+			if (!revoked.ok)
+				fail(`application revocation failed: ${sprintf('%J', revoked)}`);
+		}
+	}
+	else if (scenario == 'approval_noop') {
+		const before = service.status.call().generation;
+		const approved = service.approve.call(null, {
+			scope: 'access', identity_id: 'alice', duration: 'one_hour',
+		});
+		if (!approved.ok || service.status.call().generation != before)
+			fail(`base ALLOW approval caused an unnecessary nft projection: ${sprintf('%J', approved)}`);
+	}
 
 	const status = service.status.call();
 	const app = status.app_filter ?? {};
 	const runtime = fs_stub.snapshot();
+	const approvals = service.approvals.call();
 
 	if (scenario == 'restart_prune') {
 		if (app.backend_mode != 'V4_BPF_BASIC' || !app.enabled ||
@@ -101,9 +154,72 @@ export function run() {
 		    length(runtime.attachments) != 1 || runtime.attachments[0] != 'lan0')
 			fail('stale attachment failure was not made neutral and visible');
 	}
+	else if (scenario == 'access_approval') {
+		const access = target(approvals, 'access');
+		const application = target(approvals, 'application', 10);
+		if (approvals.active_count != 1 || !access ||
+		    access.base_verdict != 'deny' || access.effective_verdict != 'allow' ||
+		    !application || application.effective_verdict != 'deny' ||
+		    !runtime.journal_present)
+			fail(`policy-plane independent Access Lease is wrong: ${sprintf('%J', approvals)}`);
+	}
+	else if (scenario == 'access_revoke') {
+		const access = target(approvals, 'access');
+		const transitions = approvals.latest_transitions ?? [];
+		if (approvals.active_count != 0 || !access ||
+		    access.effective_verdict != 'deny' || !length(transitions) ||
+		    transitions[0].reason != 'lease_revoked' ||
+		    transitions[0].revocation_state != 'complete')
+			fail(`manual Access Lease revocation is wrong: ${sprintf('%J', approvals)}`);
+	}
+	else if (scenario == 'application_approval') {
+		const application = target(approvals, 'application', 10);
+		if (approvals.active_count != 1 || !application ||
+		    application.base_verdict != 'deny' ||
+		    application.effective_verdict != 'allow' ||
+		    runtime.policy_generation != 2 || runtime.classifier_generation != 1)
+			fail(`Application Lease did not preserve classification generation: ${sprintf('%J', approvals)}`);
+	}
+	else if (scenario == 'application_revoke') {
+		const application = target(approvals, 'application', 10);
+		if (approvals.active_count != 0 || !application ||
+		    application.effective_verdict != 'deny' ||
+		    runtime.policy_generation != 3 || runtime.classifier_generation != 1)
+			fail(`Application Lease revocation did not reuse cached class: ${sprintf('%J', approvals)}`);
+	}
+	else if (scenario == 'approval_journal_restart') {
+		const access = target(approvals, 'access');
+		if (approvals.active_count != 1 || !access ||
+		    access.effective_verdict != 'allow')
+			fail(`valid restart journal did not retain approval: ${sprintf('%J', approvals)}`);
+	}
+	else if (scenario == 'router_reboot') {
+		const access = target(approvals, 'access');
+		if (approvals.active_count != 0 || !access ||
+		    access.effective_verdict != 'deny' || runtime.journal_present)
+			fail(`empty volatile reboot state did not restore base DENY: ${sprintf('%J', approvals)}`);
+	}
+	else if (scenario == 'journal_corruption') {
+		const access = target(approvals, 'access');
+		if (approvals.active_count != 0 || !access ||
+		    access.effective_verdict != 'deny' || !length(approvals.errors))
+			fail(`corrupt journal broadened authorization: ${sprintf('%J', approvals)}`);
+	}
+	else if (scenario == 'journal_write_failure') {
+		const access = target(approvals, 'access');
+		if (approvals.active_count != 0 || !access || access.effective_verdict != 'deny')
+			fail(`failed journal left approval active: ${sprintf('%J', approvals)}`);
+	}
+	else if (scenario == 'approval_noop') {
+		const access = target(approvals, 'access');
+		if (approvals.active_count != 1 || !access ||
+		    access.base_verdict != 'allow' || access.effective_verdict != 'allow' ||
+		    length(approvals.latest_transitions ?? []))
+			fail(`base ALLOW approval created an effective transition: ${sprintf('%J', approvals)}`);
+	}
 	else {
 		fail(`unknown daemon test scenario '${scenario}'`);
 	}
 
-	print(sprintf('%J\n', { scenario, app_filter: app, runtime }));
+	print(sprintf('%J\n', { scenario, app_filter: app, approvals, runtime }));
 }

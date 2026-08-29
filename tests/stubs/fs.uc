@@ -6,6 +6,7 @@ let policy_generations = [];
 let attachments = {};
 let scope_active = false;
 let health_checks = 0;
+let files = {};
 
 function scenario() {
 	return getenv('CA_DAEMON_TEST_SCENARIO');
@@ -36,12 +37,72 @@ export function snapshot() {
 		policy_generations,
 		attachments: names,
 		scope_active,
+		journal_present: files['/tmp/client-access-approvals.json'] != null,
 	};
 }
 
 export function stat(path) {
 	initialize();
 	return path == '/usr/sbin/client-access-bpfctl' ? {} : null;
+}
+
+export function open(path, mode, permissions) {
+	if (mode == 'r') {
+		let content = files[path];
+		if (content == null && path == '/tmp/client-access-approvals.json' &&
+		    scenario() == 'journal_corruption')
+			content = '{invalid';
+		if (content == null && path == '/tmp/client-access-approvals.json' &&
+		    scenario() == 'approval_journal_restart') {
+			const epoch = clock()[0];
+			const monotonic = clock(true)[0];
+			content = sprintf('%J', {
+				schema_version: 1,
+				next_id: 2,
+				leases: [ {
+					id: `lease-${epoch}-1`,
+					scope: 'access',
+					identity_id: 'alice',
+					subject_id: 42,
+					target_key: 'access/alice',
+					created_at: epoch,
+					expires_at: epoch + 3600,
+					monotonic_deadline: monotonic + 3600,
+					duration: 'one_hour',
+				} ],
+			});
+		}
+		if (content == null)
+			return null;
+		return {
+			read: function() { return content; },
+			close: function() { return true; },
+		};
+	}
+	if (mode == 'w') {
+		if (scenario() == 'journal_write_failure')
+			return null;
+		let content = '';
+		return {
+			write: function(value) { content += value; return length(value); },
+			flush: function() { return true; },
+			close: function() { files[path] = content; return true; },
+		};
+	}
+	return null;
+}
+
+export function rename(source, destination) {
+	if (files[source] == null)
+		return null;
+	files[destination] = files[source];
+	delete files[source];
+	return true;
+}
+
+export function unlink(path) {
+	delete files[path];
+	return true;
 }
 
 function read_result(argv) {

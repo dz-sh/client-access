@@ -1,6 +1,7 @@
-# The V3 access policy gates only new and related tuples. Established/offloaded
-# flows are intentionally untouched by that workflow.
-ct state { new, related } iifname @client_access_sources oifname @client_access_destinations jump client_access_dispatch
+# V4.4 continuously authorizes every scoped packet. Established normal-path
+# flows therefore observe ALLOW -> DENY on their next packet without conntrack
+# deletion. Flow offload remains unsupported by the application workflow.
+iifname @client_access_sources oifname @client_access_destinations jump client_access_dispatch
 
 # Independent application-policy layer. Existing flows are intentionally
 # evaluated so policy-generation changes take effect on their next packet.

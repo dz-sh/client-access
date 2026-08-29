@@ -23,6 +23,26 @@ const callObservations = rpc.declare({
 	expect: { '': { observations: [] } }
 });
 
+const callApprovals = rpc.declare({
+	object: 'client_access',
+	method: 'approvals',
+	expect: { '': { approvals: [], access_targets: [], application_targets: [] } }
+});
+
+const callApprove = rpc.declare({
+	object: 'client_access',
+	method: 'approve',
+	params: [ 'scope', 'identity_id', 'class_id', 'duration' ],
+	expect: { '': {} }
+});
+
+const callRevokeApproval = rpc.declare({
+	object: 'client_access',
+	method: 'revoke_approval',
+	params: [ 'lease_id' ],
+	expect: { '': {} }
+});
+
 const callReconcile = rpc.declare({
 	object: 'client_access',
 	method: 'reconcile',
@@ -107,6 +127,109 @@ function formatTime(epoch) {
 	return epoch ? new Date(epoch * 1000).toLocaleString() : _('No scheduled change');
 }
 
+function formatRemaining(seconds) {
+	seconds = Math.max(0, Number(seconds) || 0);
+	if (seconds < 60)
+		return _('%d seconds').format(Math.ceil(seconds));
+	if (seconds < 3600)
+		return _('%d minutes').format(Math.ceil(seconds / 60));
+	const hours = Math.floor(seconds / 3600);
+	const minutes = Math.ceil((seconds % 3600) / 60);
+	return minutes ? _('%d hours %d minutes').format(hours, minutes)
+		: _('%d hours').format(hours);
+}
+
+function approvalError(result) {
+	const errors = result && Array.isArray(result.errors) ? result.errors : [];
+	return errors.length ? errors.join('; ') : _('The temporary approval operation failed.');
+}
+
+function runApproval(scope, identityId, classId, duration) {
+	return callApprove(scope, identityId, classId == null ? 0 : classId,
+		duration).then(function(result) {
+		if (!result || result.ok !== true) {
+			ui.addNotification(null, E('p', {}, [ approvalError(result) ]), 'error');
+			return;
+		}
+		window.location.reload();
+	});
+}
+
+function runRevocation(leaseId) {
+	return callRevokeApproval(leaseId).then(function(result) {
+		if (!result || result.ok !== true) {
+			ui.addNotification(null, E('p', {}, [ approvalError(result) ]), 'error');
+			return;
+		}
+		window.location.reload();
+	});
+}
+
+function actionButton(label, handler, className) {
+	return E('button', {
+		'type': 'button',
+		'class': className || 'btn cbi-button-action',
+		'click': ui.createHandlerFn(null, handler)
+	}, [ label ]);
+}
+
+function approvalActions(scope, identityId, classId, target, inventory) {
+	if (!target)
+		return E('span', {}, [ _('Apply pending configuration before creating an approval.') ]);
+	const available = scope === 'access'
+		? inventory.access_available : inventory.application_available;
+	if (!available)
+		return E('span', {}, [ scope === 'access'
+			? _('Enable and apply Internet access control before creating an access approval.')
+			: _('Enable and apply application filtering before creating an application approval.') ]);
+	if (target.lease_id) {
+		const lease = (inventory.approvals || []).find(function(item) {
+			return item.id === target.lease_id;
+		});
+		return E('div', { 'class': 'alert-message notice' }, [
+			E('strong', {}, [ _('Temporary approval active') ]),
+			E('br'),
+			_('Base: %s · Effective: %s').format(
+				target.base_verdict === 'deny' ? _('Blocked') : _('Allowed'),
+				target.effective_verdict === 'deny' ? _('Blocked') : _('Allowed')),
+			E('br'),
+			_('Expires: %s (%s remaining)').format(formatTime(target.lease_expires_at),
+				formatRemaining(lease ? lease.remaining_seconds : 0)),
+			E('div', { 'style': 'margin-top:.6em' }, [
+				actionButton(_('Set 1 hour from now'), function() {
+					return runApproval(scope, identityId, classId, 'one_hour');
+				}),
+				' ',
+				actionButton(_('Set until today ends'), function() {
+					return runApproval(scope, identityId, classId, 'today');
+				}),
+				' ',
+				actionButton(_('Revoke now'), function() {
+					return runRevocation(target.lease_id);
+				}, 'btn cbi-button-negative')
+			])
+		]);
+	}
+	if (target.base_verdict !== 'deny')
+		return E('span', {}, [
+			_('The base policy already allows this target, so a temporary approval would not change access.')
+		]);
+	if (!inventory.clock_valid)
+		return E('span', {}, [ _('The router clock is not valid, so temporary approval is unavailable.') ]);
+	return E('div', {}, [
+		E('p', {}, [
+			_('Base: Blocked · Temporary approval changes only the runtime result and does not edit the saved rule.')
+		]),
+		actionButton(_('Approve for 1 hour'), function() {
+			return runApproval(scope, identityId, classId, 'one_hour');
+		}),
+		' ',
+		actionButton(_('Approve today'), function() {
+			return runApproval(scope, identityId, classId, 'today');
+		})
+	]);
+}
+
 function accessResult(verdict, enabled) {
 	if (!enabled)
 		return _('Control is off');
@@ -126,6 +249,9 @@ function resultReason(identity, status) {
 		return _('Internet access control is off.');
 	if (!identity)
 		return _('Apply the pending configuration to calculate the current result.');
+	if (identity.verdict_source === 'temporary_approval')
+		return _('A runtime-only approval overrides the base result until %s.').format(
+			formatTime(identity.lease_expires_at));
 	if (identity.reason === 'always_active')
 		return _('The policy always applies to this identity.');
 	if (identity.reason === 'schedule_match')
@@ -254,6 +380,79 @@ function applicationStatusPanel(status) {
 			(appStatus.warnings || []).length
 				? E('p', { 'class': 'alert-message warning' }, [ appStatus.warnings.join('; ') ]) : ''
 		])
+	]);
+}
+
+function temporaryApprovalsPanel(inventory) {
+	const approvals = inventory.approvals || [];
+	const errors = inventory.errors || [];
+	const accessTargets = inventory.access_targets || [];
+	const applicationTargets = inventory.application_targets || [];
+	const transitions = inventory.latest_transitions || [];
+
+	function accessTarget(lease) {
+		return accessTargets.find(function(target) {
+			return target.identity_id === lease.identity_id;
+		});
+	}
+
+	function applicationTarget(lease) {
+		return applicationTargets.find(function(target) {
+			return target.identity_id === lease.identity_id &&
+				Number(target.class_id) === Number(lease.class_id);
+		});
+	}
+
+	const rows = approvals.map(function(lease) {
+		const target = lease.scope === 'access' ? accessTarget(lease) : applicationTarget(lease);
+		const identityName = target && target.identity_name
+			? target.identity_name : lease.identity_id;
+		const scopeLabel = lease.scope === 'access'
+			? _('Internet access')
+			: _('Application: %s').format(target && target.class_name
+				? target.class_name : String(lease.class_id));
+		return E('div', { 'class': 'tr' }, [
+			E('div', { 'class': 'td left' }, [ identityName ]),
+			E('div', { 'class': 'td left' }, [ scopeLabel ]),
+			E('div', { 'class': 'td left' }, [ formatTime(lease.expires_at) ]),
+			E('div', { 'class': 'td left' }, [ formatRemaining(lease.remaining_seconds) ]),
+			E('div', { 'class': 'td left' }, [
+				actionButton(_('Revoke'), function() { return runRevocation(lease.id); },
+					'btn cbi-button-negative')
+			])
+		]);
+	});
+
+	return E('div', { 'class': 'cbi-section' }, [
+		E('h3', {}, [ _('Temporary approvals') ]),
+		E('p', {}, [
+			_('These runtime-only ALLOW overrides are separate from saved policies. They disappear at expiry and after a router reboot.')
+		]),
+		approvals.length
+			? E('div', { 'class': 'table' }, [
+				E('div', { 'class': 'tr table-titles' }, [
+					E('div', { 'class': 'th left' }, [ _('Identity') ]),
+					E('div', { 'class': 'th left' }, [ _('Scope') ]),
+					E('div', { 'class': 'th left' }, [ _('Expires') ]),
+					E('div', { 'class': 'th left' }, [ _('Remaining') ]),
+					E('div', { 'class': 'th left' }, [ _('Action') ])
+				]),
+				...rows
+			])
+			: E('p', { 'class': 'alert-message notice' }, [ _('No temporary approvals are active.') ]),
+		inventory.journal_available === false
+			? E('p', { 'class': 'alert-message warning' }, [
+				_('Volatile approval state is not synchronized; new approvals must not be trusted until the service reports recovery.')
+			]) : '',
+		errors.length ? E('p', { 'class': 'alert-message error' }, [ errors.join('; ') ]) : '',
+		transitions.length ? E('details', {}, [
+			E('summary', {}, [ _('Latest authorization transition') ]),
+			E('p', {}, [ transitions.map(function(item) {
+				return '%s: %s → %s (%s)'.format(item.identity_id,
+					String(item.old_verdict).toUpperCase(),
+					String(item.new_verdict).toUpperCase(), item.reason);
+			}).join('; ') ])
+		]) : ''
 	]);
 }
 
@@ -561,6 +760,9 @@ return view.extend({
 			L.resolveDefault(callStatus(), { running: false, errors: [ _('Service is unavailable') ] }),
 			L.resolveDefault(callIdentities(), { identities: [] }),
 			L.resolveDefault(callObservations(), { observations: [] }),
+			L.resolveDefault(callApprovals(), {
+				approvals: [], access_targets: [], application_targets: [], errors: []
+			}),
 			uci.load('client_access')
 		]);
 	},
@@ -569,7 +771,16 @@ return view.extend({
 		const status = data[0];
 		const identityInventory = data[1];
 		const observationInventory = data[2];
+		const approvalInventory = data[3];
 		const inventoryById = identityById(identityInventory);
+		const accessApprovalTargets = {};
+		const applicationApprovalTargets = {};
+		(approvalInventory.access_targets || []).forEach(function(target) {
+			accessApprovalTargets[target.identity_id] = target;
+		});
+		(approvalInventory.application_targets || []).forEach(function(target) {
+			applicationApprovalTargets[target.identity_id + '/' + target.class_id] = target;
+		});
 		const configuredIdentities = uci.sections('client_access', 'identity');
 		const configuredClasses = uci.sections('client_access', 'app_class');
 		const classesById = configuredClassById();
@@ -723,9 +934,20 @@ return view.extend({
 		o.cfgvalue = function(sectionId) {
 			const identity = inventoryById[sectionId];
 			return identity
-				? '%s — %s'.format(accessResult(identity.verdict, status.enabled), resultReason(identity, status))
+				? '%s — %s — %s'.format(
+					_('Base: %s').format(identity.base_verdict === 'deny' ? _('Blocked') : _('Allowed')),
+					_('Effective: %s').format(accessResult(identity.verdict, status.enabled)),
+					resultReason(identity, status))
 				: _('Apply the pending configuration to calculate the current result.');
 		};
+
+		o = s.taboption('identity', form.DummyValue, '_temporary_approval', _('Temporary Internet approval'));
+		o.rawhtml = true;
+		o.cfgvalue = function(sectionId) {
+			return approvalActions('access', sectionId, null,
+				accessApprovalTargets[sectionId], approvalInventory);
+		};
+		o.description = _('This is runtime authorization, not a persistent rule or weekly schedule.');
 
 		o = s.taboption('identity', form.DynamicList, '_recognized_macs', _('Recognized MAC addresses'));
 		o.datatype = 'macaddr';
@@ -952,6 +1174,20 @@ return view.extend({
 			return hasPeriod ? true : _('Add at least one weekly period when Apply rule is On schedule.');
 		};
 
+		o = s.taboption('rule', form.DummyValue, '_temporary_approval', _('Temporary application approval'));
+		o.rawhtml = true;
+		o.cfgvalue = function(sectionId) {
+			const identityId = uci.get('client_access', sectionId, 'identity');
+			const classId = Number(uci.get('client_access', sectionId, 'class_id'));
+			if (classId <= 1)
+				return E('span', {}, [
+					_('Temporary approval is intentionally unavailable for default and unclassified traffic.')
+				]);
+			return approvalActions('application', identityId, classId,
+				applicationApprovalTargets[identityId + '/' + classId], approvalInventory);
+		};
+		o.description = _('Application authorization remains independent from the nftables Internet access policy.');
+
 		DAYS.forEach(function(day) {
 			o = s.taboption('schedule', form.DynamicList, '_schedule_' + day.id, day.label);
 			o.depends('activation', 'active_during');
@@ -971,7 +1207,8 @@ return view.extend({
 				formNode.appendChild(clientViews(managedSection,
 					unknownClientsSection(observationInventory, configuredIdentities, inventoryById, status)));
 			}
-			return E([], [ statusPanel(status), applicationStatusPanel(status), formNode ]);
+			return E([], [ statusPanel(status), applicationStatusPanel(status),
+				temporaryApprovalsPanel(approvalInventory), formNode ]);
 		});
 	}
 });

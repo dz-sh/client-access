@@ -61,9 +61,15 @@ extract_package() {
 	extract_archive "$data_archive" "$directory/root"
 	(
 		cd "$directory/root"
-		find . \( -type f -o -type l \) -print | sed 's#^\.#/#' | sort
+		find . \( -type f -o -type l \) -print | sed 's#^\./#/#' | sort
 	) >"$evidence_dir/$name.files"
 	cp "$directory/control/control" "$evidence_dir/$name.control"
+	for script in postinst postinst-pkg prerm prerm-pkg postrm; do
+		if [ -f "$directory/control/$script" ]; then
+			cp "$directory/control/$script" \
+				"$evidence_dir/$name.$script"
+		fi
+	done
 	bytes=$(wc -c <"$package" | tr -d ' ')
 	installed_kib=$(du -sk "$directory/root" | awk '{print $1}')
 	printf '%s\t%s\t%s\t%s\n' "$name" "$bytes" "$installed_kib" "$package" \
@@ -139,13 +145,13 @@ for left in client-access-core luci-app-client-access client-access-bpf; do
 	done
 done
 
-assert_excludes "$work_dir/luci-app-client-access/control/postinst" \
+assert_excludes "$work_dir/luci-app-client-access/control/postinst-pkg" \
 	'client-access|firewall|bpfctl'
 assert_excludes "$work_dir/luci-app-client-access/control/postrm" \
 	'client-access|firewall|bpfctl'
-assert_contains "$work_dir/client-access-bpf/control/prerm" \
+assert_contains "$work_dir/client-access-bpf/control/prerm-pkg" \
 	'client-access-bpfctl disable'
-assert_contains "$work_dir/client-access-bpf/control/prerm" \
+assert_contains "$work_dir/client-access-bpf/control/prerm-pkg" \
 	'client-access-bpfctl unload'
 
 compose() {
@@ -158,7 +164,7 @@ compose() {
 	done
 	(
 		cd "$directory"
-		find . \( -type f -o -type l \) -print | sed 's#^\.#/#' | sort
+		find . \( -type f -o -type l \) -print | sed 's#^\./#/#' | sort
 	) >"$evidence_dir/composition-$name.files"
 }
 

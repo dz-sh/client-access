@@ -594,9 +594,9 @@ jobs:
             tests/send-malformed-frames.py ca-client.42 "${router_mac}")
           parse_after=$(sudo "${RUNNER_TEMP}/client-access-bpfctl" status \
             | jq -r '.parse_unsupported')
-          # Truncated Ethernet returns before a selector can be resolved. Every
-          # other adversarial frame must take the explicit unsupported path.
-          test "$((parse_after - parse_before))" -eq "$((malformed_count - 1))"
+          # Every frame in the AF_PACKET-reachable adversarial corpus must take
+          # the explicit unsupported path.
+          test "$((parse_after - parse_before))" -eq "${malformed_count}"
 
           # V41-SEC-002: isolate per-subject admission pressure from the
           # higher global limit.

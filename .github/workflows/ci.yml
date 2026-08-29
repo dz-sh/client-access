@@ -153,7 +153,7 @@ jobs:
       - name: Install eBPF build and runtime dependencies
         run: >-
           sudo apt-get update && sudo apt-get install --yes
-          linux-tools-common clang llvm libbpf-dev libelf-dev zlib1g-dev
+          linux-tools-common linux-tools-azure clang llvm libbpf-dev libelf-dev zlib1g-dev
           iproute2 iputils-ping netcat-openbsd nftables util-linux
 
       - name: Build the datapath and publisher on Linux
@@ -697,7 +697,7 @@ jobs:
         run: >-
           sudo apt-get update &&
           sudo env DEBIAN_FRONTEND=noninteractive apt-get install --yes
-          linux-tools-common clang iperf3 iproute2 jq libbpf-dev libelf-dev llvm zlib1g-dev
+          linux-tools-common linux-tools-azure clang iperf3 iproute2 jq libbpf-dev libelf-dev llvm zlib1g-dev
 
       - name: Build on Linux and record informational measurements
         shell: bash

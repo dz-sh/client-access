@@ -80,12 +80,11 @@ function read_result(argv) {
 	if (command == 'prune') {
 		if (scenario() == 'prune_failure')
 			return { code: 1, output: '' };
-		let keep = {};
+		let retained = {};
 		for (let index = 2; index < length(argv); index++)
-			keep[argv[index]] = true;
-		for (let name in keys(attachments))
-			if (!keep[name])
-				delete attachments[name];
+			if (attachments[argv[index]])
+				retained[argv[index]] = true;
+		attachments = retained;
 		return { code: 0, output: '' };
 	}
 	if (command == 'gc')

@@ -55,7 +55,7 @@ export function run() {
 	if (scenario == 'restart_prune') {
 		if (app.backend_mode != 'V4_BPF_BASIC' || !app.enabled ||
 		    sprintf('%J', runtime.attachments) != '["lan0"]')
-			fail('restart did not reconcile the exact attachment set');
+			fail(`restart did not reconcile the exact attachment set: app=${sprintf('%J', app)} runtime=${sprintf('%J', runtime)}`);
 	}
 	else if (scenario == 'fw4_restore') {
 		if (app.backend_mode != 'V4_BPF_BASIC' || !app.enabled ||

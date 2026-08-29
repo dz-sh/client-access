@@ -160,7 +160,7 @@ jobs:
       - name: Select the runner-matched bpftool
         shell: bash
         run: |
-          bpftool_path="$(dpkg -L "linux-tools-$(uname -r)" | sed -n '/\/bpftool$/ { p; q; }')"
+          bpftool_path="$(find /usr/lib/linux-tools -type f -name bpftool -print -quit)"
           test -x "${bpftool_path}"
           mkdir -p "${RUNNER_TEMP}/client-access-tools"
           ln -s "${bpftool_path}" "${RUNNER_TEMP}/client-access-tools/bpftool"
@@ -713,7 +713,7 @@ jobs:
       - name: Select the runner-matched bpftool
         shell: bash
         run: |
-          bpftool_path="$(dpkg -L "linux-tools-$(uname -r)" | sed -n '/\/bpftool$/ { p; q; }')"
+          bpftool_path="$(find /usr/lib/linux-tools -type f -name bpftool -print -quit)"
           test -x "${bpftool_path}"
           mkdir -p "${RUNNER_TEMP}/client-access-tools"
           ln -s "${bpftool_path}" "${RUNNER_TEMP}/client-access-tools/bpftool"

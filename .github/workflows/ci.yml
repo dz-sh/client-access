@@ -160,7 +160,7 @@ jobs:
       - name: Select the runner-matched bpftool
         shell: bash
         run: |
-          bpftool_path="$(find /usr/lib/linux-tools -name bpftool -print -quit)"
+          bpftool_path="$(find /usr/lib/linux-tools -path '*-generic/bpftool' -print -quit)"
           test -x "${bpftool_path}"
           mkdir -p "${RUNNER_TEMP}/client-access-tools"
           ln -s "${bpftool_path}" "${RUNNER_TEMP}/client-access-tools/bpftool"
@@ -713,7 +713,7 @@ jobs:
       - name: Select the runner-matched bpftool
         shell: bash
         run: |
-          bpftool_path="$(find /usr/lib/linux-tools -name bpftool -print -quit)"
+          bpftool_path="$(find /usr/lib/linux-tools -path '*-generic/bpftool' -print -quit)"
           test -x "${bpftool_path}"
           mkdir -p "${RUNNER_TEMP}/client-access-tools"
           ln -s "${bpftool_path}" "${RUNNER_TEMP}/client-access-tools/bpftool"

@@ -16,21 +16,32 @@ define Package/luci-app-client-access
   SECTION:=luci
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
-  TITLE:=Identity and application-aware LAN Internet access control
-  DEPENDS:=+luci-base +firewall4 +nftables-json +rpcd +rpcd-mod-ucode \
-	+ucode +ucode-mod-fs +ucode-mod-ubus +ucode-mod-uci +ucode-mod-uloop
+  TITLE:=LuCI frontend for Client Access
+  DEPENDS:=+client-access-core +luci-base +rpcd +rpcd-mod-ucode
 endef
 
 define Package/luci-app-client-access/description
- Identity-based OpenWrt and ImmortalWrt Internet access control with an
- independent bounded TC eBPF application-policy workflow.
+ Web frontend for the headless Client Access control plane.
+endef
+
+define Package/client-access-core
+  SECTION:=net
+  CATEGORY:=Network
+  TITLE:=Headless identity-based LAN Internet access control
+  DEPENDS:=+firewall4 +nftables-json +ucode +ucode-mod-fs +ucode-mod-ubus \
+	+ucode-mod-uci +ucode-mod-uloop
+endef
+
+define Package/client-access-core/description
+ Headless Client Access control plane and nftables datapath for OpenWrt and
+ ImmortalWrt. LuCI and the TC eBPF backend are optional clients of this package.
 endef
 
 define Package/client-access-bpf
   SECTION:=net
   CATEGORY:=Network
   TITLE:=TC eBPF application-filter backend for Client Access
-  DEPENDS:=+luci-app-client-access +libbpf +kmod-sched-bpf $(BPF_DEPENDS)
+  DEPENDS:=+client-access-core +libbpf +kmod-sched-bpf $(BPF_DEPENDS)
 endef
 
 define Package/client-access-bpf/description
@@ -38,7 +49,7 @@ define Package/client-access-bpf/description
  Access. The nftables-only controller remains usable without this package.
 endef
 
-define Package/luci-app-client-access/conffiles
+define Package/client-access-core/conffiles
 /etc/config/client_access
 endef
 
@@ -63,11 +74,42 @@ define Build/Compile
 endef
 endif
 
+define Package/client-access-core/install
+	$(INSTALL_DIR) $(1)/etc/config
+	$(INSTALL_CONF) $(PKG_BUILD_DIR)/root/etc/config/client_access $(1)/etc/config/
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/root/etc/init.d/client-access $(1)/etc/init.d/
+	$(INSTALL_DIR) $(1)/etc/hotplug.d/iface $(1)/etc/hotplug.d/ntp
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/root/etc/hotplug.d/iface/90-client-access \
+		$(1)/etc/hotplug.d/iface/
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/root/etc/hotplug.d/ntp/90-client-access \
+		$(1)/etc/hotplug.d/ntp/
+	$(INSTALL_DIR) $(1)/usr/sbin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/root/usr/sbin/client-accessd $(1)/usr/sbin/
+	$(INSTALL_DIR) $(1)/usr/share/ucode/client_access
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/root/usr/share/ucode/client_access/*.uc \
+		$(1)/usr/share/ucode/client_access/
+	$(INSTALL_DIR) $(1)/usr/share/nftables.d/table-pre
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/root/usr/share/nftables.d/table-pre/30-client-access.nft \
+		$(1)/usr/share/nftables.d/table-pre/
+	$(INSTALL_DIR) $(1)/usr/share/nftables.d/chain-pre/forward
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/root/usr/share/nftables.d/chain-pre/forward/30-client-access.nft \
+		$(1)/usr/share/nftables.d/chain-pre/forward/
+endef
+
 define Package/luci-app-client-access/install
-	$(INSTALL_DIR) $(1)/www
-	$(CP) $(PKG_BUILD_DIR)/htdocs/* $(1)/www/
-	$(INSTALL_DIR) $(1)/
-	$(CP) $(PKG_BUILD_DIR)/root/* $(1)/
+	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/client-access
+	$(CP) $(PKG_BUILD_DIR)/htdocs/luci-static/resources/view/client-access/* \
+		$(1)/www/luci-static/resources/view/client-access/
+	$(INSTALL_DIR) $(1)/www/luci-static/resources/client-access
+	$(CP) $(PKG_BUILD_DIR)/htdocs/luci-static/resources/client-access/* \
+		$(1)/www/luci-static/resources/client-access/
+	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/root/usr/share/luci/menu.d/luci-app-client-access.json \
+		$(1)/usr/share/luci/menu.d/
+	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/root/usr/share/rpcd/acl.d/luci-app-client-access.json \
+		$(1)/usr/share/rpcd/acl.d/
 endef
 
 define Package/client-access-bpf/install
@@ -91,7 +133,35 @@ endef
 define Package/client-access-bpf/prerm
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}$${PKG_INSTROOT}" ] || {
-	/usr/sbin/client-access-bpfctl unload >/dev/null 2>&1 || exit 1
+	/usr/sbin/client-access-bpfctl disable >/dev/null 2>&1 || true
+	/usr/sbin/client-access-bpfctl unload >/dev/null 2>&1 || true
+}
+exit 0
+endef
+
+define Package/client-access-bpf/postrm
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}$${PKG_INSTROOT}" ] || {
+	[ ! -x /etc/init.d/client-access ] || \
+		/etc/init.d/client-access restart >/dev/null 2>&1 || true
+}
+exit 0
+endef
+
+define Package/client-access-core/postinst
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}$${PKG_INSTROOT}" ] || {
+	/etc/init.d/client-access enable >/dev/null 2>&1 || true
+	/etc/init.d/firewall reload >/dev/null 2>&1 || true
+	/etc/init.d/client-access restart >/dev/null 2>&1 || true
+}
+exit 0
+endef
+
+define Package/client-access-core/prerm
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}$${PKG_INSTROOT}" ] || {
+	/etc/init.d/client-access stop >/dev/null 2>&1 || true
 }
 exit 0
 endef
@@ -102,12 +172,20 @@ define Package/luci-app-client-access/postinst
 	rm -f /tmp/luci-indexcache.*
 	rm -rf /tmp/luci-modulecache/
 	/etc/init.d/rpcd reload >/dev/null 2>&1 || true
-	/etc/init.d/client-access enable >/dev/null 2>&1 || true
-	/etc/init.d/firewall reload >/dev/null 2>&1 || true
-	/etc/init.d/client-access restart >/dev/null 2>&1 || true
 }
 exit 0
 endef
 
+define Package/luci-app-client-access/postrm
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}$${PKG_INSTROOT}" ] || {
+	rm -f /tmp/luci-indexcache.*
+	rm -rf /tmp/luci-modulecache/
+	/etc/init.d/rpcd reload >/dev/null 2>&1 || true
+}
+exit 0
+endef
+
+$(eval $(call BuildPackage,client-access-core))
 $(eval $(call BuildPackage,luci-app-client-access))
 $(eval $(call BuildPackage,client-access-bpf))

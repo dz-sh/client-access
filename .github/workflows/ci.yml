@@ -30,6 +30,7 @@ jobs:
           find root/etc -type f \( -path '*/init.d/*' -o -path '*/hotplug.d/*' \) -print0 \
             | xargs -0 -n1 sh -n
           sh -n tests/verify-packaged-bpf.sh
+          sh -n tests/verify-v45-packages.sh
           sh -n tests/measure-bpf-performance.sh
           sh -n tests/measure-v44-continuous-authorization.sh
           python3 -m py_compile tests/send-malformed-frames.py
@@ -39,8 +40,8 @@ jobs:
         run: |
           ! grep -Eiq 'ringbuf|perf.event|netlink' src/client-access-bpf.c src/client-access-bpf.h
           ! grep -Eiq 'profile|provider|provenance|dnsmasq|dns[_-]' src/client-access-bpf.c src/client-access-bpf.h
-          ! grep -Eq 'dns-sync' src/client-access-bpfctl.c
-          ! grep -Eq 'ca_dns4|ca_dns6' src/client-access-bpfctl.c
+          ! grep -Eq 'dns-sync' src/*.c src/*.h
+          ! grep -Eq 'ca_dns4|ca_dns6' src/*.c src/*.h
           grep -Fq 'classification.resolve' root/usr/sbin/client-accessd
           grep -Fq 'runtime_projection' root/usr/sbin/client-accessd
 
@@ -56,6 +57,38 @@ jobs:
             root/usr/share/nftables.d/table-pre/30-client-access.nft \
             root/usr/share/nftables.d/chain-pre/forward/30-client-access.nft
           ! grep -Eiq 'conntrack-tools|\+conntrack' Makefile
+
+      - name: Enforce the V4.5 package and source boundaries
+        shell: bash
+        run: |
+          grep -Fq 'define Package/client-access-core' Makefile
+          grep -Eq 'Package/luci-app-client-access.*|DEPENDS:=\+client-access-core' Makefile
+          grep -Fq 'DEPENDS:=+client-access-core +libbpf' Makefile
+          ! sed -n '/define Package\/client-access-core/,/endef/p' Makefile \
+            | grep -Eq 'luci|libbpf|kmod-sched-bpf'
+          ! sed -n '/define Package\/client-access-core\/install/,/endef/p' Makefile \
+            | grep -Eq 'htdocs|luci/menu|rpcd/acl|client-access-bpf'
+          ! sed -n '/define Package\/luci-app-client-access\/install/,/endef/p' Makefile \
+            | grep -Eq 'etc/config|client-accessd|ucode/client_access|nftables|lib/bpf'
+          test -f root/usr/share/ucode/client_access/config.uc
+          test -f root/usr/share/ucode/client_access/lease_store.uc
+          test -f root/usr/share/ucode/client_access/firewall.uc
+          test -f root/usr/share/ucode/client_access/bpf_runtime.uc
+          test -f root/usr/share/ucode/client_access/application_reconcile.uc
+          test -f root/usr/share/ucode/client_access/status.uc
+          test -f root/usr/share/ucode/client_access/classification_ir.uc
+          test -f root/usr/share/ucode/client_access/classification_observation.uc
+          test -f root/usr/share/ucode/client_access/classification_projection.uc
+          ! grep -Eq "from 'uci'|from 'fs'|popen\(|nft -j" root/usr/sbin/client-accessd
+          test -f src/bpfctl-internal.h
+          for unit in bpf-object bpf-tc bpf-snapshot bpf-runtime bpf-health; do
+            test -f "src/${unit}.c"
+          done
+          test "$(grep -l '^int main(' src/*.c | wc -l)" -eq 1
+          test -f htdocs/luci-static/resources/client-access/rpc.js
+          test -f htdocs/luci-static/resources/client-access/common.js
+          test -f htdocs/luci-static/resources/client-access/status.js
+          test -f htdocs/luci-static/resources/client-access/approvals.js
 
       - name: Check the generated nftables fragment
         shell: bash
@@ -81,7 +114,9 @@ jobs:
           cp -a htdocs root Makefile "${RUNNER_TEMP}/luci/applications/luci-app-client-access/"
           cd "${RUNNER_TEMP}/luci"
           npm install --ignore-scripts
-          npx eslint applications/luci-app-client-access/htdocs/luci-static/resources/view/client-access/*.js
+          npx eslint \
+            applications/luci-app-client-access/htdocs/luci-static/resources/view/client-access/*.js \
+            applications/luci-app-client-access/htdocs/luci-static/resources/client-access/*.js
 
   policy-tests:
     name: Remote ucode policy tests
@@ -256,7 +291,7 @@ jobs:
             -c tests/foreign-tc-bpf.c \
             -o "${RUNNER_TEMP}/foreign-tc-bpf.o"
           cc -O2 -Wall -Wextra -Werror -std=gnu11 \
-            src/client-access-bpfctl.c \
+            src/client-access-bpfctl.c src/bpfctl-common.c src/bpf-*.c \
             -o "${RUNNER_TEMP}/client-access-bpfctl" \
             -lbpf -lelf -lz
 
@@ -797,7 +832,7 @@ jobs:
             -c src/client-access-bpf.c \
             -o "${RUNNER_TEMP}/client-access-bpf.o"
           cc -O2 -Wall -Wextra -Werror -std=gnu11 \
-            src/client-access-bpfctl.c \
+            src/client-access-bpfctl.c src/bpfctl-common.c src/bpf-*.c \
             -o "${RUNNER_TEMP}/client-access-bpfctl" \
             -lbpf -lelf -lz
           sh tests/measure-bpf-performance.sh \
@@ -811,6 +846,52 @@ jobs:
         with:
           name: bpf-performance-evidence
           path: ${{ runner.temp }}/client-access-performance
+          if-no-files-found: error
+          retention-days: 14
+
+  openwrt-core-luci:
+    name: OpenWrt core and LuCI build isolation
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out client-access
+        uses: actions/checkout@v6
+
+      - name: Stage package as an OpenWrt feed
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/client-access-feed/luci-app-client-access"
+          mkdir -p "${RUNNER_TEMP}/openwrt-core-luci-artifacts"
+          rsync -a --exclude '.git' --exclude '.github' ./ \
+            "${RUNNER_TEMP}/client-access-feed/luci-app-client-access/"
+
+      - name: Build core and LuCI without selecting BPF
+        uses: openwrt/gh-action-sdk@f5813d30eeef3534b58ac7e79c5d8842b6035434
+        env:
+          ARCH: x86_64-24.10.8
+          ARTIFACTS_DIR: ${{ runner.temp }}/openwrt-core-luci-artifacts
+          BUILD_LOG: 1
+          FEED_DIR: ${{ runner.temp }}/client-access-feed
+          PACKAGES: client-access-core luci-app-client-access
+          V: s
+
+      - name: Verify the BPF package was not built
+        shell: bash
+        run: |
+          find "${RUNNER_TEMP}/openwrt-core-luci-artifacts" -type f \
+            -name 'client-access-core_*.ipk' -print -quit | grep -q .
+          find "${RUNNER_TEMP}/openwrt-core-luci-artifacts" -type f \
+            -name 'luci-app-client-access_*.ipk' -print -quit | grep -q .
+          test -z "$(find "${RUNNER_TEMP}/openwrt-core-luci-artifacts" -type f \
+            -name 'client-access-bpf_*.ipk' -print -quit)"
+          printf '%s\n' 'Core and LuCI built without selecting the BPF package.' \
+            >"${RUNNER_TEMP}/openwrt-core-luci-artifacts/v45-build-isolation.txt"
+
+      - name: Upload core and LuCI build-isolation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-core-luci-x86_64
+          path: ${{ runner.temp }}/openwrt-core-luci-artifacts
           if-no-files-found: error
           retention-days: 14
 
@@ -836,6 +917,7 @@ jobs:
           ARTIFACTS_DIR: ${{ runner.temp }}/openwrt-artifacts
           BUILD_LOG: 1
           FEED_DIR: ${{ runner.temp }}/client-access-feed
+          PACKAGES: client-access-core luci-app-client-access client-access-bpf
           V: s
 
       - name: Verifier-load the packaged OpenWrt BPF object
@@ -847,6 +929,9 @@ jobs:
           sh tests/verify-packaged-bpf.sh \
             "${RUNNER_TEMP}/openwrt-artifacts" \
             "${RUNNER_TEMP}/openwrt-packaged-bpf"
+          sh tests/verify-v45-packages.sh \
+            "${RUNNER_TEMP}/openwrt-artifacts" \
+            "${RUNNER_TEMP}/openwrt-artifacts/v45-package-evidence"
 
       - name: Upload OpenWrt packages and logs
         if: always()
@@ -879,6 +964,7 @@ jobs:
           ARTIFACTS_DIR: ${{ runner.temp }}/immortalwrt-artifacts
           BUILD_LOG: 1
           FEED_DIR: ${{ runner.temp }}/client-access-feed
+          PACKAGES: client-access-core luci-app-client-access client-access-bpf
           V: s
 
       - name: Verifier-load the packaged ImmortalWrt BPF object
@@ -890,6 +976,9 @@ jobs:
           sh tests/verify-packaged-bpf.sh \
             "${RUNNER_TEMP}/immortalwrt-artifacts" \
             "${RUNNER_TEMP}/immortalwrt-packaged-bpf"
+          sh tests/verify-v45-packages.sh \
+            "${RUNNER_TEMP}/immortalwrt-artifacts" \
+            "${RUNNER_TEMP}/immortalwrt-artifacts/v45-package-evidence"
 
       - name: Upload ImmortalWrt packages and logs
         if: always()

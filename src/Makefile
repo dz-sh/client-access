@@ -8,11 +8,15 @@ PREFIX ?= /usr
 
 .PHONY: all clean install
 
+BPFCTL_SOURCES := client-access-bpfctl.c bpfctl-common.c bpf-object.c \
+	bpf-tc.c bpf-snapshot.c bpf-runtime.c bpf-health.c
+BPFCTL_HEADERS := client-access-bpf.h bpfctl-internal.h
+
 all: client-access-bpfctl
 
-client-access-bpfctl: client-access-bpfctl.c client-access-bpf.h
+client-access-bpfctl: $(BPFCTL_SOURCES) $(BPFCTL_HEADERS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra -Werror -std=gnu11 \
-		-o $@ client-access-bpfctl.c $(LDFLAGS) $(LDLIBS)
+		-o $@ $(BPFCTL_SOURCES) $(LDFLAGS) $(LDLIBS)
 
 install: client-access-bpfctl
 	install -d $(DESTDIR)$(PREFIX)/sbin

@@ -98,7 +98,17 @@ application traffic cannot receive a temporary approval.
 
 ## Usage
 
-After installation, open:
+For the normal web interface, install `luci-app-client-access`; it installs the
+headless `client-access-core` runtime automatically. A router managed without
+LuCI can install `client-access-core` directly. Install `client-access-bpf` only
+when application filtering is needed.
+
+Removing the LuCI package leaves the daemon, saved configuration, and active
+enforcement in place. Removing the optional BPF package disables its datapath
+while preserving the baseline Internet access policy and saved application
+rules.
+
+After installing the web interface, open:
 
 ```text
 Network → Client Access

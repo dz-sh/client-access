@@ -1,54 +1,25 @@
 'use strict';
 'require view';
 'require form';
-'require rpc';
 'require uci';
 'require ui';
+'require client-access.rpc as caRpc';
+'require client-access.common as caCommon';
+'require client-access.approvals as approvalUi';
+'require client-access.status as statusUi';
 
-const callStatus = rpc.declare({
-	object: 'client_access',
-	method: 'status',
-	expect: { '': {} }
-});
-
-const callIdentities = rpc.declare({
-	object: 'client_access',
-	method: 'identities',
-	expect: { '': { identities: [] } }
-});
-
-const callObservations = rpc.declare({
-	object: 'client_access',
-	method: 'observations',
-	expect: { '': { observations: [] } }
-});
-
-const callApprovals = rpc.declare({
-	object: 'client_access',
-	method: 'approvals',
-	expect: { '': { approvals: [], access_targets: [], application_targets: [] } }
-});
-
-const callApprove = rpc.declare({
-	object: 'client_access',
-	method: 'approve',
-	params: [ 'scope', 'identity_id', 'class_id', 'duration' ],
-	expect: { '': {} }
-});
-
-const callRevokeApproval = rpc.declare({
-	object: 'client_access',
-	method: 'revoke_approval',
-	params: [ 'lease_id' ],
-	expect: { '': {} }
-});
-
-const callReconcile = rpc.declare({
-	object: 'client_access',
-	method: 'reconcile',
-	params: [ 'reason' ],
-	expect: { '': {} }
-});
+const callStatus = caRpc.status;
+const callIdentities = caRpc.identities;
+const callObservations = caRpc.observations;
+const callApprovals = caRpc.approvals;
+const asList = caCommon.asList;
+const formatTime = caCommon.formatTime;
+const accessResult = caCommon.accessResult;
+const applyPolicyLabel = caCommon.applyPolicyLabel;
+const approvalActions = approvalUi.actions;
+const temporaryApprovalsPanel = approvalUi.panel;
+const statusPanel = statusUi.accessPanel;
+const applicationStatusPanel = statusUi.applicationPanel;
 
 const DAYS = [
 	{ id: 'mon', label: _('Monday') },
@@ -59,12 +30,6 @@ const DAYS = [
 	{ id: 'sat', label: _('Saturday') },
 	{ id: 'sun', label: _('Sunday') }
 ];
-
-function asList(value) {
-	if (value == null)
-		return [];
-	return Array.isArray(value) ? value : [ value ];
-}
 
 function randomIdentityId() {
 	const bytes = new Uint8Array(12);
@@ -123,127 +88,6 @@ function accessPolicyFromUci() {
 		? 'allow_selected' : 'block_selected';
 }
 
-function formatTime(epoch) {
-	return epoch ? new Date(epoch * 1000).toLocaleString() : _('No scheduled change');
-}
-
-function formatRemaining(seconds) {
-	seconds = Math.max(0, Number(seconds) || 0);
-	if (seconds < 60)
-		return _('%d seconds').format(Math.ceil(seconds));
-	if (seconds < 3600)
-		return _('%d minutes').format(Math.ceil(seconds / 60));
-	const hours = Math.floor(seconds / 3600);
-	const minutes = Math.ceil((seconds % 3600) / 60);
-	return minutes ? _('%d hours %d minutes').format(hours, minutes)
-		: _('%d hours').format(hours);
-}
-
-function approvalError(result) {
-	const errors = result && Array.isArray(result.errors) ? result.errors : [];
-	return errors.length ? errors.join('; ') : _('The temporary approval operation failed.');
-}
-
-function runApproval(scope, identityId, classId, duration) {
-	return callApprove(scope, identityId, classId == null ? 0 : classId,
-		duration).then(function(result) {
-		if (!result || result.ok !== true) {
-			ui.addNotification(null, E('p', {}, [ approvalError(result) ]), 'error');
-			return;
-		}
-		window.location.reload();
-	});
-}
-
-function runRevocation(leaseId) {
-	return callRevokeApproval(leaseId).then(function(result) {
-		if (!result || result.ok !== true) {
-			ui.addNotification(null, E('p', {}, [ approvalError(result) ]), 'error');
-			return;
-		}
-		window.location.reload();
-	});
-}
-
-function actionButton(label, handler, className) {
-	return E('button', {
-		'type': 'button',
-		'class': className || 'btn cbi-button-action',
-		'click': ui.createHandlerFn(null, handler)
-	}, [ label ]);
-}
-
-function approvalActions(scope, identityId, classId, target, inventory) {
-	if (!target)
-		return E('span', {}, [ _('Apply pending configuration before creating an approval.') ]);
-	const available = scope === 'access'
-		? inventory.access_available : inventory.application_available;
-	if (!available)
-		return E('span', {}, [ scope === 'access'
-			? _('Enable and apply Internet access control before creating an access approval.')
-			: _('Enable and apply application filtering before creating an application approval.') ]);
-	if (target.lease_id) {
-		const lease = (inventory.approvals || []).find(function(item) {
-			return item.id === target.lease_id;
-		});
-		return E('div', { 'class': 'alert-message notice' }, [
-			E('strong', {}, [ _('Temporary approval active') ]),
-			E('br'),
-			_('Base: %s · Effective: %s').format(
-				target.base_verdict === 'deny' ? _('Blocked') : _('Allowed'),
-				target.effective_verdict === 'deny' ? _('Blocked') : _('Allowed')),
-			E('br'),
-			_('Expires: %s (%s remaining)').format(formatTime(target.lease_expires_at),
-				formatRemaining(lease ? lease.remaining_seconds : 0)),
-			E('div', { 'style': 'margin-top:.6em' }, [
-				actionButton(_('Set 1 hour from now'), function() {
-					return runApproval(scope, identityId, classId, 'one_hour');
-				}),
-				' ',
-				actionButton(_('Set until today ends'), function() {
-					return runApproval(scope, identityId, classId, 'today');
-				}),
-				' ',
-				actionButton(_('Revoke now'), function() {
-					return runRevocation(target.lease_id);
-				}, 'btn cbi-button-negative')
-			])
-		]);
-	}
-	if (target.base_verdict !== 'deny')
-		return E('span', {}, [
-			_('The base policy already allows this target, so a temporary approval would not change access.')
-		]);
-	if (!inventory.clock_valid)
-		return E('span', {}, [ _('The router clock is not valid, so temporary approval is unavailable.') ]);
-	return E('div', {}, [
-		E('p', {}, [
-			_('Base: Blocked · Temporary approval changes only the runtime result and does not edit the saved rule.')
-		]),
-		actionButton(_('Approve for 1 hour'), function() {
-			return runApproval(scope, identityId, classId, 'one_hour');
-		}),
-		' ',
-		actionButton(_('Approve today'), function() {
-			return runApproval(scope, identityId, classId, 'today');
-		})
-	]);
-}
-
-function accessResult(verdict, enabled) {
-	if (!enabled)
-		return _('Control is off');
-	return verdict === 'deny' ? _('Blocked now') : _('Allowed now');
-}
-
-function applyPolicyLabel(activation) {
-	if (activation === 'always_active')
-		return _('Always');
-	if (activation === 'active_during')
-		return _('On schedule');
-	return _('Never');
-}
-
 function resultReason(identity, status) {
 	if (!status.enabled)
 		return _('Internet access control is off.');
@@ -261,199 +105,6 @@ function resultReason(identity, status) {
 	if (identity.reason === 'inactive')
 		return _('The policy never applies to this identity.');
 	return _('The current result is fail-closed because this identity has a configuration error.');
-}
-
-function statusPanel(status) {
-	const disabled = status.running && status.enabled === false && status.schema_supported !== false;
-	const ok = status.running && status.applied;
-	const errors = Array.isArray(status.errors) ? status.errors : [];
-	const warnings = Array.isArray(status.warnings) ? status.warnings : [];
-
-	return E('div', { 'class': 'cbi-section' }, [
-		E('div', { 'class': ok || disabled ? 'alert-message success' : 'alert-message warning' }, [
-			disabled
-				? _('Internet access control is off. All clients can access the Internet.')
-				: (ok ? _('The configured Internet access policy is active.') : _('The policy could not be fully applied.'))
-		]),
-		E('details', {}, [
-			E('summary', {}, [ _('Diagnostics') ]),
-			E('div', { 'class': 'table' }, [
-				E('div', { 'class': 'tr' }, [
-					E('div', { 'class': 'td left' }, [ _('Managed identities') ]),
-					E('div', { 'class': 'td left' }, [ String(status.identity_count || 0) ]),
-					E('div', { 'class': 'td left' }, [ _('Recognized MAC addresses') ]),
-					E('div', { 'class': 'td left' }, [ String(status.binding_count || 0) ])
-				]),
-				E('div', { 'class': 'tr' }, [
-					E('div', { 'class': 'td left' }, [ _('Selected now') ]),
-					E('div', { 'class': 'td left' }, [ String(status.active_identity_count || 0) ]),
-					E('div', { 'class': 'td left' }, [ _('Next policy change') ]),
-					E('div', { 'class': 'td left' }, [ formatTime(status.next_transition) ])
-				])
-			]),
-			errors.length ? E('p', { 'class': 'alert-message error' }, [ errors.join('; ') ]) : '',
-			warnings.length ? E('p', { 'class': 'alert-message warning' }, [ warnings.join('; ') ]) : '',
-			E('button', {
-				'class': 'btn cbi-button-action',
-				'click': ui.createHandlerFn(null, function() {
-					return callReconcile('luci-manual').then(function() { window.location.reload(); });
-				})
-			}, [ _('Reapply policy') ])
-		])
-	]);
-}
-
-function runtimeStatus(appStatus) {
-	try {
-		return JSON.parse(appStatus.runtime_status_json || '{}');
-	}
-	catch (error) {
-		return {};
-	}
-}
-
-function applicationStatusPanel(status) {
-	const appStatus = status.app_filter || {};
-	const runtime = runtimeStatus(appStatus);
-	const resourceLimits = appStatus.resource_limits || {};
-	const disabled = !appStatus.requested_enabled;
-	const healthy = appStatus.enabled && !appStatus.degraded;
-	const exact = runtime.flows_classified_exact || 0;
-	const category = runtime.flows_classified_category || 0;
-	const unclassified = runtime.flows_unclassified || 0;
-	const terminal = exact + category + unclassified;
-	const coverage = terminal ? Math.round(100 * (exact + category) / terminal) : 0;
-
-	return E('div', { 'class': 'cbi-section' }, [
-		E('div', { 'class': disabled || healthy ? 'alert-message success' : 'alert-message warning' }, [
-			disabled
-				? _('Application filtering is off. The nftables Internet access policy remains independent.')
-				: (healthy
-					? _('Application filtering is active for managed identities.')
-					: _('Application filtering is degraded; see diagnostics before relying on its rules.'))
-		]),
-		E('details', {}, [
-			E('summary', {}, [ _('Application diagnostics') ]),
-			E('p', {}, [
-				_('Packets still pass the application layer while a new flow is pending. One early packet is inspected, so a denied application has a small initial leakage window.')
-			]),
-			E('div', { 'class': 'table' }, [
-				E('div', { 'class': 'tr' }, [
-					E('div', { 'class': 'td left' }, [ _('Backend') ]),
-					E('div', { 'class': 'td left' }, [ appStatus.backend_mode || 'V3_NFT_ONLY' ]),
-					E('div', { 'class': 'td left' }, [ _('Classifier coverage') ]),
-					E('div', { 'class': 'td left' }, [ terminal ? coverage + '%' : _('No terminal flows yet') ])
-				]),
-				E('div', { 'class': 'tr' }, [
-					E('div', { 'class': 'td left' }, [ _('Exact / category') ]),
-					E('div', { 'class': 'td left' }, [ '%s / %s'.format(exact, category) ]),
-					E('div', { 'class': 'td left' }, [ _('Unclassified / load shed') ]),
-					E('div', { 'class': 'td left' }, [ '%s / %s'.format(unclassified, runtime.flows_unclassified_load_shed || 0) ])
-				]),
-				E('div', { 'class': 'tr' }, [
-					E('div', { 'class': 'td left' }, [ _('Policy / classifier generation') ]),
-					E('div', { 'class': 'td left' }, [ '%s / %s'.format(appStatus.app_policy_generation || 0, appStatus.classifier_generation || 0) ]),
-					E('div', { 'class': 'td left' }, [ _('Flow map') ]),
-					E('div', { 'class': 'td left' }, [ '%s / %s'.format(runtime.flow_map_entries || 0, runtime.flow_capacity || 0) ])
-				]),
-				E('div', { 'class': 'tr' }, [
-					E('div', { 'class': 'td left' }, [ _('DNS correlation') ]),
-					E('div', { 'class': 'td left' }, [ appStatus.dns_subscribed ? _('Subscribed') : _('Unavailable') ]),
-					E('div', { 'class': 'td left' }, [ _('DNS events accepted / dropped') ]),
-					E('div', { 'class': 'td left' }, [ '%s / %s'.format(appStatus.dns_events_accepted || 0, appStatus.dns_events_dropped || 0) ])
-				]),
-				E('div', { 'class': 'tr' }, [
-					E('div', { 'class': 'td left' }, [ _('Profiles / normalized evidence') ]),
-					E('div', { 'class': 'td left' }, [ '%s / %s'.format(appStatus.profile_count || 0, appStatus.classification_ir_entry_count || 0) ]),
-					E('div', { 'class': 'td left' }, [ _('Semantic / runtime entries') ]),
-					E('div', { 'class': 'td left' }, [ '%s / %s'.format(appStatus.semantic_entry_count || 0, appStatus.runtime_projection_entry_count || 0) ])
-				]),
-				E('div', { 'class': 'tr' }, [
-					E('div', { 'class': 'td left' }, [ _('Signature table estimate') ]),
-					E('div', { 'class': 'td left' }, [ '%s / %s B'.format(appStatus.classifier_signature_memory_bytes || 0, resourceLimits.signature_table_memory_limit || 0) ]),
-					E('div', { 'class': 'td left' }, [ _('Backend schema') ]),
-					E('div', { 'class': 'td left' }, [ String(runtime.bpf_schema_version || _('Unavailable')) ])
-				])
-			]),
-			(appStatus.errors || []).length
-				? E('p', { 'class': 'alert-message error' }, [ appStatus.errors.join('; ') ]) : '',
-			(appStatus.warnings || []).length
-				? E('p', { 'class': 'alert-message warning' }, [ appStatus.warnings.join('; ') ]) : ''
-		])
-	]);
-}
-
-function temporaryApprovalsPanel(inventory) {
-	const approvals = inventory.approvals || [];
-	const errors = inventory.errors || [];
-	const accessTargets = inventory.access_targets || [];
-	const applicationTargets = inventory.application_targets || [];
-	const transitions = inventory.latest_transitions || [];
-
-	function accessTarget(lease) {
-		return accessTargets.find(function(target) {
-			return target.identity_id === lease.identity_id;
-		});
-	}
-
-	function applicationTarget(lease) {
-		return applicationTargets.find(function(target) {
-			return target.identity_id === lease.identity_id &&
-				Number(target.class_id) === Number(lease.class_id);
-		});
-	}
-
-	const rows = approvals.map(function(lease) {
-		const target = lease.scope === 'access' ? accessTarget(lease) : applicationTarget(lease);
-		const identityName = target && target.identity_name
-			? target.identity_name : lease.identity_id;
-		const scopeLabel = lease.scope === 'access'
-			? _('Internet access')
-			: _('Application: %s').format(target && target.class_name
-				? target.class_name : String(lease.class_id));
-		return E('div', { 'class': 'tr' }, [
-			E('div', { 'class': 'td left' }, [ identityName ]),
-			E('div', { 'class': 'td left' }, [ scopeLabel ]),
-			E('div', { 'class': 'td left' }, [ formatTime(lease.expires_at) ]),
-			E('div', { 'class': 'td left' }, [ formatRemaining(lease.remaining_seconds) ]),
-			E('div', { 'class': 'td left' }, [
-				actionButton(_('Revoke'), function() { return runRevocation(lease.id); },
-					'btn cbi-button-negative')
-			])
-		]);
-	});
-
-	return E('div', { 'class': 'cbi-section' }, [
-		E('h3', {}, [ _('Temporary approvals') ]),
-		E('p', {}, [
-			_('These runtime-only ALLOW overrides are separate from saved policies. They disappear at expiry and after a router reboot.')
-		]),
-		approvals.length
-			? E('div', { 'class': 'table' }, [
-				E('div', { 'class': 'tr table-titles' }, [
-					E('div', { 'class': 'th left' }, [ _('Identity') ]),
-					E('div', { 'class': 'th left' }, [ _('Scope') ]),
-					E('div', { 'class': 'th left' }, [ _('Expires') ]),
-					E('div', { 'class': 'th left' }, [ _('Remaining') ]),
-					E('div', { 'class': 'th left' }, [ _('Action') ])
-				]),
-				...rows
-			])
-			: E('p', { 'class': 'alert-message notice' }, [ _('No temporary approvals are active.') ]),
-		inventory.journal_available === false
-			? E('p', { 'class': 'alert-message warning' }, [
-				_('Volatile approval state is not synchronized; new approvals must not be trusted until the service reports recovery.')
-			]) : '',
-		errors.length ? E('p', { 'class': 'alert-message error' }, [ errors.join('; ') ]) : '',
-		transitions.length ? E('details', {}, [
-			E('summary', {}, [ _('Latest authorization transition') ]),
-			E('p', {}, [ transitions.map(function(item) {
-				return '%s: %s → %s (%s)'.format(item.identity_id,
-					String(item.old_verdict).toUpperCase(),
-					String(item.new_verdict).toUpperCase(), item.reason);
-			}).join('; ') ])
-		]) : ''
-	]);
 }
 
 function parseScheduleMap(sectionId) {

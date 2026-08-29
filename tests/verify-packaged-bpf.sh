@@ -40,7 +40,7 @@ if [ ! -s "$object" ]; then
 fi
 
 cc -O2 -Wall -Wextra -Werror -std=gnu11 \
-	src/client-access-bpfctl.c \
+	src/client-access-bpfctl.c src/bpfctl-common.c src/bpf-*.c \
 	-o "$work_dir/client-access-bpfctl" \
 	-lbpf -lelf -lz
 

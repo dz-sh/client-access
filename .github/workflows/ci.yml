@@ -164,6 +164,7 @@ jobs:
           test -x "${bpftool_path}"
           mkdir -p "${RUNNER_TEMP}/client-access-tools"
           ln -s "${bpftool_path}" "${RUNNER_TEMP}/client-access-tools/bpftool"
+          sudo ln -sf "${bpftool_path}" /usr/local/bin/bpftool
           echo "${RUNNER_TEMP}/client-access-tools" >> "${GITHUB_PATH}"
 
       - name: Build the datapath and publisher on Linux
@@ -717,6 +718,7 @@ jobs:
           test -x "${bpftool_path}"
           mkdir -p "${RUNNER_TEMP}/client-access-tools"
           ln -s "${bpftool_path}" "${RUNNER_TEMP}/client-access-tools/bpftool"
+          sudo ln -sf "${bpftool_path}" /usr/local/bin/bpftool
           echo "${RUNNER_TEMP}/client-access-tools" >> "${GITHUB_PATH}"
 
       - name: Build on Linux and record informational measurements

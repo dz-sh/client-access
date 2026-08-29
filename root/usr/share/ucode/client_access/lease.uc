@@ -30,6 +30,19 @@ function monotonic_second(value) {
 	return null;
 }
 
+function end_of_today(epoch) {
+	const tm = localtime(epoch);
+	return timelocal({
+		year: tm.year,
+		mon: tm.mon,
+		mday: tm.mday + 1,
+		hour: 0,
+		min: 0,
+		sec: 0,
+		isdst: -1,
+	});
+}
+
 function target_key(scope, identity_id, class_id) {
 	return scope == 'access'
 		? `access/${identity_id}`
@@ -188,19 +201,6 @@ export function parse_database(value, context, epoch, monotonic_now) {
 	};
 }
 
-function end_of_today(epoch) {
-	const tm = localtime(epoch);
-	return timelocal({
-		year: tm.year,
-		mon: tm.mon,
-		mday: tm.mday + 1,
-		hour: 0,
-		min: 0,
-		sec: 0,
-		isdst: -1,
-	});
-}
-
 export function create(database, request, context, epoch, monotonic_now) {
 	epoch ??= clock()[0];
 	monotonic_now ??= clock(true);
@@ -327,6 +327,14 @@ export function next_expiry(database) {
 	return result;
 }
 
+function min_transition(first, second) {
+	if (first == null)
+		return second;
+	if (second == null)
+		return first;
+	return first < second ? first : second;
+}
+
 export function overlay_access(compiled, database) {
 	let by_identity = {};
 	for (let lease in ((database && database.leases) ?? []))
@@ -346,14 +354,6 @@ export function overlay_access(compiled, database) {
 	}
 	return { ...compiled, identities,
 		next_transition: min_transition(compiled.next_transition, next_expiry(database)) };
-}
-
-function min_transition(first, second) {
-	if (first == null)
-		return second;
-	if (second == null)
-		return first;
-	return first < second ? first : second;
 }
 
 export function overlay_application(compiled, database) {

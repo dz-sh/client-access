@@ -64,8 +64,11 @@ export function run() {
 	}
 	else if (scenario == 'generation_nonreuse') {
 		if (app.backend_mode != 'V4_BPF_BASIC' || app.app_policy_generation != 3 ||
-		    sprintf('%J', runtime.policy_generations) != '[1,2,3]')
-			fail('a consumed application-policy generation was reused');
+		    length(runtime.policy_generations) != 3 ||
+		    runtime.policy_generations[0] != 1 ||
+		    runtime.policy_generations[1] != 2 ||
+		    runtime.policy_generations[2] != 3)
+			fail(`a consumed application-policy generation was reused: app=${sprintf('%J', app)} runtime=${sprintf('%J', runtime)}`);
 	}
 	else if (scenario == 'health_failure' ||
 	         scenario == 'status_health_failure' ||

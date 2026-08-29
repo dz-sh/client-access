@@ -44,6 +44,17 @@ export function cursor() {
 			else if (package_name == 'client_access' && section_type == 'binding')
 				callback({ '.name': 'alice_mac', identity: 'alice', type: 'mac',
 					value: '02:00:00:00:00:42' });
+			else if (package_name == 'client_access' && section_type == 'app_class') {
+				callback({ '.name': 'video', class_id: '10', name: 'Video',
+					kind: 'category', tcp_port: [ '443' ],
+					profile_schema_version: '1', profile_source: 'native',
+					profile_license: 'Apache-2.0', profile_provenance: 'test:video' });
+				if (scenario == 'projection_failure' && phase > 0)
+					callback({ '.name': 'social', class_id: '20', name: 'Social',
+						kind: 'category', tcp_port: [ '443' ],
+						profile_schema_version: '1', profile_source: 'native',
+						profile_license: 'Apache-2.0', profile_provenance: 'test:social' });
+			}
 			else if (package_name == 'firewall' && section_type == 'defaults')
 				callback({
 					flow_offloading: scenario == 'offload_software' ? '1' : '0',

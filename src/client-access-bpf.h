@@ -9,7 +9,7 @@
 #define CA_PROGRAM_PIN CA_PIN_ROOT "/ca_ingress"
 
 /* Bump whenever a pinned program or map ABI becomes incompatible. */
-#define CA_BPF_SCHEMA_VERSION 3U
+#define CA_BPF_SCHEMA_VERSION 4U
 
 /* Reserved TC classifier coordinate owned by this application. */
 #define CA_TC_HANDLE 0xcaU
@@ -29,9 +29,7 @@
 #define CA_MAX_PORT_HINTS 1024
 #define CA_MAX_IPV4_HINTS 4096
 #define CA_MAX_IPV6_HINTS 4096
-#define CA_MAX_DNS4_HINTS 4096
-#define CA_MAX_DNS6_HINTS 4096
-#define CA_STATS_COUNT 32
+#define CA_STATS_COUNT 22
 
 #define CA_DEFAULT_MAX_PACKETS 1
 #define CA_DEFAULT_MAX_BYTES 256
@@ -55,6 +53,7 @@ enum ca_class_kind {
 	CA_CLASS_KIND_NONE = 0,
 	CA_CLASS_KIND_EXACT = 1,
 	CA_CLASS_KIND_CATEGORY = 2,
+	CA_CLASS_KIND_UNCLASSIFIED = 3,
 };
 
 enum ca_stat_id {
@@ -80,8 +79,6 @@ enum ca_stat_id {
 	CA_STAT_FLOW_MAP_EVICTIONS = 19,
 	CA_STAT_PARSE_UNSUPPORTED = 20,
 	CA_STAT_CLASSIFIER_CONFLICTS = 21,
-	CA_STAT_DNS_HINT_EXPIRED = 22,
-	CA_STAT_CLASSIFIER_RESTARTS = 23,
 };
 
 struct ca_config {
@@ -131,17 +128,6 @@ struct ca_ipv4_lpm_key {
 struct ca_ipv6_lpm_key {
 	__u32 prefixlen;
 	__u8 addr[16];
-};
-
-struct ca_ipv6_addr_key {
-	__u8 addr[16];
-};
-
-struct ca_dns_hint {
-	__u64 expires_ns;
-	__u32 classifier_generation;
-	__u32 reserved;
-	struct ca_class_hint hint;
 };
 
 struct ca_flow_key {

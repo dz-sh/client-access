@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { evaluate_schedule } from 'client_access.policy';
+import * as classification from 'client_access.classification';
 
 const CLASS_DEFAULT = 0;
-const CLASS_UNCLASSIFIED = 1;
-const MAX_CLASS_ID = 65535;
+const CLASS_UNCLASSIFIED = classification.constants.CLASS_UNCLASSIFIED;
+const MAX_CLASS_ID = classification.constants.MAX_CLASS_ID;
 const MAX_SUBJECT_ID = 4294967295;
-const CLASS_KIND_EXACT = 1;
-const CLASS_KIND_CATEGORY = 2;
 
 const RESOURCE_DEFAULTS = {
 	max_packets_inspected: 1,
@@ -18,31 +17,6 @@ const RESOURCE_DEFAULTS = {
 	per_subject_new_classification_rate: 64,
 	signature_table_memory_limit: 262144,
 };
-
-/* Conservative admission estimates include allocator/map metadata, alignment,
- * and both classifier snapshot slots. They are intentionally larger than the
- * bare key/value structs so configuration cannot promise impossible memory
- * usage on a small router.
- */
-const SIGNATURE_MEMORY = {
-	port: 128,
-	ipv4_prefix: 160,
-	ipv6_prefix: 192,
-	domain_base: 128,
-};
-
-const SIGNATURE_CAPACITY = {
-	ports: 1024,
-	ipv4_prefixes: 4096,
-	ipv6_prefixes: 4096,
-	domains: 4096,
-};
-
-function as_list(value) {
-	if (value == null)
-		return [];
-	return type(value) == 'array' ? value : [ value ];
-}
 
 function flag(value, fallback) {
 	if (value == null)
@@ -67,19 +41,6 @@ function bounded_uint(value, fallback, minimum, maximum, label, errors) {
 		return fallback;
 	}
 	return parsed;
-}
-
-function normalized_strings(values) {
-	let result = [], seen = {};
-	for (let value in as_list(values)) {
-		value = lc(trim('' + value));
-		if (length(value) && !seen[value]) {
-			seen[value] = true;
-			push(result, value);
-		}
-	}
-	sort(result);
-	return result;
 }
 
 function normalize_verdict(value, fallback) {
@@ -166,66 +127,6 @@ function resolve_verdict(rules_by_class, class_id, classes) {
 		: { verdict: 'allow', matched_class_id: null };
 }
 
-function validate_class_graph(classes, configured_ids, errors) {
-	for (let class_id in configured_ids) {
-		let current = class_id, seen = {};
-		while (current != null && current != CLASS_DEFAULT && current != CLASS_UNCLASSIFIED) {
-			if (seen[current]) {
-				push(errors, `Application class ${class_id}: parent cycle includes ${current}`);
-				break;
-			}
-			seen[current] = true;
-			const info = classes['' + current];
-			if (!info)
-				break;
-			if (info.parent_id != null && !classes['' + info.parent_id]) {
-				push(errors, `Application class ${current}: unknown parent ${info.parent_id}`);
-				break;
-			}
-			current = info.parent_id;
-		}
-	}
-}
-
-function runtime_category_id(classes, class_id) {
-	let current = classes['' + class_id], seen = {};
-	while (current && !seen[current.id]) {
-		seen[current.id] = true;
-		if (current.kind == 'category')
-			return current.id;
-		current = current.parent_id != null ? classes['' + current.parent_id] : null;
-	}
-	return null;
-}
-
-function classifier_hint(classes, class_info, allow_downgrade) {
-	const category_id = runtime_category_id(classes, class_info.id);
-	if (class_info.kind == 'category')
-		return { class_id: class_info.id, category_id: class_info.id, kind: CLASS_KIND_CATEGORY };
-	if (allow_downgrade)
-		return category_id == null ? null : {
-			class_id: category_id,
-			category_id,
-			kind: CLASS_KIND_CATEGORY,
-		};
-	return {
-		class_id: class_info.id,
-		category_id: category_id ?? 0,
-		kind: CLASS_KIND_EXACT,
-	};
-}
-
-function add_classifier_entry(entries, seen, key, entry, errors, label) {
-	const prior = seen[key];
-	if (prior) {
-		if (sprintf('%J', prior.hint) != sprintf('%J', entry.hint))
-			push(errors, `${label}: conflicting classifier evidence for '${key}'`);
-		return;
-	}
-	seen[key] = entry;
-	push(entries, entry);
-}
-
 export function compile(config, epoch) {
 	epoch ??= clock()[0];
 	const schema_supported = '' + (config.schema_version ?? '') == '4';
@@ -271,7 +172,7 @@ export function compile(config, epoch) {
 	if (!provisional_app_verdict)
 		provisional_app_verdict = 'allow';
 	if (provisional_app_verdict != 'allow') {
-		push(errors, 'V4.1 only supports provisional application verdict allow');
+		push(errors, 'Only provisional application verdict allow is supported');
 		provisional_app_verdict = 'allow';
 	}
 
@@ -310,120 +211,25 @@ export function compile(config, epoch) {
 			subject_owner['' + subject_id] = id;
 	}
 
+	const classification_model = classification.compile_profiles(config.app_classes);
+	for (let error in classification_model.errors)
+		push(errors, error);
+	for (let warning in classification_model.warnings)
+		push(warnings, warning);
 	let classes = {
 		'0': { id: CLASS_DEFAULT, name: 'Application policy default', kind: 'default', parent_id: null },
 		'1': { id: CLASS_UNCLASSIFIED, name: 'Unclassified', kind: 'unclassified', parent_id: null },
 	};
-	let configured_class_ids = [];
-	for (let app_class in (config.app_classes ?? [])) {
-		const id = parse_uint(app_class.id ?? app_class.class_id, MAX_CLASS_ID);
-		const label = app_class.name ?? app_class.section ?? app_class.id ?? 'class';
-		if (id == null || id <= CLASS_UNCLASSIFIED) {
-			push(errors, `${label}: class_id must be an integer from 2 to ${MAX_CLASS_ID}`);
-			continue;
-		}
-		if (classes['' + id]) {
-			push(errors, `${label}: duplicate class_id ${id}`);
-			continue;
-		}
-		const parent_id = app_class.parent_id == null || trim('' + app_class.parent_id) == ''
-			? null : parse_uint(app_class.parent_id, MAX_CLASS_ID);
-		if (app_class.parent_id != null && parent_id == null)
-			push(errors, `${label}: invalid parent class '${app_class.parent_id}'`);
-		classes['' + id] = {
-			id,
-			name: label,
-			kind: app_class.kind == 'category' ? 'category' : 'application',
-			parent_id,
-			domains: normalized_strings(app_class.domains),
-			tcp_ports: normalized_strings(app_class.tcp_ports),
-			udp_ports: normalized_strings(app_class.udp_ports),
-			ipv4_prefixes: normalized_strings(app_class.ipv4_prefixes),
-			ipv6_prefixes: normalized_strings(app_class.ipv6_prefixes),
-			signature_source: app_class.signature_source ?? 'user-configured',
-			signature_license: app_class.signature_license ?? 'user-configured',
-		};
-		push(configured_class_ids, id);
-	}
-	validate_class_graph(classes, configured_class_ids, errors);
-	for (let class_id in configured_class_ids)
-		classes['' + class_id].category_id = runtime_category_id(classes, class_id);
-
-	let classifier = {
-		ports: [],
-		ipv4_prefixes: [],
-		ipv6_prefixes: [],
-		domains: [],
-	};
-	let port_seen = {}, ipv4_seen = {}, ipv6_seen = {}, domain_seen = {};
-	for (let class_id in configured_class_ids) {
-		const class_info = classes['' + class_id];
-		const direct_hint = classifier_hint(classes, class_info, false);
-		const port_hint = classifier_hint(classes, class_info, true);
-
-		for (let protocol, values in { '6': class_info.tcp_ports, '17': class_info.udp_ports }) {
-			for (let value in values) {
-				const port = parse_uint(value, 65535);
-				if (port == null || port == 0) {
-					push(errors, `${class_info.name}: invalid destination port '${value}'`);
-					continue;
-				}
-				if (!port_hint) {
-					push(warnings, `${class_info.name}: port-only evidence was ignored because the application has no category parent`);
-					continue;
-				}
-				const entry = { protocol: +protocol, port, hint: port_hint };
-				add_classifier_entry(classifier.ports, port_seen,
-					`${protocol}/${port}`, entry, errors, class_info.name);
-			}
-		}
-		for (let prefix in class_info.ipv4_prefixes) {
-			if (!match(prefix, /^[0-9.]+\/[0-9]{1,2}$/)) {
-				push(errors, `${class_info.name}: invalid IPv4 prefix '${prefix}'`);
-				continue;
-			}
-			const entry = { prefix, hint: direct_hint };
-			add_classifier_entry(classifier.ipv4_prefixes, ipv4_seen,
-				prefix, entry, errors, class_info.name);
-		}
-		for (let prefix in class_info.ipv6_prefixes) {
-			if (!match(prefix, /^[0-9a-f:]+\/[0-9]{1,3}$/)) {
-				push(errors, `${class_info.name}: invalid IPv6 prefix '${prefix}'`);
-				continue;
-			}
-			const entry = { prefix, hint: direct_hint };
-			add_classifier_entry(classifier.ipv6_prefixes, ipv6_seen,
-				prefix, entry, errors, class_info.name);
-		}
-		for (let domain in class_info.domains) {
-			if (!match(domain, /^(\*\.)?[a-z0-9_-]+(\.[a-z0-9_-]+)+$/)) {
-				push(errors, `${class_info.name}: invalid domain pattern '${domain}'`);
-				continue;
-			}
-			const entry = { pattern: domain, hint: direct_hint };
-			add_classifier_entry(classifier.domains, domain_seen,
-				domain, entry, errors, class_info.name);
-		}
-	}
-	classifier.signature_count = length(classifier.ports) +
-		length(classifier.ipv4_prefixes) + length(classifier.ipv6_prefixes) +
-		length(classifier.domains);
-	classifier.signature_memory_bytes =
-		length(classifier.ports) * SIGNATURE_MEMORY.port +
-		length(classifier.ipv4_prefixes) * SIGNATURE_MEMORY.ipv4_prefix +
-		length(classifier.ipv6_prefixes) * SIGNATURE_MEMORY.ipv6_prefix;
-	for (let entry in classifier.domains)
-		classifier.signature_memory_bytes += SIGNATURE_MEMORY.domain_base +
-			length(entry.pattern);
-
-	for (let kind, maximum in SIGNATURE_CAPACITY) {
-		if (length(classifier[kind]) > maximum)
-			push(errors, `Classifier ${kind} exceeds capacity ${maximum}`);
-	}
-	if (classifier.signature_memory_bytes >
-	    resource_limits.signature_table_memory_limit)
-		push(errors,
-			`Classifier signature table requires an estimated ${classifier.signature_memory_bytes} bytes, exceeding limit ${resource_limits.signature_table_memory_limit}`);
+	for (let class_id, class_info in classification_model.classes)
+		classes[class_id] = class_info;
+	let configured_class_ids = [ ...classification_model.configured_class_ids ];
+	sort(configured_class_ids);
+	const static_classification = classification.resolve(classification_model,
+		[], epoch, 1, resource_limits);
+	for (let error in static_classification.errors)
+		push(errors, error);
+	for (let warning in static_classification.warnings)
+		push(warnings, warning);
 
 	let rules = [], rules_by_identity = {}, fail_closed_identity = {};
 	for (let rule in (config.app_rules ?? [])) {
@@ -506,7 +312,8 @@ export function compile(config, epoch) {
 		provisional_app_verdict,
 		identities,
 		classes,
-		classifier,
+		classification_model,
+		static_classification,
 		resource_limits,
 		rules,
 		policies,
@@ -541,9 +348,5 @@ export const constants = {
 	CLASS_UNCLASSIFIED,
 	MAX_CLASS_ID,
 	MAX_SUBJECT_ID,
-	CLASS_KIND_EXACT,
-	CLASS_KIND_CATEGORY,
 	RESOURCE_DEFAULTS,
-	SIGNATURE_MEMORY,
-	SIGNATURE_CAPACITY,
 };

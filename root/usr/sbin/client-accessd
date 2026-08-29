@@ -9,6 +9,7 @@ import * as ubus from 'ubus';
 import * as uloop from 'uloop';
 import * as policy from 'client_access.policy';
 import * as app_policy from 'client_access.app_policy';
+import * as classification from 'client_access.classification';
 import * as model from 'client_access.model';
 import * as runtime_policy from 'client_access.runtime';
 
@@ -27,20 +28,20 @@ let app_applied_sources = [];
 let app_applied_destinations = [];
 let generation_floors_loaded = false;
 let app_attached_interfaces = [];
-let dns_subscriber, dns_flush_timer;
+let dns_subscriber, observation_flush_timer;
 let dns_subscribed = false;
-let dns_queue = {};
+let observation_store = {};
+let observation_generation = 1;
+let observation_profile_signature = null;
 let dns_window_epoch = 0;
 let dns_window_events = 0;
 let dns_events_accepted = 0;
 let dns_events_dropped = 0;
-let dns_hint_conflicts = 0;
-let dns_publish_errors = 0;
-let last_config = null;
-let last_compiled = null;
-let last_projection = null;
+let classification_conflicts = 0;
+let projection_publish_errors = 0;
+let observations_expired = 0;
+let observations_stale = 0;
 let last_app_compiled = null;
-let last_subject_projection = null;
 let state = {
 	running: true,
 	applied: false,
@@ -74,8 +75,8 @@ let state = {
 		dns_subscribed: false,
 		dns_events_accepted: 0,
 		dns_events_dropped: 0,
-		dns_hint_conflicts: 0,
-		dns_publish_errors: 0,
+		classification_conflicts: 0,
+		projection_publish_errors: 0,
 		next_transition: null,
 		errors: [],
 		warnings: [],
@@ -129,6 +130,11 @@ function read_config() {
 	uci.foreach('client_access', 'app_class', function(s) {
 		push(config.app_classes, {
 			section: s['.name'],
+			profile_id: s['.name'],
+			profile_schema_version: s.profile_schema_version,
+			profile_source: s.profile_source,
+			profile_license: s.profile_license,
+			profile_provenance: s.profile_provenance,
 			id: s.class_id,
 			name: s.name ?? s['.name'],
 			kind: s.kind,
@@ -138,8 +144,6 @@ function read_config() {
 			udp_ports: as_list(s.udp_port),
 			ipv4_prefixes: as_list(s.ipv4_prefix),
 			ipv6_prefixes: as_list(s.ipv6_prefix),
-			signature_source: s.signature_source,
-			signature_license: s.signature_license,
 		});
 	});
 	uci.foreach('client_access', 'app_rule', function(s) {
@@ -261,8 +265,8 @@ function app_signature(app_compiled, subject_projection, sources, destinations) 
 	});
 }
 
-function classifier_signature(app_compiled) {
-	return sprintf('%J', app_compiled.classifier);
+function classifier_signature(runtime_projection) {
+	return runtime_projection.signature;
 }
 
 function load_generation_floors() {
@@ -287,8 +291,8 @@ function verdict_number(verdict) {
 	return verdict == 'deny' ? 1 : 0;
 }
 
-function app_snapshot(app_compiled, subject_projection, candidate_generation,
-		candidate_classifier_generation) {
+function app_snapshot(app_compiled, runtime_projection, subject_projection,
+		candidate_generation, candidate_classifier_generation) {
 	const limits = app_compiled.resource_limits;
 	let lines = [ sprintf('CONFIG %d %d %d %d %d %d %d %d %d %d %d',
 		app_compiled.enabled ? 1 : 0,
@@ -307,104 +311,80 @@ function app_snapshot(app_compiled, subject_projection, candidate_generation,
 	for (let entry in app_compiled.policies)
 		push(lines, sprintf('POLICY %d %d %d',
 			entry.subject_id, entry.class_id, verdict_number(entry.verdict)));
-	for (let entry in app_compiled.classifier.ports)
+	for (let entry in runtime_projection.ports)
 		push(lines, sprintf('PORT %d %d %d %d %d', entry.protocol, entry.port,
 			entry.hint.class_id, entry.hint.category_id, entry.hint.kind));
-	for (let entry in app_compiled.classifier.ipv4_prefixes)
+	for (let entry in runtime_projection.ipv4_prefixes)
 		push(lines, sprintf('PREFIX4 %s %d %d %d', entry.prefix,
 			entry.hint.class_id, entry.hint.category_id, entry.hint.kind));
-	for (let entry in app_compiled.classifier.ipv6_prefixes)
+	for (let entry in runtime_projection.ipv6_prefixes)
 		push(lines, sprintf('PREFIX6 %s %d %d %d', entry.prefix,
 			entry.hint.class_id, entry.hint.category_id, entry.hint.kind));
 	return join('\n', lines) + '\n';
 }
 
-function clear_dns_queue() {
-	dns_queue = {};
-}
-
-function domain_hint(app_compiled, raw_name) {
-	let name = lc(trim('' + (raw_name ?? '')));
-	name = replace(name, /\.+$/, '');
-	if (!length(name))
-		return null;
-
-	let selected = null, selected_score = -1, conflict = false;
-	for (let entry in (app_compiled.classifier.domains ?? [])) {
-		const pattern = entry.pattern;
-		let score = -1;
-		if (substr(pattern, 0, 2) == '*.') {
-			const suffix = substr(pattern, 1);
-			if (length(name) > length(suffix) &&
-			    substr(name, length(name) - length(suffix)) == suffix)
-				score = length(suffix);
-		}
-		else if (name == pattern) {
-			score = 100000 + length(pattern);
-		}
-
-		if (score > selected_score) {
-			selected = entry.hint;
-			selected_score = score;
-			conflict = false;
-		}
-		else if (score >= 0 && score == selected_score &&
-		         sprintf('%J', selected) != sprintf('%J', entry.hint)) {
-			conflict = true;
-		}
-	}
-
-	return selected_score >= 0 && !conflict ? selected : null;
-}
-
-function dns_queue_size() {
+function observation_store_size() {
 	let count = 0;
-	for (let key in dns_queue)
+	for (let key in observation_store)
 		count++;
 	return count;
 }
 
-function flush_dns_queue() {
-	if (!dns_queue_size())
+function observation_values() {
+	let names = keys(observation_store), result = [];
+	sort(names);
+	for (let name in names)
+		push(result, observation_store[name]);
+	return result;
+}
+
+function prepare_observations(profile_signature) {
+	const profile_changed = observation_profile_signature == null ||
+		observation_profile_signature != profile_signature;
+	return {
+		generation: observation_profile_signature != null && profile_changed
+			? observation_generation + 1 : observation_generation,
+		observations: profile_changed ? [] : observation_values(),
+		profile_signature,
+		profile_changed,
+	};
+}
+
+function commit_observations(context, epoch) {
+	if (context.profile_changed) {
+		observations_stale += observation_store_size();
+		observation_store = {};
+		observation_generation = context.generation;
+		observation_profile_signature = context.profile_signature;
+	}
+	for (let id, observation in observation_store) {
+		if (observation.generation != observation_generation) {
+			delete observation_store[id];
+			observations_stale++;
+		}
+		else if (observation.expires_at <= epoch) {
+			delete observation_store[id];
+			observations_expired++;
+		}
+	}
+}
+
+function flush_observation_updates() {
+	if (!last_app_compiled || !last_app_compiled.requested_enabled)
 		return;
-
-	const batch = dns_queue;
-	dns_queue = {};
-	if (!last_app_compiled || !last_app_compiled.enabled || !classifier_generation)
-		return;
-
-	let lines = [ sprintf('DNSGEN %d', classifier_generation) ];
-	for (let key, entry in batch)
-		push(lines, sprintf('%s %s %d %d %d %d',
-			entry.type == 'A' ? 'DNS4' : 'DNS6', entry.address,
-			entry.hint.class_id, entry.hint.category_id,
-			entry.hint.kind, entry.ttl));
-
-	const result = run_write([ BPFCTL, 'dns-sync' ], join('\n', lines) + '\n');
-	if (!result.ok)
-		dns_publish_errors++;
+	const result = reconcile('classification-observation', false);
+	if (!result.app_filter.applied)
+		projection_publish_errors++;
 }
 
 function queue_dns_result(data) {
-	if (!last_app_compiled || !last_app_compiled.enabled || !classifier_generation)
-		return;
-	if (data.type != 'A' && data.type != 'AAAA')
-		return;
-
-	const hint = domain_hint(last_app_compiled, data.name);
-	if (!hint)
+	if (!last_app_compiled || !last_app_compiled.enabled ||
+	    observation_profile_signature == null)
 		return;
 
-	const address = trim('' + (data.address ?? ''));
-	const ttl_text = trim('' + (data.ttl ?? ''));
-	if (!length(address) || !match(ttl_text, /^(0|[1-9][0-9]*)$/)) {
-		dns_events_dropped++;
-		return;
-	}
-
-	const now = clock()[0];
-	if (now != dns_window_epoch) {
-		dns_window_epoch = now;
+	const epoch = clock()[0];
+	if (epoch != dns_window_epoch) {
+		dns_window_epoch = epoch;
 		dns_window_events = 0;
 	}
 	if (dns_window_events >= 128) {
@@ -413,43 +393,25 @@ function queue_dns_result(data) {
 	}
 	dns_window_events++;
 
-	const key = `${data.type}/${address}`;
-	const was_empty = dns_queue_size() == 0;
-	if (!dns_queue[key] && dns_queue_size() >= 256) {
+	const normalized = classification.normalize_dns_observation(data,
+		observation_generation, epoch);
+	if (!normalized.valid) {
 		dns_events_dropped++;
 		return;
 	}
-	let ttl = +ttl_text;
-	if (ttl < 1)
-		ttl = 1;
-	if (ttl > 86400)
-		ttl = 86400;
-	const queued = dns_queue[key];
-	if (queued && sprintf('%J', queued.hint) != sprintf('%J', hint)) {
-		dns_queue[key] = {
-			type: data.type,
-			address,
-			hint: { class_id: 1, category_id: 0, kind: 0 },
-			ttl: ttl > queued.ttl ? ttl : queued.ttl,
-		};
-		dns_hint_conflicts++;
+	const observation = normalized.observation;
+	if (!observation_store[observation.id] && observation_store_size() >= 256) {
+		dns_events_dropped++;
+		return;
 	}
-	else if (!queued || queued.hint.kind != 0) {
-		dns_queue[key] = {
-			type: data.type,
-			address,
-			hint,
-			ttl: queued && queued.ttl > ttl ? queued.ttl : ttl,
-		};
-	}
+	observation_store[observation.id] = observation;
 	dns_events_accepted++;
 
-	if (was_empty) {
-		if (!dns_flush_timer)
-			dns_flush_timer = uloop.timer(100, function() { flush_dns_queue(); });
-		else
-			dns_flush_timer.set(100);
-	}
+	if (!observation_flush_timer)
+		observation_flush_timer = uloop.timer(100,
+			function() { flush_observation_updates(); });
+	else
+		observation_flush_timer.set(100);
 }
 
 function ensure_dns_subscription() {
@@ -517,7 +479,6 @@ function neutralize_app_runtime(errors) {
 	classifier_applied_signature = null;
 	app_applied_sources = [];
 	app_applied_destinations = [];
-	clear_dns_queue();
 	return {
 		ok: (disabled.code == null || disabled.code == 0) &&
 			(pruned.code == null || pruned.code == 0) && scope.ok,
@@ -543,16 +504,19 @@ function runtime_flow_offload() {
 	};
 }
 
-function apply_app_filter(config, app_compiled, subject_projection, sources,
-		destinations, zone_errors, force) {
-	let errors = [ ...app_compiled.errors, ...subject_projection.errors, ...zone_errors ];
-	let warnings = [ ...app_compiled.warnings ];
+function apply_app_filter(config, app_compiled, classification_state,
+		subject_projection, sources, destinations, zone_errors, force) {
+	let errors = [ ...app_compiled.errors, ...classification_state.errors,
+		...subject_projection.errors, ...zone_errors ];
+	let warnings = [ ...app_compiled.warnings, ...classification_state.warnings ];
+	const runtime_projection = classification_state.runtime_projection;
 	const previously_enabled = app_applied_signature != null && length(app_attached_interfaces) > 0;
 	const previous_interfaces = {};
 	for (let ifname in app_attached_interfaces)
 		previous_interfaces[ifname] = true;
 
 	if (!app_compiled.requested_enabled) {
+		observation_store = {};
 		const neutral = neutralize_app_runtime(errors);
 		return {
 			ok: neutral.ok,
@@ -688,14 +652,14 @@ function apply_app_filter(config, app_compiled, subject_projection, sources,
 	const signature = app_signature(app_compiled, subject_projection, sources, destinations);
 	const changed = signature != app_applied_signature;
 	const candidate_generation = changed ? app_policy_generation + 1 : app_policy_generation;
-	const current_classifier_signature = classifier_signature(app_compiled);
+	const current_classifier_signature = classifier_signature(runtime_projection);
 	const classifier_changed = current_classifier_signature != classifier_applied_signature;
 	const candidate_classifier_generation = classifier_changed
 		? classifier_generation + 1 : classifier_generation;
 	if (force || changed || classifier_changed) {
 		const result = run_write([ BPFCTL, 'sync' ],
-			app_snapshot(app_compiled, subject_projection, candidate_generation,
-				candidate_classifier_generation));
+			app_snapshot(app_compiled, runtime_projection, subject_projection,
+				candidate_generation, candidate_classifier_generation));
 		if (!result.ok) {
 			push(errors, result.error);
 			for (let ifname in attached)
@@ -717,10 +681,8 @@ function apply_app_filter(config, app_compiled, subject_projection, sources,
 		}
 		if (changed)
 			app_policy_generation = candidate_generation;
-		if (classifier_changed) {
+		if (classifier_changed)
 			classifier_generation = candidate_classifier_generation;
-			clear_dns_queue();
-		}
 	}
 	const scope = apply_app_nft_scope(true, sources, destinations);
 	if (!scope.ok) {
@@ -797,11 +759,11 @@ function app_runtime_snapshot(enabled, policy_generation,
 function current_status() {
 	let result = { ...state, app_filter: { ...(state.app_filter ?? {}) } };
 	result.app_filter.dns_subscribed = dns_subscribed;
-	result.app_filter.dns_queue_entries = dns_queue_size();
+	result.app_filter.observation_entries = observation_store_size();
 	result.app_filter.dns_events_accepted = dns_events_accepted;
 	result.app_filter.dns_events_dropped = dns_events_dropped;
-	result.app_filter.dns_hint_conflicts = dns_hint_conflicts;
-	result.app_filter.dns_publish_errors = dns_publish_errors;
+	result.app_filter.classification_conflicts = classification_conflicts;
+	result.app_filter.projection_publish_errors = projection_publish_errors;
 	if (result.app_filter.enabled && stat(BPFCTL)) {
 		const runtime = run_capture([ BPFCTL, 'health',
 			'' + result.app_filter.app_policy_generation,
@@ -863,12 +825,17 @@ function apply_nft(compiled, projection, sources, destinations) {
 		: { ok: false, error: `nft transaction failed with exit code ${code}` };
 }
 
-function update_timer(config, compiled, app_compiled, epoch) {
+function update_timer(config, compiled, app_compiled, classification_state, epoch) {
 	let delay = policy.safety_delay_ms(compiled, epoch, config.safety_interval);
 	if (app_compiled.requested_enabled && app_compiled.next_transition != null) {
 		const app_delay = (app_compiled.next_transition - epoch) * 1000;
 		if (app_delay > 0 && app_delay < delay)
 			delay = app_delay;
+	}
+	if (app_compiled.requested_enabled && classification_state.next_expiry != null) {
+		const expiry_delay = (classification_state.next_expiry - epoch) * 1000;
+		if (expiry_delay > 0 && expiry_delay < delay)
+			delay = expiry_delay;
 	}
 	timer.set(delay);
 }
@@ -885,9 +852,18 @@ function compile_runtime(config, epoch) {
 	const compiled = policy.compile(config, epoch);
 	const projection = model.project(compiled, config.bindings);
 	const app_compiled = app_policy.compile(config, epoch);
+	const observation_context = prepare_observations(
+		app_compiled.classification_model.signature);
+	const classification_state = classification.resolve(
+		app_compiled.classification_model,
+		observation_context.observations,
+		epoch,
+		observation_context.generation,
+		app_compiled.resource_limits);
 	const subject_projection = model.project_subjects(app_compiled, config.bindings);
 	const consistency = app_policy.consistency(compiled, app_compiled);
-	return { compiled, projection, app_compiled, subject_projection, consistency };
+	return { compiled, projection, app_compiled, classification_state,
+		observation_context, subject_projection, consistency };
 }
 
 function reconcile(reason, force) {
@@ -898,6 +874,7 @@ function reconcile(reason, force) {
 	const compiled = runtime.compiled;
 	const projection = runtime.projection;
 	const app_compiled = runtime.app_compiled;
+	const classification_state = runtime.classification_state;
 	const subject_projection = runtime.subject_projection;
 	const source = compiled.enabled || app_compiled.requested_enabled
 		? resolve_zones(config.source_zone)
@@ -926,8 +903,8 @@ function reconcile(reason, force) {
 	else
 		push(errors, apply.error);
 
-	let app_apply = apply_app_filter(config, app_compiled, subject_projection,
-		source.interfaces, destination.interfaces,
+	let app_apply = apply_app_filter(config, app_compiled, classification_state,
+		subject_projection, source.interfaces, destination.interfaces,
 		[ ...source.errors, ...destination.errors ], force);
 	let app_runtime = app_runtime_snapshot(app_apply.enabled,
 		app_apply.generation, app_apply.classifier_generation,
@@ -950,6 +927,8 @@ function reconcile(reason, force) {
 		push(app_apply.warnings, app_runtime.error);
 	for (let warning in runtime.consistency.warnings)
 		push(app_apply.warnings, warning);
+	if (app_apply.ok && app_apply.enabled)
+		commit_observations(runtime.observation_context, epoch);
 
 	const configuration_ready = compiled.schema_supported && compiled.mode_valid;
 	const synchronized = apply.ok && configuration_ready && !length(readiness_errors);
@@ -957,11 +936,8 @@ function reconcile(reason, force) {
 		(length(readiness_errors) ? join('; ', readiness_errors) :
 		 (!configuration_ready ? join('; ', compiled.errors) : null));
 
-	last_config = config;
-	last_compiled = compiled;
-	last_projection = projection;
 	last_app_compiled = app_compiled;
-	last_subject_projection = subject_projection;
+	classification_conflicts = classification_state.semantic_state.conflict_count;
 	state = {
 		running: true,
 		applied: synchronized,
@@ -997,17 +973,25 @@ function reconcile(reason, force) {
 			applied: app_apply.ok,
 			app_policy_generation: app_apply.generation,
 			classifier_generation: app_apply.classifier_generation,
-			classifier_signature_count: app_compiled.classifier.signature_count,
-			classifier_signature_memory_bytes: app_compiled.classifier.signature_memory_bytes,
+			classifier_signature_count: classification_state.runtime_projection.signature_count,
+			classifier_signature_memory_bytes: classification_state.runtime_projection.signature_memory_bytes,
+			profile_count: app_compiled.classification_model.profile_count,
+			classification_ir_entry_count: app_compiled.classification_model.ir_entry_count,
+			semantic_entry_count: length(classification_state.semantic_state.entries),
+			runtime_projection_entry_count: classification_state.runtime_projection.signature_count,
+			provider_count: length(classification_state.semantic_state.provider_ids),
 			resource_limits: app_compiled.resource_limits,
 			runtime_available: app_runtime.available,
 			runtime_status_json: app_runtime.status_json,
 			dns_subscribed,
-			dns_queue_entries: dns_queue_size(),
+			observation_entries: observation_store_size(),
+			observation_generation,
+			observations_expired,
+			observations_stale,
 			dns_events_accepted,
 			dns_events_dropped,
-			dns_hint_conflicts,
-			dns_publish_errors,
+			classification_conflicts,
+			projection_publish_errors,
 			next_transition: app_compiled.next_transition,
 			subject_count: length(app_compiled.identities),
 			selector_count: length(subject_projection.preview_selectors),
@@ -1017,7 +1001,7 @@ function reconcile(reason, force) {
 		},
 	};
 
-	update_timer(config, compiled, app_compiled, epoch);
+	update_timer(config, compiled, app_compiled, classification_state, epoch);
 	return state;
 }
 
@@ -1130,6 +1114,7 @@ published = conn.publish('client_access', {
 				compiled: runtime.compiled,
 				projection: runtime.projection,
 				app_compiled: runtime.app_compiled,
+				classification_state: runtime.classification_state,
 				subject_projection: runtime.subject_projection,
 				consistency: runtime.consistency,
 				clock: epoch,

@@ -47,6 +47,11 @@ export function run() {
 		fs_stub.advance();
 		reconcile('generation-retry-test');
 	}
+	else if (scenario == 'projection_failure') {
+		uci_stub.advance();
+		fs_stub.advance();
+		reconcile('projection-failure-test');
+	}
 
 	const status = service.status.call();
 	const app = status.app_filter ?? {};
@@ -61,6 +66,12 @@ export function run() {
 		if (app.backend_mode != 'V4_BPF_BASIC' || !app.enabled ||
 		    !app.retained_previous_snapshot || !runtime.scope_active)
 			fail('fw4 scope loss was not restored before retaining V4');
+	}
+	else if (scenario == 'projection_failure') {
+		if (app.backend_mode != 'V4_BPF_BASIC' || !app.enabled ||
+		    !app.degraded || !app.retained_previous_snapshot ||
+		    length(runtime.policy_generations) != 1 || !runtime.scope_active)
+			fail(`failed projection did not retain the previous complete snapshot: app=${sprintf('%J', app)} runtime=${sprintf('%J', runtime)}`);
 	}
 	else if (scenario == 'generation_nonreuse') {
 		if (app.backend_mode != 'V4_BPF_BASIC' || app.app_policy_generation != 3 ||

@@ -209,7 +209,7 @@ function applicationStatusPanel(status) {
 		E('details', {}, [
 			E('summary', {}, [ _('Application diagnostics') ]),
 			E('p', {}, [
-				_('Packets still pass the application layer while a new flow is pending. V4.1 inspects one early packet, so a denied application has a small initial leakage window.')
+				_('Packets still pass the application layer while a new flow is pending. One early packet is inspected, so a denied application has a small initial leakage window.')
 			]),
 			E('div', { 'class': 'table' }, [
 				E('div', { 'class': 'tr' }, [
@@ -235,6 +235,12 @@ function applicationStatusPanel(status) {
 					E('div', { 'class': 'td left' }, [ appStatus.dns_subscribed ? _('Subscribed') : _('Unavailable') ]),
 					E('div', { 'class': 'td left' }, [ _('DNS events accepted / dropped') ]),
 					E('div', { 'class': 'td left' }, [ '%s / %s'.format(appStatus.dns_events_accepted || 0, appStatus.dns_events_dropped || 0) ])
+				]),
+				E('div', { 'class': 'tr' }, [
+					E('div', { 'class': 'td left' }, [ _('Profiles / normalized evidence') ]),
+					E('div', { 'class': 'td left' }, [ '%s / %s'.format(appStatus.profile_count || 0, appStatus.classification_ir_entry_count || 0) ]),
+					E('div', { 'class': 'td left' }, [ _('Semantic / runtime entries') ]),
+					E('div', { 'class': 'td left' }, [ '%s / %s'.format(appStatus.semantic_entry_count || 0, appStatus.runtime_projection_entry_count || 0) ])
 				]),
 				E('div', { 'class': 'tr' }, [
 					E('div', { 'class': 'td left' }, [ _('Signature table estimate') ]),
@@ -619,7 +625,7 @@ return view.extend({
 		o = s.taboption('applications', form.DummyValue, '_pending_behavior', _('New-flow behavior'));
 		o.depends('app_filter_enabled', '1');
 		o.cfgvalue = function() { return _('Allow packets during the initial classification window'); };
-		o.description = _('V4.1 uses one-packet best-effort classification. This is suitable for parental controls, not zero-leak security enforcement.');
+		o.description = _('Application classification is one-packet best effort. This is suitable for parental controls, not zero-leak security enforcement.');
 
 		o = s.taboption('advanced', form.ListValue, 'deny_action', _('When access is blocked'));
 		o.value('reject', _('Reject the connection'));
@@ -766,8 +772,10 @@ return view.extend({
 			const result = addClass.call(this, ev, sectionId);
 			uci.set('client_access', sectionId, 'class_id', randomClassId());
 			uci.set('client_access', sectionId, 'kind', 'application');
-			uci.set('client_access', sectionId, 'signature_source', 'user-configured');
-			uci.set('client_access', sectionId, 'signature_license', 'user-configured');
+			uci.set('client_access', sectionId, 'profile_schema_version', '1');
+			uci.set('client_access', sectionId, 'profile_source', 'user-configured');
+			uci.set('client_access', sectionId, 'profile_license', 'user-configured');
+			uci.set('client_access', sectionId, 'profile_provenance', 'local');
 			return result;
 		};
 		const removeClass = s.handleRemove;
@@ -785,6 +793,7 @@ return view.extend({
 		};
 		s.tab('identity', _('Identity'));
 		s.tab('evidence', _('Classification evidence'));
+		s.tab('metadata', _('Profile metadata'));
 
 		o = s.option(form.DummyValue, '_catalog_name', _('Name'));
 		o.modalonly = false;
@@ -822,6 +831,27 @@ return view.extend({
 		o.depends('kind', 'application');
 		o.rmempty = true;
 		o.description = _('A broad category provides a safe fallback when evidence cannot identify the exact application.');
+
+		o = s.taboption('metadata', form.DummyValue, '_profile_id', _('Stable Profile ID'));
+		o.cfgvalue = function(sectionId) { return sectionId; };
+		o.description = _('This stable identifier is independent of the display name and access rules.');
+
+		o = s.taboption('metadata', form.Value, 'profile_schema_version', _('Profile schema'));
+		o.default = '1';
+		o.datatype = 'uinteger';
+		o.rmempty = false;
+
+		o = s.taboption('metadata', form.Value, 'profile_source', _('Source'));
+		o.default = 'user-configured';
+		o.rmempty = false;
+
+		o = s.taboption('metadata', form.Value, 'profile_license', _('License'));
+		o.default = 'user-configured';
+		o.rmempty = false;
+
+		o = s.taboption('metadata', form.Value, 'profile_provenance', _('Provenance'));
+		o.default = 'local';
+		o.rmempty = false;
 
 		o = s.taboption('evidence', form.DynamicList, 'domain', _('Domains'));
 		o.placeholder = '*.video.example';

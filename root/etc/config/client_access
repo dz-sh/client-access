@@ -36,6 +36,10 @@ config client_access 'main'
 # class_id 0 is APP_POLICY_DEFAULT and class_id 1 is UNCLASSIFIED.
 #
 # config app_class
+#	option profile_schema_version '1'
+#	option profile_source 'user-configured'
+#	option profile_license 'user-configured'
+#	option profile_provenance 'local'
 #	option class_id '100'
 #	option name 'Example video application'
 #	option kind 'application'

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-/* V41-OFF-001..003: V4.1 supports refusal, not offload coordination. Keep the
+/* V4.2 preserves refusal rather than adding offload coordination. Keep the
  * decision pure so the daemon and remote policy tests exercise identical
  * semantics.
  */

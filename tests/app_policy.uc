@@ -58,7 +58,7 @@ let result = app_policy.compile(config('0'), monday_0900);
 assert_equal(result.requested_enabled, false, 'application workflow is disabled independently');
 assert_equal(result.enabled, false, 'disabled application workflow remains inactive');
 assert_equal(result.unknown_subject_app_verdict, 'allow', 'unknown subject has an independent neutral app verdict');
-assert_equal(result.provisional_app_verdict, 'allow', 'V4.1 provisional app verdict is allow');
+assert_equal(result.provisional_app_verdict, 'allow', 'provisional app verdict is allow');
 
 result = app_policy.compile(config('1'), monday_0900);
 assert_equal(result.enabled, true, 'valid application workflow can be enabled');
@@ -72,22 +72,29 @@ assert_equal(result.resource_limits, {
 	max_new_classifications_per_second: 512,
 	per_subject_new_classification_rate: 64,
 	signature_table_memory_limit: 262144,
-}, 'V4.1 compiles explicit bounded resource defaults');
-assert_equal(result.classifier.ports, [ {
+}, 'application policy compiles explicit bounded resource defaults');
+assert_equal(result.static_classification.runtime_projection.ports, [ {
 	protocol: 6,
 	port: 443,
 	hint: { class_id: 10, category_id: 10, kind: 2 },
 } ], 'port-only evidence compiles to a category hint');
-assert_equal(result.classifier.ipv4_prefixes, [ {
+assert_equal(result.static_classification.runtime_projection.ipv4_prefixes, [ {
 	prefix: '192.0.2.0/24',
 	hint: { class_id: 100, category_id: 10, kind: 1 },
 } ], 'static prefix evidence can identify an exact application');
-assert_equal(result.classifier.domains, [ {
-	pattern: '*.youtube.example',
+let domain_ir = [];
+for (let entry in result.classification_model.ir)
+	if (entry.primitive == 'domain_suffix')
+		push(domain_ir, entry);
+assert_equal(domain_ir, [ {
+	primitive: 'domain_suffix',
+	value: 'youtube.example',
+	subdomains_only: true,
+	profile_id: 'native:100',
 	hint: { class_id: 100, category_id: 10, kind: 1 },
-} ], 'domain evidence compiles for bounded DNS correlation');
-assert_equal(result.classifier.signature_memory_bytes, 433,
-	'signature admission accounts for map overhead and domain storage');
+} ], 'domain evidence normalizes through backend-independent Classification IR');
+assert_equal(result.static_classification.runtime_projection.signature_memory_bytes, 431,
+	'signature admission accounts for runtime projection and Profile domain storage');
 
 let independent_limits = config('1');
 independent_limits.max_new_classifications_per_second = '1';
@@ -185,7 +192,7 @@ assert_equal(length(result.errors) > 0, true, 'classifier conflicts are diagnose
 let invalid_limits = config('1');
 invalid_limits.max_packets_inspected = '2';
 result = app_policy.compile(invalid_limits, monday_0900);
-assert_equal(result.enabled, false, 'V4.1 rejects multi-packet inspection configuration');
+assert_equal(result.enabled, false, 'application policy rejects multi-packet inspection configuration');
 
 let oversized_signatures = config('1');
 oversized_signatures.signature_table_memory_limit = '4096';
@@ -195,7 +202,7 @@ for (let i = 0; i < 32; i++)
 result = app_policy.compile(oversized_signatures, monday_0900);
 assert_equal(result.enabled, false,
 	'signature table exceeding its explicit memory budget is not published');
-assert_equal(result.classifier.signature_memory_bytes > 4096, true,
+assert_equal(result.static_classification.runtime_projection.signature_memory_bytes > 4096, true,
 	'signature memory estimate reports the rejected footprint');
 
 let invalid_domain = config('1');

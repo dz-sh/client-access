@@ -120,24 +120,6 @@ CA_IPV6_MAP(ca_ipv6_b);
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, CA_MAX_DNS4_HINTS);
-	__uint(map_flags, BPF_F_NO_PREALLOC);
-	__type(key, __be32);
-	__type(value, struct ca_dns_hint);
-	__uint(pinning, LIBBPF_PIN_BY_NAME);
-} ca_dns4 SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, CA_MAX_DNS6_HINTS);
-	__uint(map_flags, BPF_F_NO_PREALLOC);
-	__type(key, struct ca_ipv6_addr_key);
-	__type(value, struct ca_dns_hint);
-	__uint(pinning, LIBBPF_PIN_BY_NAME);
-} ca_dns6 SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, CA_MAX_FLOWS);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__type(key, struct ca_flow_key);
@@ -387,6 +369,8 @@ static __always_inline int ca_merge_hint(struct ca_class_hint *result,
 {
 	if (!candidate || candidate->kind == CA_CLASS_KIND_NONE)
 		return 0;
+	if (candidate->kind == CA_CLASS_KIND_UNCLASSIFIED)
+		return -1;
 	if (result->kind == CA_CLASS_KIND_NONE) {
 		*result = *candidate;
 		return 0;
@@ -408,50 +392,8 @@ static __always_inline int ca_merge_hint(struct ca_class_hint *result,
 	return -1;
 }
 
-static __always_inline const struct ca_class_hint *
-ca_dns4_lookup(__be32 address, __u32 generation, __u64 now)
-{
-	struct ca_dns_hint *entry = bpf_map_lookup_elem(&ca_dns4, &address);
-
-	if (!entry)
-		return NULL;
-	if (entry->classifier_generation != generation) {
-		bpf_map_delete_elem(&ca_dns4, &address);
-		return NULL;
-	}
-	if (entry->expires_ns && entry->expires_ns <= now) {
-		bpf_map_delete_elem(&ca_dns4, &address);
-		ca_stat_inc(CA_STAT_DNS_HINT_EXPIRED);
-		return NULL;
-	}
-	return &entry->hint;
-}
-
-static __always_inline const struct ca_class_hint *
-ca_dns6_lookup(const __u8 address[16], __u32 generation, __u64 now)
-{
-	struct ca_ipv6_addr_key key = {};
-	struct ca_dns_hint *entry;
-
-	__builtin_memcpy(key.addr, address, sizeof(key.addr));
-	entry = bpf_map_lookup_elem(&ca_dns6, &key);
-
-	if (!entry)
-		return NULL;
-	if (entry->classifier_generation != generation) {
-		bpf_map_delete_elem(&ca_dns6, &key);
-		return NULL;
-	}
-	if (entry->expires_ns && entry->expires_ns <= now) {
-		bpf_map_delete_elem(&ca_dns6, &key);
-		ca_stat_inc(CA_STAT_DNS_HINT_EXPIRED);
-		return NULL;
-	}
-	return &entry->hint;
-}
-
 static __always_inline void ca_classify(const struct ca_config *config,
-						 const struct ca_flow_key *key, __u64 now,
+						 const struct ca_flow_key *key,
 						 __u16 *class_id, __u8 *class_kind)
 {
 	struct ca_class_hint result = {};
@@ -464,9 +406,6 @@ static __always_inline void ca_classify(const struct ca_config *config,
 			.addr = key->addr.v4.dst,
 		};
 
-		hint = ca_dns4_lookup(key->addr.v4.dst,
-						 config->classifier_generation, now);
-		conflict |= ca_merge_hint(&result, hint);
 		hint = ca_ipv4_lookup(config, &prefix);
 		conflict |= ca_merge_hint(&result, hint);
 	}
@@ -474,9 +413,6 @@ static __always_inline void ca_classify(const struct ca_config *config,
 		struct ca_ipv6_lpm_key prefix = { .prefixlen = 128 };
 
 		__builtin_memcpy(prefix.addr, key->addr.v6.dst, 16);
-		hint = ca_dns6_lookup(key->addr.v6.dst,
-						 config->classifier_generation, now);
-		conflict |= ca_merge_hint(&result, hint);
 		hint = ca_ipv6_lookup(config, &prefix);
 		conflict |= ca_merge_hint(&result, hint);
 	}
@@ -624,7 +560,7 @@ static __always_inline bool ca_try_terminal(const struct ca_config *config,
 {
 	bool budget;
 
-	ca_classify(config, key, now, &flow->class_id, &flow->class_kind);
+	ca_classify(config, key, &flow->class_id, &flow->class_kind);
 	budget = ca_budget_exhausted(config, flow, now);
 	if (flow->class_kind != CA_CLASS_KIND_NONE)
 		flow->classification_state = CA_FLOW_CLASSIFIED;
@@ -803,7 +739,7 @@ int ca_ingress(struct __sk_buff *skb)
 			initial.classification_state == CA_FLOW_UNCLASSIFIED_FINAL);
 	}
 
-	/* The first admitted packet uses the explicit optimistic V4.1 verdict. */
+	/* The first admitted packet uses the explicit optimistic verdict. */
 	return ca_emit_app_verdict(skb, config->provisional_app_verdict);
 }
 

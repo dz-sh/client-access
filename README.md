@@ -68,12 +68,17 @@ bounded classification evidence, then attach allow or block rules to an
 identity. Application rules have their own always, never, or weekly schedule
 and remain independent from the global nftables policy.
 
-V4.1 is best effort: it allows packets in a small initial window while
-classifying one early packet of a new flow, uses DNS/IP/port metadata rather
-than full DPI, and treats ambiguous or
-encrypted traffic as unclassified. LuCI reports classification coverage and
-resource shedding. Software and hardware flow offloading must be disabled
-while this layer is enabled.
+Application knowledge is stored as reusable Profiles, independently from
+identity access rules. Classification complexity belongs in userspace. The
+datapath consumes precomputed classification state. A datapath miss MUST NOT
+invoke a userspace classification slow path.
+
+V4.2 remains best effort: it allows packets in a small initial window while
+classifying one early packet of a new flow, uses bounded DNS/IP/port evidence
+rather than full DPI, and treats ambiguous or encrypted traffic as
+unclassified. LuCI reports classification coverage and resource shedding.
+Software and hardware flow offloading must be disabled while this layer is
+enabled.
 
 ## Usage
 
@@ -103,14 +108,14 @@ Network → Client Access
 - Names and addresses are best-effort discovery information and may be stale or
   incomplete.
 
-## Compatibility
+## Supported platforms
 
 The application currently targets firewall4/nftables on OpenWrt and
 ImmortalWrt. The firewall4 `auto_includes` option must remain enabled.
 The optional application backend reserves firewall mark mask `0x60000000`;
 custom VPN, QoS, or policy-routing rules must not use those two bits.
 
-The reproducible V4.1 package baselines are OpenWrt 24.10.8 x86_64 and
+The reproducible V4.2 package baselines are OpenWrt 24.10.8 x86_64 and
 ImmortalWrt 24.10.6 x86_64. Automated datapath coverage includes a Linux
 bridge, 802.1Q VLAN, IPv4 forwarding, and routed IPv6 forwarding. This does not
 claim validation of DSA, PPPoE, big-endian targets, vendor-specific hardware,

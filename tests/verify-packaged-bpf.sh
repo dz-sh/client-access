@@ -78,7 +78,7 @@ sudo ip netns exec ca-pkg-ns ping -c 1 -W 1 192.0.2.1
 sudo "$work_dir/client-access-bpfctl" status >"$work_dir/status.json"
 jq -e '
 	.backend_mode == "V4_BPF_BASIC" and
-	.bpf_schema_version == 3 and
+	.bpf_schema_version == 4 and
 	.program_pinned == true and
 	.maps_pinned == true and
 	.flow_map_entries >= 1 and

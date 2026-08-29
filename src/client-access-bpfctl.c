@@ -30,12 +30,8 @@
 static const char *const map_names[] = {
 	"ca_config", "ca_mark_schema", "ca_subject_a", "ca_subject_b", "ca_policy_a",
 	"ca_policy_b", "ca_port_a", "ca_port_b", "ca_ipv4_a", "ca_ipv4_b",
-	"ca_ipv6_a", "ca_ipv6_b", "ca_dns4", "ca_dns6", "ca_flows",
+	"ca_ipv6_a", "ca_ipv6_b", "ca_flows",
 	"ca_global_rate", "ca_subject_rates", "ca_runtime", "ca_stats",
-};
-
-static const char *const legacy_map_names[] = {
-	"ca_destination_a", "ca_destination_b",
 };
 
 struct subject_entry {
@@ -90,7 +86,6 @@ static void usage(FILE *out)
 		"  detach IFNAME          detach this application's TC ingress filter\n"
 		"  prune [IFNAME ...]     keep owned filters only on listed interfaces\n"
 		"  sync                   validate stdin snapshot and atomically publish it\n"
-		"  dns-sync               publish a bounded batch of DNS classification hints\n"
 		"  gc [IDLE_SECONDS]      expire idle cached flows\n"
 		"  generations            print policy and classifier generation floors\n"
 		"  health POLICY CLASSIFIER IFNAME [IFNAME ...]\n"
@@ -363,10 +358,6 @@ static void unlink_pins(void)
 		if (!pin_path(path, sizeof(path), map_names[i]))
 			unlink(path);
 	}
-	for (size_t i = 0; i < ARRAY_SIZE(legacy_map_names); i++) {
-		if (!pin_path(path, sizeof(path), legacy_map_names[i]))
-			unlink(path);
-	}
 }
 
 static int ensure_pin_root(void)
@@ -397,7 +388,7 @@ static int load_object(const char *path, bool replace)
 		fprintf(stderr, "refusing to replace BPF state while an owned TC filter remains attached\n");
 		return 1;
 	}
-	/* Remove partial or schema-incompatible pins before loading this object. */
+	/* Recover an unusable pin set by loading one complete current object. */
 	unlink_pins();
 
 	object = bpf_object__open_file(path, &open_opts);
@@ -622,6 +613,13 @@ static int append_ipv6(struct snapshot *snapshot, const struct ipv6_entry *entry
 static int parse_hint(unsigned int class_id, unsigned int category_id,
 			      unsigned int kind, struct ca_class_hint *hint)
 {
+	if (kind == CA_CLASS_KIND_UNCLASSIFIED &&
+	    class_id == CA_CLASS_UNCLASSIFIED && category_id == 0) {
+		hint->class_id = class_id;
+		hint->category_id = 0;
+		hint->kind = kind;
+		return 0;
+	}
 	if (class_id <= CA_CLASS_UNCLASSIFIED || class_id > UINT16_MAX ||
 	    category_id > UINT16_MAX ||
 	    (kind != CA_CLASS_KIND_EXACT && kind != CA_CLASS_KIND_CATEGORY))
@@ -632,17 +630,6 @@ static int parse_hint(unsigned int class_id, unsigned int category_id,
 	hint->category_id = category_id;
 	hint->kind = kind;
 	return 0;
-}
-
-static int parse_dns_hint(unsigned int class_id, unsigned int category_id,
-				  unsigned int kind, struct ca_class_hint *hint)
-{
-	if (kind == CA_CLASS_KIND_NONE && class_id == CA_CLASS_UNCLASSIFIED &&
-	    category_id == 0) {
-		hint->class_id = class_id;
-		return 0;
-	}
-	return parse_hint(class_id, category_id, kind, hint);
 }
 
 static int parse_prefix(const char *text, int family, void *address,
@@ -857,7 +844,7 @@ static int sync_snapshot(void)
 	__u32 zero = 0;
 	int config_fd = -1, subject_fd = -1, policy_fd = -1;
 	int port_fd = -1, ipv4_fd = -1, ipv6_fd = -1;
-	int dns4_fd = -1, dns6_fd = -1, rate_fd = -1;
+	int rate_fd = -1;
 	int lock_fd = -1;
 	int ret = 1;
 
@@ -935,11 +922,8 @@ static int sync_snapshot(void)
 		}
 	}
 	if (snapshot.config.classifier_generation != current.classifier_generation) {
-		dns4_fd = open_map("ca_dns4");
-		dns6_fd = open_map("ca_dns6");
 		rate_fd = open_map("ca_subject_rates");
-		if (dns4_fd < 0 || dns6_fd < 0 || rate_fd < 0 ||
-		    clear_map(rate_fd, sizeof(__u32))) {
+		if (rate_fd < 0 || clear_map(rate_fd, sizeof(__u32))) {
 			fprintf(stderr, "unable to reset generation-scoped classifier state\n");
 			goto out;
 		}
@@ -949,10 +933,6 @@ static int sync_snapshot(void)
 		fprintf(stderr, "unable to publish application snapshot: %s\n", strerror(errno));
 		goto out;
 	}
-	if (snapshot.config.classifier_generation != current.classifier_generation &&
-	    (clear_map(dns4_fd, sizeof(__be32)) ||
-	     clear_map(dns6_fd, sizeof(struct ca_ipv6_addr_key))))
-		fprintf(stderr, "warning: stale DNS hints will expire lazily\n");
 	ret = 0;
 out:
 	if (config_fd >= 0)
@@ -967,10 +947,6 @@ out:
 		close(ipv4_fd);
 	if (ipv6_fd >= 0)
 		close(ipv6_fd);
-	if (dns4_fd >= 0)
-		close(dns4_fd);
-	if (dns6_fd >= 0)
-		close(dns6_fd);
 	if (rate_fd >= 0)
 		close(rate_fd);
 	if (lock_fd >= 0)
@@ -980,177 +956,6 @@ out:
 	free(snapshot.ports);
 	free(snapshot.ipv4);
 	free(snapshot.ipv6);
-	return ret;
-}
-
-#define CA_MAX_DNS_BATCH 256
-
-struct dns4_publish_entry {
-	__be32 address;
-	struct ca_class_hint hint;
-	unsigned int ttl;
-};
-
-struct dns6_publish_entry {
-	struct ca_ipv6_addr_key address;
-	struct ca_class_hint hint;
-	unsigned int ttl;
-};
-
-static bool same_hint(const struct ca_class_hint *a,
-			      const struct ca_class_hint *b)
-{
-	return a->class_id == b->class_id &&
-	       a->category_id == b->category_id && a->kind == b->kind;
-}
-
-static int publish_dns_hint(int fd, const void *key, struct ca_dns_hint *value,
-			    __u64 now_ns)
-{
-	struct ca_dns_hint current;
-
-	if (!bpf_map_lookup_elem(fd, key, &current) &&
-	    current.classifier_generation == value->classifier_generation &&
-	    current.expires_ns > now_ns) {
-		if (!same_hint(&current.hint, &value->hint)) {
-			value->hint.class_id = CA_CLASS_UNCLASSIFIED;
-			value->hint.category_id = 0;
-			value->hint.kind = CA_CLASS_KIND_NONE;
-		}
-		if (current.expires_ns > value->expires_ns)
-			value->expires_ns = current.expires_ns;
-	}
-	return bpf_map_update_elem(fd, key, value, BPF_ANY) ? -errno : 0;
-}
-
-static int sync_dns_hints(void)
-{
-	struct dns4_publish_entry entries4[CA_MAX_DNS_BATCH];
-	struct dns6_publish_entry entries6[CA_MAX_DNS_BATCH];
-	struct ca_config config = {};
-	char *line = NULL;
-	size_t capacity = 0, count4 = 0, count6 = 0;
-	unsigned long line_number = 0;
-	unsigned int generation = 0;
-	bool have_generation = false;
-	struct timespec now;
-	__u64 now_ns;
-	int config_fd = -1, dns4_fd = -1, dns6_fd = -1;
-	int lock_fd = -1;
-	int ret = 1;
-
-	lock_fd = acquire_update_lock();
-	if (lock_fd < 0)
-		goto out;
-
-	while (getline(&line, &capacity, stdin) >= 0) {
-		char command[16], address[INET6_ADDRSTRLEN];
-		unsigned int class_id, category_id, kind, ttl;
-
-		line_number++;
-		if (line[0] == '#' || line[0] == '\n')
-			continue;
-		if (sscanf(line, "%15s", command) != 1)
-			continue;
-		if (!strcmp(command, "DNSGEN")) {
-			if (have_generation || sscanf(line, "DNSGEN %u", &generation) != 1)
-				goto invalid;
-			have_generation = true;
-			continue;
-		}
-		if (!have_generation || count4 + count6 >= CA_MAX_DNS_BATCH ||
-		    sscanf(line, "%15s %45s %u %u %u %u", command, address,
-			   &class_id, &category_id, &kind, &ttl) != 6 ||
-		    ttl < 1 || ttl > 86400)
-			goto invalid;
-		if (!strcmp(command, "DNS4")) {
-			struct dns4_publish_entry *entry;
-
-			entry = &entries4[count4];
-			if (inet_pton(AF_INET, address, &entry->address) != 1 ||
-			    parse_dns_hint(class_id, category_id, kind, &entry->hint))
-				goto invalid;
-			entry->ttl = ttl;
-			count4++;
-		}
-		else if (!strcmp(command, "DNS6")) {
-			struct dns6_publish_entry *entry;
-
-			entry = &entries6[count6];
-			if (inet_pton(AF_INET6, address, entry->address.addr) != 1 ||
-			    parse_dns_hint(class_id, category_id, kind, &entry->hint))
-				goto invalid;
-			entry->ttl = ttl;
-			count6++;
-		}
-		else
-			goto invalid;
-	}
-	if (!have_generation)
-		goto invalid;
-	free(line);
-	line = NULL;
-
-	config_fd = open_map("ca_config");
-	if (config_fd < 0 || lookup_config(config_fd, &config)) {
-		fprintf(stderr, "application BPF config map is unavailable\n");
-		goto out;
-	}
-	/* A queued DNS batch from an older taxonomy is intentionally discarded. */
-	if (!config.enabled || config.classifier_generation != generation) {
-		ret = 0;
-		goto out;
-	}
-	dns4_fd = open_map("ca_dns4");
-	dns6_fd = open_map("ca_dns6");
-	if (dns4_fd < 0 || dns6_fd < 0) {
-		fprintf(stderr, "DNS classifier maps are unavailable\n");
-		goto out;
-	}
-	if (clock_gettime(CLOCK_MONOTONIC, &now)) {
-		fprintf(stderr, "unable to read monotonic clock: %s\n", strerror(errno));
-		goto out;
-	}
-	now_ns = (__u64)now.tv_sec * 1000000000ULL + now.tv_nsec;
-	for (size_t i = 0; i < count4; i++) {
-		struct ca_dns_hint value = {
-			.expires_ns = now_ns + (__u64)entries4[i].ttl * 1000000000ULL,
-			.classifier_generation = generation,
-			.hint = entries4[i].hint,
-		};
-
-		if (publish_dns_hint(dns4_fd, &entries4[i].address, &value, now_ns)) {
-			fprintf(stderr, "unable to publish IPv4 DNS hint: %s\n", strerror(errno));
-			goto out;
-		}
-	}
-	for (size_t i = 0; i < count6; i++) {
-		struct ca_dns_hint value = {
-			.expires_ns = now_ns + (__u64)entries6[i].ttl * 1000000000ULL,
-			.classifier_generation = generation,
-			.hint = entries6[i].hint,
-		};
-
-		if (publish_dns_hint(dns6_fd, &entries6[i].address, &value, now_ns)) {
-			fprintf(stderr, "unable to publish IPv6 DNS hint: %s\n", strerror(errno));
-			goto out;
-		}
-	}
-	ret = 0;
-	goto out;
-
-invalid:
-	fprintf(stderr, "invalid DNS hint batch at line %lu\n", line_number);
-out:
-	free(line);
-	if (config_fd >= 0)
-		close(config_fd);
-	if (dns4_fd >= 0)
-		close(dns4_fd);
-	if (dns6_fd >= 0)
-		close(dns6_fd);
-	if (lock_fd >= 0)
-		close(lock_fd);
 	return ret;
 }
 
@@ -1355,7 +1160,7 @@ static int print_status(void)
 	__u32 zero = 0, schema = 0;
 	int config_fd = -1, subject_fd = -1, policy_fd = -1;
 	int port_fd = -1, ipv4_fd = -1, ipv6_fd = -1;
-	int dns4_fd = -1, dns6_fd = -1, flow_fd = -1;
+	int flow_fd = -1;
 	int runtime_fd = -1, stats_fd = -1, schema_fd = -1;
 	int cpus = libbpf_num_possible_cpus();
 	uint64_t *percpu = NULL;
@@ -1364,7 +1169,7 @@ static int print_status(void)
 		(sizeof(struct ca_flow_key) + sizeof(struct ca_flow_state) + 72);
 	int subject_entries, unique_subjects, policy_entries;
 	int flow_entries;
-	int port_entries, ipv4_entries, ipv6_entries, dns4_entries, dns6_entries;
+	int port_entries, ipv4_entries, ipv6_entries;
 	int ret = 1;
 
 	config_fd = open_map("ca_config");
@@ -1382,13 +1187,11 @@ static int print_status(void)
 	port_fd = open_map(config.active_slot ? "ca_port_b" : "ca_port_a");
 	ipv4_fd = open_map(config.active_slot ? "ca_ipv4_b" : "ca_ipv4_a");
 	ipv6_fd = open_map(config.active_slot ? "ca_ipv6_b" : "ca_ipv6_a");
-	dns4_fd = open_map("ca_dns4");
-	dns6_fd = open_map("ca_dns6");
 	flow_fd = open_map("ca_flows");
 	runtime_fd = open_map("ca_runtime");
 	stats_fd = open_map("ca_stats");
 	if (subject_fd < 0 || policy_fd < 0 || port_fd < 0 || ipv4_fd < 0 ||
-	    ipv6_fd < 0 || dns4_fd < 0 || dns6_fd < 0 || flow_fd < 0 ||
+	    ipv6_fd < 0 || flow_fd < 0 ||
 	    runtime_fd < 0 || stats_fd < 0 || cpus <= 0) {
 		fprintf(stderr, "one or more application BPF maps are unavailable\n");
 		goto out;
@@ -1410,8 +1213,6 @@ static int print_status(void)
 	port_entries = count_map_entries(port_fd, sizeof(struct ca_port_key));
 	ipv4_entries = count_map_entries(ipv4_fd, sizeof(struct ca_ipv4_lpm_key));
 	ipv6_entries = count_map_entries(ipv6_fd, sizeof(struct ca_ipv6_lpm_key));
-	dns4_entries = count_map_entries(dns4_fd, sizeof(__be32));
-	dns6_entries = count_map_entries(dns6_fd, 16);
 	flow_entries = count_map_entries(flow_fd, sizeof(struct ca_flow_key));
 	printf("{\"backend_mode\":\"V4_BPF_BASIC\"," 
 	       "\"program_pinned\":true,\"maps_pinned\":true,"
@@ -1421,7 +1222,7 @@ static int print_status(void)
 	       "\"subject_entries\":%d,\"subject_count\":%d,"
 	       "\"app_policy_snapshot_entries\":%d,\"policy_entries\":%d,"
 	       "\"port_hint_entries\":%d,\"ipv4_prefix_entries\":%d,"
-	       "\"ipv6_prefix_entries\":%d,\"dns_hint_entries\":%d,"
+	       "\"ipv6_prefix_entries\":%d,\"runtime_projection_entries\":%d,"
 	       "\"flow_map_entries\":%d,\"flow_entries\":%d,"
 	       "\"flow_capacity\":%u,\"estimated_flow_map_memory_bytes\":%" PRIu64 ","
 	       "\"flows_total\":%" PRIu64 ",\"flows_pending\":%u,"
@@ -1443,7 +1244,6 @@ static int print_status(void)
 	       "\"unknown_subject_packets\":%" PRIu64 ","
 	       "\"parse_unsupported\":%" PRIu64 ","
 	       "\"classifier_conflicts\":%" PRIu64 ","
-	       "\"dns_hint_expired\":%" PRIu64 ","
 	       "\"packet_app_allow_verdicts\":%" PRIu64 ","
 	       "\"packet_app_deny_verdicts\":%" PRIu64 ","
 	       "\"app_mark_mask\":%u,"
@@ -1455,7 +1255,8 @@ static int print_status(void)
 	       config.app_policy_generation, config.classifier_generation,
 	       subject_entries, unique_subjects,
 	       policy_entries, policy_entries,
-	       port_entries, ipv4_entries, ipv6_entries, dns4_entries + dns6_entries,
+	       port_entries, ipv4_entries, ipv6_entries,
+	       port_entries + ipv4_entries + ipv6_entries,
 	       flow_entries, flow_entries, CA_MAX_FLOWS, flow_memory,
 	       stats[CA_STAT_FLOWS_TOTAL], (__u32)runtime, (__u32)(runtime >> 32),
 	       stats[CA_STAT_FLOWS_CLASSIFIED_EXACT],
@@ -1471,7 +1272,7 @@ static int print_status(void)
 	       config.enabled ? unique_subjects : 0,
 	       stats[CA_STAT_FLOW_MAP_FULL], stats[CA_STAT_POLICY_REEVALUATIONS],
 	       stats[CA_STAT_UNKNOWN_SUBJECT_PACKETS], stats[CA_STAT_PARSE_UNSUPPORTED],
-	       stats[CA_STAT_CLASSIFIER_CONFLICTS], stats[CA_STAT_DNS_HINT_EXPIRED],
+	       stats[CA_STAT_CLASSIFIER_CONFLICTS],
 	       stats[CA_STAT_PACKET_APP_ALLOW_VERDICTS],
 	       stats[CA_STAT_PACKET_APP_DENY_VERDICTS], CA_APP_MARK_MASK,
 	       config.max_packets_inspected, config.max_bytes_examined,
@@ -1493,10 +1294,6 @@ out:
 		close(ipv4_fd);
 	if (ipv6_fd >= 0)
 		close(ipv6_fd);
-	if (dns4_fd >= 0)
-		close(dns4_fd);
-	if (dns6_fd >= 0)
-		close(dns6_fd);
 	if (flow_fd >= 0)
 		close(flow_fd);
 	if (runtime_fd >= 0)
@@ -1655,8 +1452,6 @@ int main(int argc, char **argv)
 		return prune_command(argc - 2, argv + 2);
 	if (!strcmp(argv[1], "sync") && argc == 2)
 		return sync_snapshot();
-	if (!strcmp(argv[1], "dns-sync") && argc == 2)
-		return sync_dns_hints();
 	if (!strcmp(argv[1], "generations") && argc == 2)
 		return generations_command();
 	if (!strcmp(argv[1], "health") && argc >= 5) {

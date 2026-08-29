@@ -33,6 +33,16 @@ jobs:
           sh -n tests/measure-bpf-performance.sh
           python3 -m py_compile tests/send-malformed-frames.py
 
+      - name: Enforce the V4.2 classification boundary
+        shell: bash
+        run: |
+          ! grep -Eiq 'ringbuf|perf.event|netlink' src/client-access-bpf.c src/client-access-bpf.h
+          ! grep -Eiq 'profile|provider|provenance|dnsmasq|dns[_-]' src/client-access-bpf.c src/client-access-bpf.h
+          ! grep -Eq 'dns-sync' src/client-access-bpfctl.c
+          ! grep -Eq 'ca_dns4|ca_dns6' src/client-access-bpfctl.c
+          grep -Fq 'classification.resolve' root/usr/sbin/client-accessd
+          grep -Fq 'runtime_projection' root/usr/sbin/client-accessd
+
       - name: Check the generated nftables fragment
         shell: bash
         run: |
@@ -97,6 +107,14 @@ jobs:
           -L "${GITHUB_WORKSPACE}/root/usr/share/ucode"
           "${GITHUB_WORKSPACE}/tests/app_policy.uc"
 
+      - name: Run V4.2 classification architecture tests
+        env:
+          TZ: UTC
+        run: >-
+          "${RUNNER_TEMP}/ucode-build/ucode"
+          -L "${GITHUB_WORKSPACE}/root/usr/share/ucode"
+          "${GITHUB_WORKSPACE}/tests/classification.uc"
+
       - name: Run runtime policy tests
         env:
           TZ: UTC
@@ -120,6 +138,7 @@ jobs:
           for scenario in \
             restart_prune \
             fw4_restore \
+            projection_failure \
             generation_nonreuse \
             health_failure \
             status_health_failure \
@@ -309,8 +328,8 @@ jobs:
           sudo nsenter --net=/var/run/netns/ca-router-ns -- \
             "${RUNNER_TEMP}/client-access-bpfctl" attach ca-br-lan
 
-          # V41-LIFE-001/002: a partial pin set and an incompatible schema are
-          # replaced as a complete unit, detaching the old owned program first.
+          # A partial current pin set is recovered as a complete unit,
+          # detaching the old owned program first.
           sudo rm /sys/fs/bpf/client_access/ca_policy_a
           sudo nsenter --net=/var/run/netns/ca-router-ns -- \
             "${RUNNER_TEMP}/client-access-bpfctl" ensure \
@@ -322,20 +341,6 @@ jobs:
           fi
           sudo nsenter --net=/var/run/netns/ca-router-ns -- \
             "${RUNNER_TEMP}/client-access-bpfctl" attach ca-br-lan
-          sudo bpftool map update pinned \
-            /sys/fs/bpf/client_access/ca_mark_schema \
-            key hex 00 00 00 00 value hex 02 00 00 00
-          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
-            "${RUNNER_TEMP}/client-access-bpfctl" ensure \
-            "${RUNNER_TEMP}/client-access-bpf.o"
-          if sudo ip netns exec ca-router-ns tc filter show dev ca-br-lan ingress \
-              | grep -q 'bpf'; then
-            echo 'schema replacement left the incompatible program attached' >&2
-            exit 1
-          fi
-          sudo nsenter --net=/var/run/netns/ca-router-ns -- \
-            "${RUNNER_TEMP}/client-access-bpfctl" attach ca-br-lan
-
           # V41-LIFE-004/005: a foreign program at the reserved coordinate is
           # neither replaced by attach nor removed by detach.
           sudo bpftool prog load "${RUNNER_TEMP}/foreign-tc-bpf.o" \
@@ -409,6 +414,9 @@ jobs:
           fi
           sudo ip netns exec ca-client-ns ping -6 -c 1 -W 1 2001:db8:2::2
 
+          # V42-TEST-010: client-accessd is intentionally absent from this
+          # job. Forwarding and classification use the last complete snapshot
+          # without waiting for a userspace Classification Engine.
           printf '%s\n' \
             'CONFIG 1 1 1 0 0 1 256 200 256 512 64' \
             'SUBJECT 02:00:00:00:00:42 42' \
@@ -542,18 +550,14 @@ jobs:
             exit 1
           fi
 
-          # DNS hints are generation scoped. Conflicting hints for one shared
-          # IP degrade to UNCLASSIFIED rather than last-writer-wins.
-          printf '%s\n' \
-            'DNSGEN 2' \
-            'DNS4 198.51.100.3 101 10 1 60' \
-            'DNS4 198.51.100.4 100 10 1 60' \
-            'DNS4 198.51.100.4 101 10 1 60' \
-            | sudo "${RUNNER_TEMP}/client-access-bpfctl" dns-sync
-
+          # V4.2 userspace has already fused Profile and Observation evidence.
+          # The datapath receives only the complete near-final projection:
+          # one exact result and one deterministic UNCLASSIFIED conflict.
           printf '%s\n' \
             'CONFIG 1 4 2 0 0 1 256 200 256 512 64' \
             'SUBJECT 02:00:00:00:00:42 42' \
+            'PREFIX4 198.51.100.3/32 101 10 1' \
+            'PREFIX4 198.51.100.4/32 1 0 3' \
             'PORT 17 443 10 10 2' \
             'POLICY 42 101 1' \
             'POLICY 42 10 1' \
@@ -562,7 +566,7 @@ jobs:
             | sudo "${RUNNER_TEMP}/client-access-bpfctl" sync
           sudo ip netns exec ca-client-ns ping -c 1 -W 1 198.51.100.3
           if sudo ip netns exec ca-client-ns ping -c 1 -W 1 198.51.100.3; then
-            echo 'DNS-derived exact application DENY did not become terminal' >&2
+            echo 'precomputed exact application DENY did not become terminal' >&2
             exit 1
           fi
           sudo ip netns exec ca-client-ns ping -c 2 -W 1 198.51.100.4
@@ -682,7 +686,7 @@ jobs:
             | tee "${RUNNER_TEMP}/client-access-bpf-status.json"
           jq -e '
             .enabled == true and
-            .bpf_schema_version == 3 and
+            .bpf_schema_version == 4 and
             .app_policy_generation == 9 and
             .classifier_generation == 2 and
             .subject_entries == 1 and

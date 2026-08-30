@@ -19,7 +19,7 @@ devices = { "lan", "wan" }
 counter
 }
 chain forward {
-meta l4proto { tcp, udp } flow offload @ft
+meta l4proto { tcp, udp } flow add @ft
 }
 }`;
 

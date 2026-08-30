@@ -253,7 +253,8 @@ static __always_inline bool ca_is_ipv6_extension(__u8 nexthdr)
 }
 
 static __always_inline int ca_parse_flow(void *data, void *data_end,
-						 struct ca_flow_key *key,
+							 __u32 packet_len,
+							 struct ca_flow_key *key,
 						 struct ca_mac_key *mac,
 						 __u32 *examined)
 {
@@ -298,7 +299,12 @@ static __always_inline int ca_parse_flow(void *data, void *data_end,
 		 */
 		length_bytes = (const volatile __u8 *)&ip->tot_len;
 		total_len = ((__u32)length_bytes[0] << 8) | length_bytes[1];
-		if (total_len < ihl || data + offset + total_len > data_end)
+		/* data_end bounds direct access to the linear area, while skb->len
+		 * bounds the complete packet including non-linear GRO/GSO payload.
+		 * Classification reads headers only and must not require payload
+		 * linearization.
+		 */
+		if (total_len < ihl || offset + total_len > packet_len)
 			return CA_PARSE_UNSUPPORTED;
 		key->ip_proto = ip->protocol;
 		key->addr.v4.src = ip->saddr;
@@ -318,7 +324,7 @@ static __always_inline int ca_parse_flow(void *data, void *data_end,
 		length_bytes = (const volatile __u8 *)&ip6->payload_len;
 		payload_len = ((__u32)length_bytes[0] << 8) | length_bytes[1];
 		if (!payload_len ||
-		    data + offset + sizeof(*ip6) + payload_len > data_end)
+		    offset + sizeof(*ip6) + payload_len > packet_len)
 			return CA_PARSE_UNSUPPORTED;
 		key->ip_proto = ip6->nexthdr;
 		__builtin_memcpy(key->addr.v6.src, &ip6->saddr, 16);
@@ -677,7 +683,7 @@ int ca_ingress(struct __sk_buff *skb)
 		return TC_ACT_UNSPEC;
 	ca_stat_inc(CA_STAT_PACKETS);
 
-	parsed = ca_parse_flow(data, data_end, &flow_key, &mac, &examined);
+	parsed = ca_parse_flow(data, data_end, skb->len, &flow_key, &mac, &examined);
 	if (parsed == CA_PARSE_NO_ETHERNET)
 		return TC_ACT_UNSPEC;
 	subject_id = ca_subject_lookup(config, &mac);

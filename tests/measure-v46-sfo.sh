@@ -96,7 +96,7 @@ apply_ruleset() {
 			' type filter hook forward priority filter; policy drop;' \
 			' meta mark & 0x60000000 == 0x60000000 drop'
 		if [ "$mode" = sfo ]; then
-			printf '%s\n' ' meta l4proto { tcp, udp } flow offload @ft'
+			printf '%s\n' ' meta l4proto { tcp, udp } flow add @ft'
 		fi
 		printf '%s\n' \
 			' ct state established,related accept' \

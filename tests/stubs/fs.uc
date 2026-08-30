@@ -139,7 +139,7 @@ function read_result(argv) {
 				    scenario() == 'sfo_access_revoke' ||
 				    scenario() == 'sfo_application_revoke' ||
 				    scenario() == 'sfo_deadline_failure')
-					? 'table inet fw4 {\nflowtable ft {\nhook ingress priority filter\n}\nchain forward {\nmeta l4proto { tcp, udp } flow offload @ft\n}\n}'
+					? 'table inet fw4 {\nflowtable ft {\nhook ingress priority filter\n}\nchain forward {\nmeta l4proto { tcp, udp } flow add @ft\n}\n}'
 					: 'table inet fw4 { chain forward { counter accept } }'),
 		};
 	if (argv[0] == '/usr/sbin/client-access-sfoctl') {

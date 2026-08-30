@@ -13,7 +13,8 @@ for test_file in \
   lease.uc \
   sfo_manager.uc \
   reconcile.uc \
-  commit.uc; do
+  commit.uc \
+  status.uc; do
   TZ=UTC "${ucode_bin}" -L "${module_dir}" "${repo_dir}/tests/${test_file}"
 done
 
@@ -26,8 +27,12 @@ done
 for scenario in \
   restart_prune \
   fw4_restore \
+  interface_add \
+  interface_remove \
+  interface_repair \
   projection_failure \
   generation_nonreuse \
+  runtime_generation_floor \
   health_failure \
   status_health_failure \
   ensure_failure \

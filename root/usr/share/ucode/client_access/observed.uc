@@ -32,28 +32,17 @@ export function collect(config) {
 		: { known: true, policy: 0, classifier: 0 };
 
 	return {
-		access: {
-			publication_observable: false,
-			runtime_signature: null,
-		},
 		application: {
 			backend_present: bpf_present,
 			policy_generation: generations.policy,
 			classifier_generation: generations.classifier,
 			generations_known: generations.known,
-			policy_signature: null,
-			classifier_signature: null,
-			attached_interfaces: null,
-			runtime_healthy: null,
 		},
 		acceleration: {
 			capability,
 			ruleset_checked: offload.checked,
 			backend_present: sfo_present,
-			correlation_healthy: null,
-			baseline_verified: null,
 		},
 		topology: { source, destination },
 	};
 }
-

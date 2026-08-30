@@ -20,6 +20,11 @@ function initialize() {
 		attachments.lan0 = true;
 		attachments.stale0 = true;
 	}
+	if (scenario() == 'runtime_generation_floor' &&
+	    policy_generation == 0 && classifier_generation == 0) {
+		policy_generation = 10;
+		classifier_generation = 8;
+	}
 }
 
 export function advance() {
@@ -28,6 +33,10 @@ export function advance() {
 
 export function simulate_fw4_reload() {
 	scope_active = false;
+}
+
+export function simulate_attachment_loss() {
+	delete attachments.lan0;
 }
 
 export function snapshot() {
@@ -123,8 +132,18 @@ export function unlink(path) {
 
 function read_result(argv) {
 	initialize();
-	if (argv[0] == '/sbin/fw4' && argv[1] == 'zone')
-		return { code: 0, output: argv[2] == 'lan' ? 'lan0\n' : 'wan0\n' };
+	if (argv[0] == '/sbin/fw4' && argv[1] == 'zone') {
+		let output = 'wan0\n';
+		if (argv[2] == 'lan') {
+			if (scenario() == 'interface_add' && phase > 0)
+				output = 'lan0\nlan1\n';
+			else if (scenario() == 'interface_remove')
+				output = phase > 0 ? 'lan1\n' : 'lan0\nlan1\n';
+			else
+				output = 'lan0\n';
+		}
+		return { code: 0, output };
+	}
 	if (argv[0] == '/usr/sbin/nft' && argv[1] == 'list')
 		return {
 			code: 0,

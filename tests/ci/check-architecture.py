@@ -144,6 +144,27 @@ def validate_ucode_imports(repo: pathlib.Path, contracts, errors):
                 errors.append(f"ucode-imports: {relative} must not import {module}")
 
 
+def validate_ucode_boundaries(repo: pathlib.Path, contracts, errors):
+    for relative, rules in contracts.get("ucode_boundaries", {}).items():
+        source = (repo / relative).read_text(encoding="utf-8")
+        lexical = strip_c_comments_and_literals(source)
+        tokens = set(IDENTIFIER.findall(lexical))
+        for identifier in rules.get("forbidden_identifiers", []):
+            if identifier in tokens:
+                errors.append(
+                    f"ucode-boundaries: {relative} contains forbidden identifier {identifier}"
+                )
+        for call in rules.get("forbidden_calls", []):
+            owner, member = call.split(".", 1)
+            pattern = re.compile(
+                rf"\b{re.escape(owner)}\s*\.\s*{re.escape(member)}\s*\("
+            )
+            if pattern.search(lexical):
+                errors.append(
+                    f"ucode-boundaries: {relative} must not call {call}"
+                )
+
+
 def validate_c_lexical_boundaries(repo: pathlib.Path, contracts, errors):
     for boundary in contracts["c_lexical_boundaries"]:
         exact = set(boundary.get("forbidden_identifiers", []))
@@ -265,6 +286,7 @@ def main() -> int:
 
     validate_paths(repo, contracts, errors)
     validate_ucode_imports(repo, contracts, errors)
+    validate_ucode_boundaries(repo, contracts, errors)
     validate_c_lexical_boundaries(repo, contracts, errors)
     validate_packages(repo, contracts, errors)
     validate_workflows(repo, errors)

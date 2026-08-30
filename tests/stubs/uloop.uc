@@ -62,6 +62,14 @@ export function run() {
 		fs_stub.advance();
 		reconcile('projection-failure-test');
 	}
+	else if (scenario == 'interface_add' || scenario == 'interface_remove') {
+		fs_stub.advance();
+		reconcile('interface-target-change');
+	}
+	else if (scenario == 'interface_repair') {
+		fs_stub.simulate_attachment_loss();
+		reconcile('interface-repair');
+	}
 	else if (scenario == 'status_health_failure') {
 		// Runtime health is sampled during reconciliation; status is read-only.
 		reconcile('health-poll-test');
@@ -127,6 +135,18 @@ export function run() {
 		    length(runtime.attachments) != 1 || runtime.attachments[0] != 'lan0')
 			fail(`restart did not reconcile the exact attachment set: app=${sprintf('%J', app)} runtime=${sprintf('%J', runtime)}`);
 	}
+	else if (scenario == 'interface_add') {
+		if (sprintf('%J', runtime.attachments) != '["lan0","lan1"]')
+			fail(`application runtime did not converge an added target interface: ${sprintf('%J', runtime.attachments)}`);
+	}
+	else if (scenario == 'interface_remove') {
+		if (sprintf('%J', runtime.attachments) != '["lan1"]')
+			fail(`application runtime did not prune a removed target interface: ${sprintf('%J', runtime.attachments)}`);
+	}
+	else if (scenario == 'interface_repair') {
+		if (sprintf('%J', runtime.attachments) != '["lan0"]')
+			fail(`application runtime did not repair the unchanged target: ${sprintf('%J', runtime.attachments)}`);
+	}
 	else if (scenario == 'fw4_restore') {
 		if (app.backend_mode != 'V4_BPF_BASIC' || !app.enabled ||
 		    !app.retained_previous_snapshot || !runtime.scope_active)
@@ -145,6 +165,12 @@ export function run() {
 		    runtime.policy_generations[1] != 2 ||
 		    runtime.policy_generations[2] != 3)
 			fail(`a consumed application-policy generation was reused: app=${sprintf('%J', app)} runtime=${sprintf('%J', runtime)}`);
+	}
+	else if (scenario == 'runtime_generation_floor') {
+		if (app.app_policy_generation != 11 || app.classifier_generation != 9 ||
+		    runtime.policy_generation != 11 || runtime.classifier_generation != 9 ||
+		    sprintf('%J', runtime.policy_generations) != '[11]')
+			fail(`observed runtime generations did not flow through the authoritative plan: ${sprintf('%J', { app, runtime })}`);
 	}
 	else if (scenario == 'health_failure' ||
 	         scenario == 'status_health_failure' ||

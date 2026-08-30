@@ -4,7 +4,44 @@
  * caller owns configuration, journal, observation, clock, and runtime reads.
  */
 
-import * as reconciliation from 'client_access.reconcile';
+export function access_signature(compiled, projection, sources, destinations) {
+	if (!compiled.enabled)
+		return sprintf('%J', { enabled: false });
+	return sprintf('%J', {
+		enabled: true,
+		mode: compiled.mode,
+		deny_action: compiled.deny_action,
+		exceptions: projection.exceptions,
+		sources,
+		destinations,
+	});
+}
+
+export function application_signature(app_compiled, subject_projection,
+		sources, destinations) {
+	let policies = [];
+	for (let entry in app_compiled.policies)
+		push(policies, {
+			identity_id: entry.identity_id,
+			subject_id: entry.subject_id,
+			class_id: entry.class_id,
+			verdict: entry.verdict,
+		});
+	return sprintf('%J', {
+		enabled: app_compiled.enabled,
+		unknown_subject_app_verdict: app_compiled.unknown_subject_app_verdict,
+		provisional_app_verdict: app_compiled.provisional_app_verdict,
+		selectors: subject_projection.selectors,
+		policies,
+		resource_limits: app_compiled.resource_limits,
+		sources,
+		destinations,
+	});
+}
+
+export function classifier_signature(runtime_projection) {
+	return runtime_projection.signature;
+}
 
 export function build(input, observed) {
 	const runtime = input.runtime;
@@ -22,14 +59,14 @@ export function build(input, observed) {
 		push(access_readiness,
 			'No destination interfaces resolved; enforcement is inactive');
 
-	const access_signature = reconciliation.access_signature(compiled,
+	const desired_access_signature = access_signature(compiled,
 		runtime.projection, sources, destinations);
-	const application_signature = sprintf('%s|tracking=%d|enforcement=%d',
-		reconciliation.application_signature(app_compiled,
+	const desired_application_signature = sprintf('%s|tracking=%d|enforcement=%d',
+		application_signature(app_compiled,
 			runtime.subject_projection, sources, destinations),
 		observed.acceleration.capability.tracking_required ? 1 : 0,
 		app_compiled.requested_enabled ? 1 : 0);
-	const classifier_signature = reconciliation.classifier_signature(
+	const desired_classifier_signature = classifier_signature(
 		runtime.classification_state.runtime_projection);
 
 	return {
@@ -40,7 +77,7 @@ export function build(input, observed) {
 				projection: runtime.projection,
 				source_interfaces: sources,
 				destination_interfaces: destinations,
-				signature: access_signature,
+				signature: desired_access_signature,
 				ready: compiled.schema_supported && compiled.mode_valid &&
 					!length(access_readiness),
 			},
@@ -50,8 +87,8 @@ export function build(input, observed) {
 				subject_projection: runtime.subject_projection,
 				source_interfaces: sources,
 				destination_interfaces: destinations,
-				policy_signature: application_signature,
-				classifier_signature,
+				policy_signature: desired_application_signature,
+				classifier_signature: desired_classifier_signature,
 				requested: app_compiled.requested_enabled,
 				ready: app_compiled.enabled && !length([
 					...runtime.subject_projection.errors,

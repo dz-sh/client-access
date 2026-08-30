@@ -12,7 +12,6 @@ export function application() {
 		classifier_signature: null,
 		applied_sources: [],
 		applied_destinations: [],
-		generation_floors_loaded: false,
 		attached_interfaces: [],
 		applied_enforcement: false,
 	};

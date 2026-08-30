@@ -15,6 +15,7 @@
     "root/usr/share/ucode/client_access/executor.uc",
     "root/usr/share/ucode/client_access/commit.uc",
     "root/usr/share/ucode/client_access/state_schema.uc",
+    "tests/status.uc",
     "src/bpfctl-internal.h",
     "src/bpf-object.c",
     "src/bpf-tc.c",
@@ -37,7 +38,8 @@
         "client_access.desired",
         "client_access.observed",
         "client_access.executor",
-        "client_access.commit"
+        "client_access.commit",
+        "client_access.status"
       ],
       "forbidden": [
         "uci",
@@ -50,6 +52,7 @@
     },
     "root/usr/share/ucode/client_access/desired.uc": {
       "forbidden": [
+        "client_access.reconcile",
         "client_access.firewall",
         "client_access.bpf_runtime",
         "client_access.application_reconcile",
@@ -70,6 +73,46 @@
         "client_access.bpf_runtime",
         "client_access.application_reconcile",
         "client_access.sfo_manager"
+      ]
+    },
+    "root/usr/share/ucode/client_access/status.uc": {
+      "forbidden": [
+        "client_access.firewall",
+        "client_access.bpf_runtime",
+        "client_access.application_reconcile",
+        "client_access.sfo_manager"
+      ]
+    }
+  },
+  "ucode_boundaries": {
+    "root/usr/share/ucode/client_access/application_reconcile.uc": {
+      "forbidden_calls": [
+        "bpf_runtime.generations"
+      ]
+    },
+    "root/usr/share/ucode/client_access/observed.uc": {
+      "forbidden_identifiers": [
+        "runtime_signature",
+        "policy_signature",
+        "classifier_signature",
+        "attached_interfaces",
+        "runtime_healthy",
+        "correlation_healthy",
+        "baseline_verified"
+      ]
+    },
+    "root/usr/share/ucode/client_access/reconcile.uc": {
+      "forbidden_identifiers": [
+        "interfaces_to_attach",
+        "interfaces_to_keep",
+        "interfaces_to_detach",
+        "interfaces_to_ensure",
+        "prerequisites"
+      ]
+    },
+    "root/usr/share/ucode/client_access/state_schema.uc": {
+      "forbidden_identifiers": [
+        "generation_floors_loaded"
       ]
     }
   },

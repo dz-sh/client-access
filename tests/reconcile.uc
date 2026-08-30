@@ -13,16 +13,8 @@ function assert_true(value, message) {
 		fail(message);
 }
 
-function contains(values, expected) {
-	for (let value in values)
-		if (value == expected)
-			return true;
-	return false;
-}
-
 function observed(policy_generation, classifier_generation) {
 	return {
-		access: { publication_observable: false, runtime_signature: null },
 		application: {
 			generations_known: true,
 			policy_generation,
@@ -31,13 +23,14 @@ function observed(policy_generation, classifier_generation) {
 	};
 }
 
-function desired(access_signature, policy_signature, classifier_signature) {
+function desired(access_signature, policy_signature, classifier_signature,
+		interfaces) {
 	return {
 		access: { signature: access_signature },
 		application: {
 			policy_signature,
 			classifier_signature,
-			source_interfaces: [ 'lan0', 'lan1' ],
+			source_interfaces: interfaces ?? [ 'lan0', 'lan1' ],
 		},
 	};
 }
@@ -52,10 +45,12 @@ assert_true(plan.actions.access.operation == 'publish' &&
 assert_true(plan.actions.application.candidate_policy_generation == 1 &&
 	plan.actions.application.candidate_classifier_generation == 1,
 	'initial application and classifier snapshots need independent generations');
-assert_true(length(plan.actions.application.interfaces_to_attach) == 2 &&
-	contains(plan.actions.application.interfaces_to_attach, 'lan0') &&
-	contains(plan.actions.application.interfaces_to_attach, 'lan1'),
-	'planner must expose the complete TC attach delta');
+assert_true(sprintf('%J', plan.actions.application.target_interfaces) ==
+		'["lan0","lan1"]' &&
+	plan.actions.application.interfaces_to_attach == null &&
+	plan.actions.application.interfaces_to_detach == null &&
+	plan.actions.application.interfaces_to_keep == null,
+	'planner must expose target interfaces without backend TC deltas');
 
 committed.access = { generation: 5, signature: 'access-a', applied: true };
 committed.application.policy_generation = 7;
@@ -72,11 +67,9 @@ assert_true(plan.actions.access.operation == 'publish' &&
 assert_true(plan.actions.application.candidate_policy_generation == 7 &&
 	plan.actions.application.candidate_classifier_generation == 3,
 	'forced reconciliation must not advance unchanged application generations');
-assert_true(length(plan.actions.application.interfaces_to_keep) == 1 &&
-	plan.actions.application.interfaces_to_keep[0] == 'lan0' &&
-	length(plan.actions.application.interfaces_to_attach) == 1 &&
-	plan.actions.application.interfaces_to_attach[0] == 'lan1',
-	'planner must distinguish kept and newly attached interfaces');
+assert_true(sprintf('%J', plan.actions.application.target_interfaces) ==
+		'["lan0","lan1"]' && plan.actions.application.repair,
+	'repair must preserve the semantic target without exposing attach operations');
 
 plan = reconciliation.plan(committed, observed(10, 8),
 	desired('access-b', 'app-b', 'classifier-b'), [ {
@@ -91,5 +84,19 @@ assert_true(plan.actions.application.candidate_policy_generation == 11 &&
 assert_true(plan.transitions[0].publication_action_id == 'application.publish' &&
 	length(plan.transitions[0].id),
 	'a restrictive transition must name its plane publication prerequisite');
+
+plan = reconciliation.plan(committed, observed(11, 9),
+	desired('access-b', 'app-b', 'classifier-b', [ 'lan1' ]), [],
+	reconciliation.attempt_context('interface-remove', false, 4));
+assert_true(sprintf('%J', plan.actions.application.target_interfaces) ==
+		'["lan1"]',
+	'interface removal must be represented only as a new target set');
+
+plan = reconciliation.plan(committed, observed(12, 10),
+	desired('access-b', 'app-b', 'classifier-b', [ 'lan0', 'lan1', 'lan2' ]), [],
+	reconciliation.attempt_context('interface-add', false, 5));
+assert_true(sprintf('%J', plan.actions.application.target_interfaces) ==
+		'["lan0","lan1","lan2"]',
+	'interface addition must be represented only as a new target set');
 
 print('reconciliation planner tests passed.\n');

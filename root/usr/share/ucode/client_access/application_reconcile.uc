@@ -17,22 +17,16 @@ export function interfaces(state) {
 	return [ ...(state.attached_interfaces ?? []) ];
 }
 
-function load_generation_floors(state) {
-	if (state.generation_floors_loaded)
-		return;
-	const result = bpf_runtime.generations();
-	const values = split(trim(result.output), /\s+/);
-	if (result.code != 0 || length(values) != 2 ||
-	    !match(values[0], /^(0|[1-9][0-9]*)$/) ||
-	    !match(values[1], /^(0|[1-9][0-9]*)$/))
-		return;
-	const policy_floor = +values[0];
-	const classifier_floor = +values[1];
-	if (policy_floor > state.policy_generation)
-		state.policy_generation = policy_floor;
-	if (classifier_floor > state.classifier_generation)
-		state.classifier_generation = classifier_floor;
-	state.generation_floors_loaded = true;
+function missing_interfaces(target, current, repair) {
+	if (repair)
+		return [ ...target ];
+	let present = {}, result = [];
+	for (let ifname in current)
+		present[ifname] = true;
+	for (let ifname in target)
+		if (!present[ifname])
+			push(result, ifname);
+	return result;
 }
 
 function prune_interfaces(state, keep) {
@@ -92,6 +86,9 @@ export function apply(state, app_compiled, classification_state,
 		push(warnings, ...app_compiled.warnings, ...classification_state.warnings);
 	}
 	const runtime_projection = classification_state.runtime_projection;
+	const target_interfaces = plan.target_interfaces ?? [];
+	const interfaces_to_ensure = missing_interfaces(target_interfaces,
+		state.attached_interfaces ?? [], plan.repair);
 	const previously_enabled = state.applied_signature != null && length(state.attached_interfaces) > 0;
 	const previous_interfaces = {};
 	for (let ifname in state.attached_interfaces)
@@ -206,10 +203,8 @@ export function apply(state, app_compiled, classification_state,
 			warnings,
 		};
 	}
-	load_generation_floors(state);
-
 	let attached = [];
-	for (let ifname in plan.interfaces_to_ensure) {
+	for (let ifname in interfaces_to_ensure) {
 		const result = bpf_runtime.attach(ifname);
 		if (result.code != 0)
 			push(errors, `Unable to attach application filter to '${ifname}'`);
@@ -291,7 +286,7 @@ export function apply(state, app_compiled, classification_state,
 			warnings,
 		};
 	}
-	const pruned = prune_interfaces(state, sources);
+	const pruned = prune_interfaces(state, target_interfaces);
 	if (pruned.code != 0) {
 		push(errors, 'Unable to establish the exact application-filter TC interface set');
 		neutralize(state, errors);
@@ -309,8 +304,8 @@ export function apply(state, app_compiled, classification_state,
 			warnings,
 		};
 	}
-	state.attached_interfaces = [ ...sources ];
-	state.applied_sources = [ ...sources ];
+	state.attached_interfaces = [ ...target_interfaces ];
+	state.applied_sources = [ ...target_interfaces ];
 	state.applied_destinations = [ ...destinations ];
 	state.applied_enforcement = enforcement_requested;
 	if (classifier_changed) {

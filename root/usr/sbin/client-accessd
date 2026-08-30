@@ -33,7 +33,6 @@ let reconcile_attempt_id = 0;
 let dns_subscriber, observation_flush_timer;
 let dns_subscribed = false;
 let observation_runtime = observation_store.create();
-let classification_conflicts = 0;
 let projection_publish_errors = 0;
 let last_app_compiled = null;
 let lease_database = temporary_approval.empty_database();
@@ -42,55 +41,8 @@ let lease_journal_dirty = false;
 let lease_transaction_active = false;
 let lease_journal_errors = [];
 let latest_authorization_transitions = [];
-let state = {
-	running: true,
-	applied: false,
-	generation: 0,
-	last_reason: 'startup',
-	last_attempt: null,
-	last_success: null,
-	last_error: null,
-	next_transition: null,
-	clock_valid: false,
-	mode: null,
-	default_verdict: null,
-	exception_verdict: null,
-	identity_count: 0,
-	active_identity_count: 0,
-	binding_count: 0,
-	exception_count: 0,
-	source_interfaces: [],
-	destination_interfaces: [],
-	errors: [],
-	warnings: [],
-	temporary_approvals: {
-		active_count: 0,
-		capacity: temporary_approval.constants.MAX_ACTIVE_LEASES,
-		next_expiry: null,
-		journal_available: true,
-		latest_transitions: [],
-		errors: [],
-	},
-	app_filter: {
-		backend_mode: 'V3_NFT_ONLY',
-		requested_enabled: false,
-		enabled: false,
-		available: false,
-		degraded: false,
-		retained_previous_snapshot: false,
-		app_policy_generation: 0,
-		classifier_generation: 0,
-		dns_subscribed: false,
-		dns_events_accepted: 0,
-		dns_events_dropped: 0,
-		classification_conflicts: 0,
-		projection_publish_errors: 0,
-		next_transition: null,
-		errors: [],
-		warnings: [],
-	},
-	software_offload: { ...committed.acceleration },
-};
+let state = status_projection.initial(committed,
+	temporary_approval.constants.MAX_ACTIVE_LEASES);
 
 function lease_context(base_app_compiled) {
 	return {
@@ -211,7 +163,6 @@ function current_status() {
 		observation_entries: observation_store.size(observation_runtime),
 		dns_events_accepted: observation_runtime.accepted,
 		dns_events_dropped: observation_runtime.dropped,
-		classification_conflicts,
 		projection_publish_errors,
 	});
 }
@@ -258,16 +209,6 @@ function compile_runtime(config, epoch, tracking_required) {
 		subject_projection, consistency, lease_state, context, monotonic_now };
 }
 
-function authorization_convergence(actions, transitions, action_id, scope) {
-	if (actions[action_id]?.status != 'SUCCEEDED')
-		return 'FAILED';
-	for (let transition in transitions)
-		if (transition.scope == scope && transition.restrictive &&
-		    actions[`transition.${transition.id}`]?.status != 'SUCCEEDED')
-			return 'FAILED';
-	return 'CONVERGED';
-}
-
 function reconcile_once(reason, repair) {
 	ensure_dns_subscription();
 	const epoch = clock()[0];
@@ -309,15 +250,6 @@ function reconcile_once(reason, repair) {
 	if (length(committed_result.transitions))
 		latest_authorization_transitions = committed_result.transitions;
 	const access_ok = execution.actions[plan.actions.access.id].status == 'SUCCEEDED';
-	const access_convergence = authorization_convergence(execution.actions,
-		execution.transitions, plan.actions.access.id, 'access');
-	const application_convergence = authorization_convergence(execution.actions,
-		execution.transitions, plan.actions.application.id, 'application');
-	const access_execution = execution.actions[plan.actions.access.id].status;
-	const application_execution =
-		execution.actions[plan.actions.application.id].status;
-	const acceleration_execution =
-		execution.actions[plan.actions.acceleration.id].status;
 	if (!lease_transaction_active && lease_journal_dirty && access_ok &&
 	    committed_result.application_ok) {
 		const journal = write_lease_journal(lease_database);
@@ -325,110 +257,25 @@ function reconcile_once(reason, repair) {
 			record_lease_errors([ journal.error ]);
 	}
 
-	const compiled = runtime.compiled;
-	const projection = runtime.projection;
 	const app_compiled = runtime.app_compiled;
 	const classification_state = runtime.classification_state;
-	const subject_projection = runtime.subject_projection;
-	const app_apply = execution.application_result;
-	const app_runtime = execution.application_runtime;
-	const source = observed.topology.source;
-	const destination = observed.topology.destination;
 	last_app_compiled = app_compiled;
-	classification_conflicts = classification_state.semantic_state.conflict_count;
-	state = {
-		running: true,
-		applied: committed_result.synchronized,
-		enabled: compiled.enabled,
-		requested_enabled: compiled.requested_enabled,
-		schema_supported: compiled.schema_supported,
-		generation: committed.access.generation,
-		last_reason: reason ?? 'unknown',
-		last_reconcile_attempt_id: attempt.attempt_id,
-		last_reconcile_result: execution.ok ? 'SUCCEEDED' : 'FAILED',
-		last_attempt: committed.health.last_attempt,
-		last_success: committed.health.last_success,
-		last_error: committed.health.last_error,
-		next_transition: compiled.next_transition,
-		clock_valid: compiled.clock_valid,
-		mode: compiled.mode,
-		deny_action: compiled.deny_action,
-		default_verdict: compiled.default_verdict,
-		exception_verdict: compiled.exception_verdict,
-		identity_count: length(compiled.identities),
-		active_identity_count: reconciliation.active_identity_count(compiled.identities),
-		binding_count: projection.binding_count,
-		exception_count: compiled.enabled ? length(projection.exceptions) : 0,
-		source_interfaces: source.interfaces,
-		destination_interfaces: destination.interfaces,
-		policy_publication: {
-			access: access_ok ? 'CURRENT' : 'STALE',
-			application: committed_result.application_ok ? 'CURRENT' : 'STALE',
-		},
-		authorization_convergence: {
-			access: access_convergence,
-			application: application_convergence,
-			acceleration:
-				acceleration_execution == 'SUCCEEDED'
-					? 'CONVERGED' : 'FAILED',
-		},
-		plane_status: {
-			access: {
-				execution: access_execution,
-				publication: access_ok ? 'CURRENT' : 'STALE',
-				convergence: access_convergence,
-				health: access_ok && build.desired.access.ready
-					? 'HEALTHY' : 'DEGRADED',
-			},
-			application: {
-				execution: application_execution,
-				publication: committed_result.application_ok
-					? 'CURRENT' : 'STALE',
-				convergence: application_convergence,
-				health: app_apply.degraded ? 'DEGRADED'
-					: (app_apply.tracking_enabled ? 'HEALTHY' : 'UNKNOWN'),
-			},
-			acceleration: {
-				execution: acceleration_execution,
-				publication: 'NOT_REQUIRED',
-				convergence: acceleration_execution == 'SUCCEEDED'
-					? 'CONVERGED' : 'FAILED',
-				health: build.desired.acceleration.offload_present
-					? (execution.sfo_ready ? 'HEALTHY' : 'DEGRADED')
-					: 'UNKNOWN',
-			},
-		},
-		errors: execution.errors,
-		warnings: execution.warnings,
-		temporary_approvals: {
-			active_count: length(lease_database.leases),
+	state = status_projection.project({
+		committed,
+		desired: build.desired,
+		plan,
+		execution,
+		outcome: committed_result,
+		observed,
+		leases: {
+			database: lease_database,
 			capacity: temporary_approval.constants.MAX_ACTIVE_LEASES,
 			next_expiry: temporary_approval.next_expiry(lease_database),
 			journal_available: !lease_journal_dirty,
 			latest_transitions: latest_authorization_transitions,
 			errors: lease_journal_errors,
 		},
-		app_filter: {
-			backend_mode: app_apply.backend_mode,
-			requested_enabled: app_compiled.requested_enabled,
-			enabled: app_apply.enabled,
-			tracking_enabled: app_apply.tracking_enabled,
-			degraded: app_apply.degraded,
-			retained_previous_snapshot: app_apply.retained_previous_snapshot,
-			available: app_apply.available,
-			applied: app_apply.ok,
-			app_policy_generation: app_apply.generation,
-			classifier_generation: app_apply.classifier_generation,
-			classifier_signature_count: classification_state.runtime_projection.signature_count,
-			classifier_signature_memory_bytes: classification_state.runtime_projection.signature_memory_bytes,
-			profile_count: app_compiled.classification_model.profile_count,
-			classification_ir_entry_count: app_compiled.classification_model.ir_entry_count,
-			semantic_entry_count: length(classification_state.semantic_state.entries),
-			runtime_projection_entry_count: classification_state.runtime_projection.signature_count,
-			provider_count: length(classification_state.semantic_state.provider_ids),
-			resource_limits: app_compiled.resource_limits,
-			runtime_available: app_runtime.available,
-			runtime_status_json: app_runtime.status_json,
+		diagnostics: {
 			dns_subscribed,
 			observation_entries: observation_store.size(observation_runtime),
 			observation_generation: observation_runtime.generation,
@@ -436,19 +283,11 @@ function reconcile_once(reason, repair) {
 			observations_stale: observation_runtime.stale,
 			dns_events_accepted: observation_runtime.accepted,
 			dns_events_dropped: observation_runtime.dropped,
-			classification_conflicts,
 			projection_publish_errors,
-			next_transition: app_compiled.next_transition,
-			subject_count: length(app_compiled.identities),
-			selector_count: length(subject_projection.preview_selectors),
-			policy_entry_count: length(app_compiled.policies),
-			errors: app_apply.errors,
-			warnings: app_apply.warnings,
 		},
-		software_offload: { ...committed.acceleration },
-	};
+	});
 
-	update_timer(config, compiled, app_compiled, classification_state, epoch);
+	update_timer(config, runtime.compiled, app_compiled, classification_state, epoch);
 	return state;
 }
 

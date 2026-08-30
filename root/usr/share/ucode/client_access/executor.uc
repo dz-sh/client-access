@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /* Side-effect execution for an already-planned reconciliation attempt. This
- * module evaluates declared prerequisites and returns bounded evidence. It
- * does not compile policy or advance daemon-global committed state.
+ * module returns bounded evidence and does not compile policy, re-plan
+ * generations, or advance daemon-global committed state.
  */
 
 import * as firewall from 'client_access.firewall';
@@ -73,7 +73,6 @@ export function execute(plan, desired, committed, handles) {
 		application_state.policy_generation = policy_floor;
 	if (classifier_floor > application_state.classifier_generation)
 		application_state.classifier_generation = classifier_floor;
-	application_state.generation_floors_loaded = true;
 	const previous_app_enforcement = application_state.applied_enforcement;
 	let application_result = application_reconcile.apply(application_state,
 		desired.application.compiled,

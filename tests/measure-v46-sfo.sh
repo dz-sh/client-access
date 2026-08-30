@@ -142,11 +142,18 @@ publish() {
 	} | sudo "$bpfctl" sync
 }
 
+run_sfoctl() {
+	# Enter only the router network namespace. Keeping the runner mount
+	# namespace makes the shared bpffs pins visible to the helper while its
+	# ctnetlink socket observes the isolated router conntrack table.
+	sudo nsenter --net="/var/run/netns/$router_ns" -- "$sfoctl" "$@"
+}
+
 wait_for_offload() {
 	minimum=$1
 	output=$2
 	for attempt in $(seq 1 80); do
-		if sudo ip netns exec "$router_ns" "$sfoctl" status >"$output" &&
+		if run_sfoctl status >"$output" &&
 		   jq -e --argjson minimum "$minimum" \
 			'.result == "COMPLETE" and .software_offloaded_flow_count >= $minimum' \
 			"$output" >/dev/null; then
@@ -188,7 +195,7 @@ flow20_pid=$!
 flow_pids="$flow10_pid $flow20_pid"
 wait_for_offload 2 "$report_dir/two-class-sfo.json"
 publish 2 1 0 0 0 0
-sudo ip netns exec "$router_ns" "$sfoctl" revoke 42 10 2000 \
+run_sfoctl revoke 42 10 2000 \
 	>"$report_dir/ipv4-nat-class-revocation.json"
 jq -e '.result == "COMPLETE" and .candidate_count >= 4 and .remaining == 0 and
 	.revocation_latency_ms <= 2000' "$report_dir/ipv4-nat-class-revocation.json"
@@ -200,7 +207,7 @@ flow30_pid=$!
 flow_pids="$flow_pids $flow30_pid"
 wait_for_offload 2 "$report_dir/ipv6-sfo.json"
 publish 3 1 0 1 0 0
-sudo ip netns exec "$router_ns" "$sfoctl" revoke 42 30 2000 \
+run_sfoctl revoke 42 30 2000 \
 	>"$report_dir/ipv6-class-revocation.json"
 jq -e '.result == "COMPLETE" and .candidate_count >= 1 and .remaining == 0 and
 	.revocation_latency_ms <= 2000' "$report_dir/ipv6-class-revocation.json"
@@ -212,13 +219,13 @@ flow40_pid=$!
 flow_pids="$flow_pids $flow40_pid"
 wait_for_offload 2 "$report_dir/udp-sfo.json"
 publish 4 1 0 1 1 0
-sudo ip netns exec "$router_ns" "$sfoctl" revoke 42 40 2000 \
+run_sfoctl revoke 42 40 2000 \
 	>"$report_dir/udp-class-revocation.json"
 jq -e '.result == "COMPLETE" and .candidate_count >= 1 and .remaining == 0 and
 	.revocation_latency_ms <= 2000' "$report_dir/udp-class-revocation.json"
 sudo kill -0 "$flow20_pid"
 
-sudo ip netns exec "$router_ns" "$sfoctl" revoke 42 - 2000 \
+run_sfoctl revoke 42 - 2000 \
 	>"$report_dir/subject-revocation.json"
 jq -e '.result == "COMPLETE" and .candidate_count >= 1 and .remaining == 0 and
 	.revocation_latency_ms <= 2000' "$report_dir/subject-revocation.json"
@@ -253,13 +260,13 @@ sudo "$bpfctl" status >"$report_dir/stress-bpf-status.json"
 jq -e --argjson minimum "$stress_count" '.flow_map_entries >= $minimum' \
 	"$report_dir/stress-bpf-status.json"
 publish 5 1 0 1 1 1
-sudo ip netns exec "$router_ns" "$sfoctl" revoke 42 50 10000 \
+run_sfoctl revoke 42 50 10000 \
 	>"$report_dir/near-bound-revocation.json"
 jq -e --argjson minimum "$stress_count" \
 	'.result == "COMPLETE" and .candidate_count >= $minimum and .remaining == 0 and
 	.revocation_latency_ms <= 10000' "$report_dir/near-bound-revocation.json"
 
-sudo ip netns exec "$router_ns" "$sfoctl" gc 1 \
+run_sfoctl gc 1 \
 	>"$report_dir/offload-aware-gc.json"
 jq -e '.result == "COMPLETE" and .correlation_health == "HEALTHY"' \
 	"$report_dir/offload-aware-gc.json"

@@ -13,6 +13,13 @@ function assert_true(value, message) {
 		fail(message);
 }
 
+function contains(values, expected) {
+	for (let value in values)
+		if (value == expected)
+			return true;
+	return false;
+}
+
 function observed(policy_generation, classifier_generation) {
 	return {
 		application: {
@@ -47,9 +54,9 @@ assert_true(plan.actions.application.candidate_policy_generation == 1 &&
 	'initial application and classifier snapshots need independent generations');
 assert_true(sprintf('%J', plan.actions.application.target_interfaces) ==
 		'["lan0","lan1"]' &&
-	plan.actions.application.interfaces_to_attach == null &&
-	plan.actions.application.interfaces_to_detach == null &&
-	plan.actions.application.interfaces_to_keep == null,
+	!contains(keys(plan.actions.application), 'interfaces_to_attach') &&
+	!contains(keys(plan.actions.application), 'interfaces_to_detach') &&
+	!contains(keys(plan.actions.application), 'interfaces_to_keep'),
 	'planner must expose target interfaces without backend TC deltas');
 
 committed.access = { generation: 5, signature: 'access-a', applied: true };

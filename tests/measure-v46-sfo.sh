@@ -225,6 +225,9 @@ jq -e '.result == "COMPLETE" and .candidate_count >= 1 and .remaining == 0 and
 	.revocation_latency_ms <= 2000' "$report_dir/udp-class-revocation.json"
 sudo kill -0 "$flow20_pid"
 
+# Publish the restrictive projection before revoking accelerated state so the
+# still-running class20 workload cannot recreate a deleted conntrack entry.
+publish 5 1 1 1 1 1
 run_sfoctl revoke 42 - 2000 \
 	>"$report_dir/subject-revocation.json"
 jq -e '.result == "COMPLETE" and .candidate_count >= 1 and .remaining == 0 and
@@ -232,6 +235,8 @@ jq -e '.result == "COMPLETE" and .candidate_count >= 1 and .remaining == 0 and
 
 current_phase=near_candidate_bound
 printf '%s\n' "$current_phase" >"$report_dir/phase.txt"
+# Re-open only class50 for the next scenario, then close it with generation 7.
+publish 6 1 1 1 1 0
 stress_count=3072
 sudo ip netns exec "$server_ns" sh -c \
 	"ulimit -n 8192; exec python3 '$repo_dir/tests/sfo-flow-load.py' server 198.51.100.2 5210 $stress_count" \
@@ -259,7 +264,7 @@ wait_for_offload 100 "$report_dir/stress-sfo.json"
 sudo "$bpfctl" status >"$report_dir/stress-bpf-status.json"
 jq -e --argjson minimum "$stress_count" '.flow_map_entries >= $minimum' \
 	"$report_dir/stress-bpf-status.json"
-publish 5 1 0 1 1 1
+publish 7 1 1 1 1 1
 run_sfoctl revoke 42 50 10000 \
 	>"$report_dir/near-bound-revocation.json"
 jq -e --argjson minimum "$stress_count" \

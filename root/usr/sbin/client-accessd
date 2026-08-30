@@ -12,23 +12,24 @@ import * as model from 'client_access.model';
 import * as temporary_approval from 'client_access.lease';
 import * as config_adapter from 'client_access.config';
 import * as lease_store from 'client_access.lease_store';
-import * as firewall from 'client_access.firewall';
-import * as bpf_runtime from 'client_access.bpf_runtime';
 import * as observation_store from 'client_access.observation_store';
 import * as reconciliation from 'client_access.reconcile';
-import * as application_reconcile from 'client_access.application_reconcile';
 import * as status_projection from 'client_access.status';
-import * as runtime_policy from 'client_access.runtime';
+import * as desired_state from 'client_access.desired';
+import * as observed_state from 'client_access.observed';
+import * as reconcile_executor from 'client_access.executor';
+import * as state_commit from 'client_access.commit';
 import * as sfo_runtime from 'client_access.sfo_runtime';
-import * as sfo_manager from 'client_access.sfo_manager';
 
 const LEASE_JOURNAL = getenv('CA_LEASE_JOURNAL') ??
 	'/tmp/client-access-approvals.json';
 
 let timer, published, conn;
-let generation = 0;
-let applied_signature = null;
-let app_runtime_state = application_reconcile.create();
+let committed = state_commit.create();
+let reconcile_active = false;
+let pending_reconcile_reason = null;
+let pending_reconcile_repair = false;
+let reconcile_attempt_id = 0;
 let dns_subscriber, observation_flush_timer;
 let dns_subscribed = false;
 let observation_runtime = observation_store.create();
@@ -40,9 +41,7 @@ let lease_journal_loaded = false;
 let lease_journal_dirty = false;
 let lease_transaction_active = false;
 let lease_journal_errors = [];
-let effective_authorization_snapshot = null;
 let latest_authorization_transitions = [];
-let sfo_runtime_state = sfo_manager.create();
 let state = {
 	running: true,
 	applied: false,
@@ -90,7 +89,7 @@ let state = {
 		errors: [],
 		warnings: [],
 	},
-	software_offload: { ...sfo_runtime_state },
+	software_offload: { ...committed.acceleration },
 };
 
 function lease_context(base_app_compiled) {
@@ -207,7 +206,7 @@ function ensure_dns_subscription() {
 }
 
 function current_status() {
-	let result = status_projection.snapshot(state, {
+	return status_projection.snapshot(state, {
 		dns_subscribed,
 		observation_entries: observation_store.size(observation_runtime),
 		dns_events_accepted: observation_runtime.accepted,
@@ -215,50 +214,6 @@ function current_status() {
 		classification_conflicts,
 		projection_publish_errors,
 	});
-	if (result.app_filter.tracking_enabled && bpf_runtime.present()) {
-		const runtime = bpf_runtime.health(
-			result.app_filter.app_policy_generation,
-			result.app_filter.classifier_generation,
-			application_reconcile.interfaces(app_runtime_state));
-		result.app_filter.runtime_available = runtime.code == 0;
-		result.app_filter.runtime_status_json = runtime.code == 0
-			? trim(runtime.output) : null;
-		if (runtime.code == 0 && sfo_runtime_state.mode == 'SFO_ACTIVE') {
-			let bpf_status = null;
-			try { bpf_status = json(runtime.output); }
-			catch (error) { bpf_status = null; }
-			if (bpf_status == null || (bpf_status.flow_map_full ?? 0) > 0 ||
-			    (bpf_status.flow_map_entries ?? 0) >=
-				(bpf_status.flow_capacity ?? 0)) {
-				sfo_runtime_state.mode = 'SFO_DEGRADED';
-				sfo_runtime_state.correlation_health = 'DEGRADED';
-				sfo_runtime_state.baseline_required = true;
-				if (!length(sfo_runtime_state.errors))
-					push(sfo_runtime_state.errors,
-						'BPF semantic flow capacity is exhausted or cannot be verified');
-				result.software_offload = { ...sfo_runtime_state };
-				result.applied = false;
-				state = result;
-			}
-		}
-		if (runtime.code != 0) {
-			if (sfo_runtime_state.mode == 'SFO_ACTIVE') {
-				sfo_runtime_state.mode = 'SFO_DEGRADED';
-				sfo_runtime_state.correlation_health = 'DEGRADED';
-				sfo_runtime_state.baseline_required = true;
-				push(sfo_runtime_state.errors,
-					'BPF semantic flow correlation became unavailable');
-				result.software_offload = { ...sfo_runtime_state };
-				result.applied = false;
-			}
-			let errors = [ ...(result.app_filter.errors ?? []),
-				'Application-filter runtime health no longer matches the published snapshot' ];
-			application_reconcile.neutralize(app_runtime_state, errors);
-			result = status_projection.application_degraded(result, errors);
-			state = result;
-		}
-	}
-	return result;
 }
 
 function update_timer(config, compiled, app_compiled, classification_state, epoch) {
@@ -303,169 +258,97 @@ function compile_runtime(config, epoch, tracking_required) {
 		subject_projection, consistency, lease_state, context, monotonic_now };
 }
 
-function reconcile(reason, force) {
+function authorization_convergence(actions, transitions, action_id, scope) {
+	if (actions[action_id]?.status != 'SUCCEEDED')
+		return 'FAILED';
+	for (let transition in transitions)
+		if (transition.scope == scope && transition.restrictive &&
+		    actions[`transition.${transition.id}`]?.status != 'SUCCEEDED')
+			return 'FAILED';
+	return 'CONVERGED';
+}
+
+function reconcile_once(reason, repair) {
 	ensure_dns_subscription();
 	const epoch = clock()[0];
 	const config = config_adapter.load();
-	const runtime_offload = firewall.runtime_offload();
-	const acceleration = runtime_policy.offload_capability(config,
-		runtime_offload.checked, runtime_offload.ruleset, sfo_runtime.present());
-	const runtime = compile_runtime(config, epoch, acceleration.tracking_required);
-	const compiled = runtime.compiled;
-	const projection = runtime.projection;
-	const app_compiled = runtime.app_compiled;
-	const classification_state = runtime.classification_state;
-	const subject_projection = runtime.subject_projection;
+	const observed = observed_state.collect(config);
+	const runtime = compile_runtime(config, epoch,
+		observed.acceleration.capability.tracking_required);
 	const authorization_snapshot = temporary_approval.effective_snapshot(
-		compiled, app_compiled, app_compiled.enabled);
+		runtime.compiled, runtime.app_compiled, runtime.app_compiled.enabled);
 	const transition_reason = reconciliation.transition_reason(reason,
 		runtime.lease_state);
-	const planned_transitions = effective_authorization_snapshot == null
+	const transitions = committed.authorization.snapshot == null
 		? [] : temporary_approval.plan_transitions(
-			effective_authorization_snapshot, authorization_snapshot,
+			committed.authorization.snapshot, authorization_snapshot,
 			transition_reason);
-	const source = compiled.enabled || app_compiled.requested_enabled ||
-		acceleration.tracking_required
-		? firewall.resolve_zones(config.source_zone)
-		: { interfaces: [], errors: [] };
-	const destination = compiled.enabled || app_compiled.requested_enabled ||
-		acceleration.tracking_required
-		? firewall.resolve_zones(config.destination_zone)
-		: { interfaces: [], errors: [] };
-	const signature = reconciliation.access_signature(compiled, projection,
-		source.interfaces, destination.interfaces);
-	let readiness_errors = compiled.enabled
-		? [ ...source.errors, ...destination.errors ] : [];
-	if (compiled.enabled && !length(source.interfaces))
-		push(readiness_errors, 'No source interfaces resolved; enforcement is inactive');
-	if (compiled.enabled && !length(destination.interfaces))
-		push(readiness_errors, 'No destination interfaces resolved; enforcement is inactive');
-	let errors = [ ...compiled.errors, ...projection.errors, ...readiness_errors ];
-	let warnings = [ ...compiled.warnings, ...projection.warnings ];
-	let apply = { ok: true, error: null };
-
-	if (force || signature != applied_signature)
-		apply = firewall.apply_access(compiled, projection, source.interfaces,
-			destination.interfaces);
-	if (apply.ok) {
-		if (force || signature != applied_signature)
-			generation++;
-		applied_signature = signature;
-	}
-	else
-		push(errors, apply.error);
-
-	const previous_app_enforcement = app_runtime_state.applied_enforcement;
-	let app_apply = application_reconcile.apply(app_runtime_state, config,
-		app_compiled, classification_state,
-		subject_projection, source.interfaces, destination.interfaces,
-		[ ...source.errors, ...destination.errors ], force, observation_runtime,
-		acceleration);
-	let app_runtime = application_reconcile.runtime_snapshot(app_runtime_state,
-		app_apply.tracking_enabled, app_apply.generation,
-		app_apply.classifier_generation);
-	if (app_apply.tracking_enabled && !app_runtime.available) {
-		push(app_apply.errors, app_runtime.error ??
-			'Application-filter runtime state became unavailable');
-		application_reconcile.neutralize(app_runtime_state, app_apply.errors);
-		app_apply = {
-			...app_apply,
-			ok: false,
-			available: false,
-			enabled: false,
-			degraded: true,
-			retained_previous_snapshot: false,
-			backend_mode: 'V3_NFT_ONLY',
-			tracking_enabled: false,
-		};
-	}
-	else if (app_runtime.error)
-		push(app_apply.warnings, app_runtime.error);
-	for (let warning in runtime.consistency.warnings)
-		push(app_apply.warnings, warning);
-	if (app_apply.ok && app_apply.enabled)
+	const build = desired_state.build({
+		config,
+		epoch,
+		runtime,
+		authorization_snapshot,
+		lease_database,
+		next_approval_expiry: temporary_approval.next_expiry(lease_database),
+	}, observed);
+	const attempt = reconciliation.attempt_context(reason, repair,
+		++reconcile_attempt_id);
+	const plan = reconciliation.plan(committed, observed, build.desired,
+		transitions, attempt);
+	const execution = reconcile_executor.execute(plan, build.desired, committed, {
+		observed,
+		diagnostics: build.diagnostics,
+		observation_runtime,
+		sfo_runtime,
+	});
+	const committed_result = state_commit.apply(committed, build.desired,
+		plan, execution);
+	committed = committed_result.state;
+	if (execution.application_result.ok && execution.application_result.enabled)
 		commit_observations(runtime.observation_context, epoch);
-
-	let planned_broad_revocation = false;
-	for (let transition in planned_transitions)
-		if (transition.restrictive && transition.subject_id == null)
-			planned_broad_revocation = true;
-	if (acceleration.mode == 'SFO_ACTIVE' && !previous_app_enforcement &&
-	    app_apply.enabled && !planned_broad_revocation)
-		sfo_runtime_state.baseline_required = true;
-	sfo_runtime_state = sfo_manager.reconcile(sfo_runtime_state, acceleration,
-		app_apply.tracking_enabled && app_runtime.available &&
-			app_runtime.correlation_healthy,
-		config.sfo_revocation_deadline_ms, sfo_runtime);
-	if (acceleration.mode == 'SFO_ACTIVE')
-		sfo_runtime_state = sfo_manager.reconcile_gc(sfo_runtime_state,
-			acceleration, app_apply.tracking_enabled && app_runtime.available &&
-				app_runtime.correlation_healthy, sfo_runtime);
-	else if (app_apply.tracking_enabled && app_runtime.available)
-		bpf_runtime.gc(300);
-
-	const app_publication_ok = !app_compiled.requested_enabled ||
-		(app_apply.ok && app_apply.enabled);
-	let transition_candidates = [], next_authorization_snapshot = {
-		...(effective_authorization_snapshot ?? {}),
-	};
-	for (let key, entry in authorization_snapshot) {
-		if ((entry.scope == 'access' && apply.ok) ||
-		    (entry.scope == 'application' && app_publication_ok))
-			next_authorization_snapshot[key] = entry;
-	}
-	for (let transition in planned_transitions) {
-		const published_ok = transition.scope == 'access'
-			? apply.ok : app_publication_ok;
-		push(transition_candidates, {
-			...transition,
-			policy_generation: transition.scope == 'access'
-				? generation : app_apply.generation,
-			policy_published: published_ok,
-		});
-		if (transition.restrictive && !published_ok)
-			push(errors,
-				`Restrictive ${transition.scope} authorization transition could not be published`);
-	}
-	const published_transitions = sfo_manager.revoke_transitions(
-		sfo_runtime_state, transition_candidates, acceleration, sfo_runtime);
-	for (let transition in published_transitions)
-		if (transition.restrictive && transition.revocation_state == 'failed')
-			push(errors,
-				`Restrictive ${transition.scope} transition did not revoke stale accelerated state`);
-	if (apply.ok || app_publication_ok)
-		effective_authorization_snapshot = next_authorization_snapshot;
-	if (length(published_transitions))
-		latest_authorization_transitions = published_transitions;
-	if (!lease_transaction_active && lease_journal_dirty && apply.ok && app_publication_ok) {
+	if (length(committed_result.transitions))
+		latest_authorization_transitions = committed_result.transitions;
+	const access_ok = execution.actions[plan.actions.access.id].status == 'SUCCEEDED';
+	const access_convergence = authorization_convergence(execution.actions,
+		execution.transitions, plan.actions.access.id, 'access');
+	const application_convergence = authorization_convergence(execution.actions,
+		execution.transitions, plan.actions.application.id, 'application');
+	const access_execution = execution.actions[plan.actions.access.id].status;
+	const application_execution =
+		execution.actions[plan.actions.application.id].status;
+	const acceleration_execution =
+		execution.actions[plan.actions.acceleration.id].status;
+	if (!lease_transaction_active && lease_journal_dirty && access_ok &&
+	    committed_result.application_ok) {
 		const journal = write_lease_journal(lease_database);
 		if (!journal.ok)
 			record_lease_errors([ journal.error ]);
 	}
 
-	const configuration_ready = compiled.schema_supported && compiled.mode_valid;
-	const sfo_ready = !acceleration.offload_present ||
-		sfo_runtime_state.mode == 'SFO_ACTIVE';
-	const synchronized = apply.ok && configuration_ready &&
-		!length(readiness_errors) && sfo_ready;
-	const state_error = apply.error ??
-		(length(readiness_errors) ? join('; ', readiness_errors) :
-		 (!configuration_ready ? join('; ', compiled.errors) :
-		 (!sfo_ready ? join('; ', sfo_runtime_state.errors) : null)));
-
+	const compiled = runtime.compiled;
+	const projection = runtime.projection;
+	const app_compiled = runtime.app_compiled;
+	const classification_state = runtime.classification_state;
+	const subject_projection = runtime.subject_projection;
+	const app_apply = execution.application_result;
+	const app_runtime = execution.application_runtime;
+	const source = observed.topology.source;
+	const destination = observed.topology.destination;
 	last_app_compiled = app_compiled;
 	classification_conflicts = classification_state.semantic_state.conflict_count;
 	state = {
 		running: true,
-		applied: synchronized,
+		applied: committed_result.synchronized,
 		enabled: compiled.enabled,
 		requested_enabled: compiled.requested_enabled,
 		schema_supported: compiled.schema_supported,
-		generation,
+		generation: committed.access.generation,
 		last_reason: reason ?? 'unknown',
-		last_attempt: epoch,
-		last_success: synchronized ? epoch : state.last_success,
-		last_error: state_error,
+		last_reconcile_attempt_id: attempt.attempt_id,
+		last_reconcile_result: execution.ok ? 'SUCCEEDED' : 'FAILED',
+		last_attempt: committed.health.last_attempt,
+		last_success: committed.health.last_success,
+		last_error: committed.health.last_error,
 		next_transition: compiled.next_transition,
 		clock_valid: compiled.clock_valid,
 		mode: compiled.mode,
@@ -478,8 +361,45 @@ function reconcile(reason, force) {
 		exception_count: compiled.enabled ? length(projection.exceptions) : 0,
 		source_interfaces: source.interfaces,
 		destination_interfaces: destination.interfaces,
-		errors,
-		warnings,
+		policy_publication: {
+			access: access_ok ? 'CURRENT' : 'STALE',
+			application: committed_result.application_ok ? 'CURRENT' : 'STALE',
+		},
+		authorization_convergence: {
+			access: access_convergence,
+			application: application_convergence,
+			acceleration:
+				acceleration_execution == 'SUCCEEDED'
+					? 'CONVERGED' : 'FAILED',
+		},
+		plane_status: {
+			access: {
+				execution: access_execution,
+				publication: access_ok ? 'CURRENT' : 'STALE',
+				convergence: access_convergence,
+				health: access_ok && build.desired.access.ready
+					? 'HEALTHY' : 'DEGRADED',
+			},
+			application: {
+				execution: application_execution,
+				publication: committed_result.application_ok
+					? 'CURRENT' : 'STALE',
+				convergence: application_convergence,
+				health: app_apply.degraded ? 'DEGRADED'
+					: (app_apply.tracking_enabled ? 'HEALTHY' : 'UNKNOWN'),
+			},
+			acceleration: {
+				execution: acceleration_execution,
+				publication: 'NOT_REQUIRED',
+				convergence: acceleration_execution == 'SUCCEEDED'
+					? 'CONVERGED' : 'FAILED',
+				health: build.desired.acceleration.offload_present
+					? (execution.sfo_ready ? 'HEALTHY' : 'DEGRADED')
+					: 'UNKNOWN',
+			},
+		},
+		errors: execution.errors,
+		warnings: execution.warnings,
 		temporary_approvals: {
 			active_count: length(lease_database.leases),
 			capacity: temporary_approval.constants.MAX_ACTIVE_LEASES,
@@ -525,11 +445,30 @@ function reconcile(reason, force) {
 			errors: app_apply.errors,
 			warnings: app_apply.warnings,
 		},
-		software_offload: { ...sfo_runtime_state },
+		software_offload: { ...committed.acceleration },
 	};
 
 	update_timer(config, compiled, app_compiled, classification_state, epoch);
 	return state;
+}
+
+function reconcile(reason, repair) {
+	if (reconcile_active) {
+		pending_reconcile_reason = reason ?? pending_reconcile_reason ?? 'coalesced';
+		pending_reconcile_repair = pending_reconcile_repair || !!repair;
+		return state;
+	}
+	reconcile_active = true;
+	const result = reconcile_once(reason, repair);
+	reconcile_active = false;
+	if (pending_reconcile_reason != null) {
+		const next_reason = pending_reconcile_reason;
+		const next_repair = pending_reconcile_repair;
+		pending_reconcile_reason = null;
+		pending_reconcile_repair = false;
+		return reconcile(next_reason, next_repair);
+	}
+	return result;
 }
 
 function observation_snapshot(config) {
@@ -627,11 +566,18 @@ function observation_inventory() {
 
 function approval_plane_published(result, scope) {
 	if (scope == 'access')
-		return result.applied;
+		return result.policy_publication?.access == 'CURRENT';
 	const application_published = result.app_filter.requested_enabled
 		? result.app_filter.applied && result.app_filter.enabled
 		: result.app_filter.applied;
-	return application_published && result.applied;
+	return application_published &&
+		result.policy_publication?.application == 'CURRENT';
+}
+
+function approval_plane_converged(result, scope) {
+	return approval_plane_published(result, scope) &&
+		result.authorization_convergence &&
+		result.authorization_convergence[scope] == 'CONVERGED';
 }
 
 function approval_inventory() {
@@ -770,8 +716,8 @@ function revoke_approval(lease_id) {
 	lease_transaction_active = true;
 	const applied = reconcile('lease_revoked', false);
 	lease_transaction_active = false;
-	const published_ok = approval_plane_published(applied, existing.scope);
-	return published_ok
+	const converged = approval_plane_converged(applied, existing.scope);
+	return converged
 		? { ok: true, revoked: existing, transitions: latest_authorization_transitions }
 		: { ok: false, revoked: existing, degraded: true,
 			errors: [ 'Approval was removed, but restrictive runtime convergence failed' ] };
@@ -849,10 +795,8 @@ if (!published) {
 	exit(1);
 }
 
-// Establish a known neutral cross-subsystem state before the first republish.
-if (bpf_runtime.present())
-	bpf_runtime.disable();
-firewall.apply_application_scope(false, [], []);
+// Establish a known neutral application plane before the first republish.
+reconcile_executor.neutralize_startup();
 
 // The safety wakeup also repairs runtime set loss after an out-of-band fw4 reload.
 timer = uloop.timer(1, function() { reconcile('timer', true); });

@@ -107,6 +107,22 @@ jobs:
           test "$(find client-access-core client-access-bpf client-access-sfo \
             luci-app-client-access -mindepth 1 -maxdepth 1 -name Makefile | wc -l)" -eq 4
 
+      - name: Enforce the V4.7 reconciliation boundary
+        shell: bash
+        run: |
+          for unit in desired observed reconcile executor commit state_schema; do
+            test -f "root/usr/share/ucode/client_access/${unit}.uc"
+          done
+          ! grep -Eq "client_access\.(firewall|bpf_runtime|application_reconcile|sfo_manager)" \
+            root/usr/share/ucode/client_access/desired.uc \
+            root/usr/share/ucode/client_access/reconcile.uc \
+            root/usr/share/ucode/client_access/commit.uc
+          ! grep -Eq "client_access\.(firewall|bpf_runtime|application_reconcile|sfo_manager)" \
+            root/usr/sbin/client-accessd
+          grep -Fq 'reconcile_executor.execute' root/usr/sbin/client-accessd
+          grep -Fq 'state_commit.apply' root/usr/sbin/client-accessd
+          grep -Fq 'observed_state.collect' root/usr/sbin/client-accessd
+
       - name: Check the generated nftables fragment
         shell: bash
         run: |
@@ -206,6 +222,22 @@ jobs:
           "${RUNNER_TEMP}/ucode-build/ucode"
           -L "${GITHUB_WORKSPACE}/root/usr/share/ucode"
           "${GITHUB_WORKSPACE}/tests/sfo_manager.uc"
+
+      - name: Run V4.7 reconciliation planner tests
+        env:
+          TZ: UTC
+        run: >-
+          "${RUNNER_TEMP}/ucode-build/ucode"
+          -L "${GITHUB_WORKSPACE}/root/usr/share/ucode"
+          "${GITHUB_WORKSPACE}/tests/reconcile.uc"
+
+      - name: Run V4.7 evidence-based commit tests
+        env:
+          TZ: UTC
+        run: >-
+          "${RUNNER_TEMP}/ucode-build/ucode"
+          -L "${GITHUB_WORKSPACE}/root/usr/share/ucode"
+          "${GITHUB_WORKSPACE}/tests/commit.uc"
 
       - name: Compile-check the daemon with stub target modules
         run: >-

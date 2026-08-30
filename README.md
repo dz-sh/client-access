@@ -1,9 +1,13 @@
-# luci-app-client-access
+# Client Access for OpenWrt
 
-An OpenWrt/ImmortalWrt LuCI application for discovering LAN clients and
-controlling their Internet access with firewall4/nftables.
+Client Access helps you see devices on your LAN, give the devices you care
+about stable names, and decide when they may use the Internet. It runs on
+OpenWrt and ImmortalWrt and can be managed from LuCI.
 
-## Features
+Access control starts **off**, so installing the application does not change
+how existing clients reach the Internet.
+
+## What you can do
 
 - Discover LAN clients with best-effort names and IP addresses.
 - Create stable identities for the clients you want to manage.
@@ -14,8 +18,7 @@ controlling their Internet access with firewall4/nftables.
   weekly schedule.
 - Use one or more periods per day, different periods on different weekdays, and
   periods that cross midnight.
-- Control IPv4 and IPv6 forwarding without creating one nftables rule per
-  client.
+- Control both IPv4 and IPv6 forwarding.
 - Optionally add independent, best-effort application rules based on domains,
   IP prefixes, protocol, and destination ports.
 - Temporarily approve a blocked identity or blocked application/category for
@@ -67,21 +70,21 @@ the router's local timezone with one-minute resolution.
 
 ## Optional application filtering
 
-Application filtering is off by default and requires the optional
-`client-access-bpf` package. Define applications or broad categories, add
-bounded classification evidence, then attach allow or block rules to an
-identity. Application rules have their own always, never, or weekly schedule
-and remain independent from the global nftables policy.
+Use application rules when a broad Internet schedule is not enough—for
+example, to block a video category at night while the identity otherwise stays
+online. This feature is off by default and requires the optional
+`client-access-bpf` package. Application rules have their own always, never, or
+weekly schedule and remain independent from the global Internet-access policy.
 
 Application knowledge is stored as reusable Profiles, independently from
 identity access rules. Classification complexity belongs in userspace. The
 datapath consumes precomputed classification state. A datapath miss MUST NOT
 invoke a userspace classification slow path.
 
-Application classification remains best effort: it allows packets in a small initial window while
-classifying one early packet of a new flow, uses bounded DNS/IP/port evidence
-rather than full DPI, and treats ambiguous or encrypted traffic as
-unclassified. LuCI reports classification coverage and resource shedding.
+Application recognition is best effort. It uses bounded early-flow,
+DNS, IP-prefix, protocol, and port evidence rather than full traffic
+inspection. Ambiguous, encrypted, or unsupported traffic is reported and
+handled as unclassified traffic.
 
 Canonical firewall4 software flow offload is supported when both
 `client-access-bpf` and `client-access-sfo` are installed. Restrictive changes

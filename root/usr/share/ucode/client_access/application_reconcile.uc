@@ -7,20 +7,10 @@
 import * as firewall from 'client_access.firewall';
 import * as bpf_runtime from 'client_access.bpf_runtime';
 import * as observation_store from 'client_access.observation_store';
-import * as reconciliation from 'client_access.reconcile';
+import * as state_schema from 'client_access.state_schema';
 
 export function create() {
-	return {
-		policy_generation: 0,
-		classifier_generation: 0,
-		applied_signature: null,
-		classifier_signature: null,
-		applied_sources: [],
-		applied_destinations: [],
-		generation_floors_loaded: false,
-		attached_interfaces: [],
-		applied_enforcement: false,
-	};
+	return state_schema.application();
 }
 
 export function interfaces(state) {
@@ -89,8 +79,8 @@ function restore_scope(state, errors) {
 	return false;
 }
 
-export function apply(state, config, app_compiled, classification_state,
-		subject_projection, sources, destinations, zone_errors, force, observations,
+export function apply(state, app_compiled, classification_state,
+		subject_projection, sources, destinations, zone_errors, plan, observations,
 		acceleration) {
 	const tracking_required = acceleration?.tracking_required ?? false;
 	const enforcement_requested = app_compiled.requested_enabled;
@@ -219,7 +209,7 @@ export function apply(state, config, app_compiled, classification_state,
 	load_generation_floors(state);
 
 	let attached = [];
-	for (let ifname in sources) {
+	for (let ifname in plan.interfaces_to_ensure) {
 		const result = bpf_runtime.attach(ifname);
 		if (result.code != 0)
 			push(errors, `Unable to attach application filter to '${ifname}'`);
@@ -246,17 +236,14 @@ export function apply(state, config, app_compiled, classification_state,
 		};
 	}
 
-	const signature = sprintf('%s|tracking=%d|enforcement=%d',
-		reconciliation.application_signature(app_compiled,
-			subject_projection, sources, destinations),
-		tracking_required ? 1 : 0, enforcement_requested ? 1 : 0);
-	const changed = signature != state.applied_signature;
-	const candidate_generation = changed ? state.policy_generation + 1 : state.policy_generation;
-	const current_classifier_signature = reconciliation.classifier_signature(runtime_projection);
-	const classifier_changed = current_classifier_signature != state.classifier_signature;
-	const candidate_classifier_generation = classifier_changed
-		? state.classifier_generation + 1 : state.classifier_generation;
-	if (force || changed || classifier_changed) {
+	const signature = plan.policy_signature;
+	const changed = plan.semantic_changed;
+	const candidate_generation = plan.candidate_policy_generation;
+	const current_classifier_signature = plan.classifier_signature;
+	const classifier_changed = plan.classifier_changed;
+	const candidate_classifier_generation =
+		plan.candidate_classifier_generation;
+	if (plan.repair || changed || classifier_changed) {
 		const result = bpf_runtime.publish(bpf_runtime.serialize_snapshot(app_compiled,
 			runtime_projection, subject_projection, candidate_generation,
 			candidate_classifier_generation, true, enforcement_requested));

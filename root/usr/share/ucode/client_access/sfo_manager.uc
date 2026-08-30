@@ -4,6 +4,8 @@
  * this module owns only bounded backend convergence and diagnostics.
  */
 
+import * as state_schema from 'client_access.state_schema';
+
 const DEFAULT_DEADLINE_MS = 2000;
 const MAX_DEADLINE_MS = 10000;
 
@@ -17,29 +19,7 @@ function parse_deadline(value) {
 }
 
 export function create() {
-	return {
-		mode: 'NO_OFFLOAD',
-		backend_available: false,
-		runtime_ruleset_verified: false,
-		hardware_offload_detected: false,
-		hardware_offloaded_flow_count: 0,
-		correlation_health: 'UNKNOWN',
-		tracked_flow_count: 0,
-		software_offloaded_flow_count: 0,
-		revocation_generation: 0,
-		last_revocation_result: 'NOT_REQUIRED',
-		last_revocation_latency_ms: 0,
-		revocation_deadline_ms: DEFAULT_DEADLINE_MS,
-		targeted_revocations: 0,
-		fallback_revocations: 0,
-		revocation_failures: 0,
-		flow_gc_reclaimed: 0,
-		flow_gc_failures: 0,
-		packet_guard_enabled: false,
-		packet_guard_healthy: false,
-		baseline_required: true,
-		errors: [],
-	};
+	return state_schema.acceleration();
 }
 
 function backend_ok(result) {

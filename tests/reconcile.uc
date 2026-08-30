@@ -1,0 +1,84 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import * as reconciliation from 'client_access.reconcile';
+import * as committed_state from 'client_access.commit';
+
+function fail(message) {
+	warn(`FAIL: ${message}\n`);
+	exit(1);
+}
+
+function assert_true(value, message) {
+	if (!value)
+		fail(message);
+}
+
+function observed(policy_generation, classifier_generation) {
+	return {
+		access: { publication_observable: false, runtime_signature: null },
+		application: {
+			generations_known: true,
+			policy_generation,
+			classifier_generation,
+		},
+	};
+}
+
+function desired(access_signature, policy_signature, classifier_signature) {
+	return {
+		access: { signature: access_signature },
+		application: {
+			policy_signature,
+			classifier_signature,
+			source_interfaces: [ 'lan0', 'lan1' ],
+		},
+	};
+}
+
+let committed = committed_state.create();
+let plan = reconciliation.plan(committed, observed(0, 0),
+	desired('access-a', 'app-a', 'classifier-a'), [],
+	reconciliation.attempt_context('startup', false, 1));
+assert_true(plan.actions.access.operation == 'publish' &&
+	plan.actions.access.candidate_generation == 1,
+	'initial access publication must allocate semantic generation 1');
+assert_true(plan.actions.application.candidate_policy_generation == 1 &&
+	plan.actions.application.candidate_classifier_generation == 1,
+	'initial application and classifier snapshots need independent generations');
+assert_true(sprintf('%J', plan.actions.application.interfaces_to_attach) ==
+	'["lan0","lan1"]', 'planner must expose the complete TC attach delta');
+
+committed.access = { generation: 5, signature: 'access-a', applied: true };
+committed.application.policy_generation = 7;
+committed.application.classifier_generation = 3;
+committed.application.applied_signature = 'app-a';
+committed.application.classifier_signature = 'classifier-a';
+committed.application.attached_interfaces = [ 'lan0' ];
+plan = reconciliation.plan(committed, observed(7, 3),
+	desired('access-a', 'app-a', 'classifier-a'), [],
+	reconciliation.attempt_context('fw4-reload', true, 2));
+assert_true(plan.actions.access.operation == 'publish' &&
+	plan.actions.access.candidate_generation == 5,
+	'repair publication must not advance access semantic generation');
+assert_true(plan.actions.application.candidate_policy_generation == 7 &&
+	plan.actions.application.candidate_classifier_generation == 3,
+	'forced reconciliation must not advance unchanged application generations');
+assert_true(sprintf('%J', plan.actions.application.interfaces_to_keep) ==
+	'["lan0"]' && sprintf('%J', plan.actions.application.interfaces_to_attach) ==
+	'["lan1"]', 'planner must distinguish kept and newly attached interfaces');
+
+plan = reconciliation.plan(committed, observed(10, 8),
+	desired('access-b', 'app-b', 'classifier-b'), [ {
+		scope: 'application', identity_id: 'alice', class_id: 10,
+		old_verdict: 'ALLOW', new_verdict: 'DENY', restrictive: true,
+	} ], reconciliation.attempt_context('policy-change', false, 3));
+assert_true(plan.actions.access.candidate_generation == 6,
+	'access generation is independent from observed BPF generation floors');
+assert_true(plan.actions.application.candidate_policy_generation == 11 &&
+	plan.actions.application.candidate_classifier_generation == 9,
+	'new BPF generations must be allocated above observed runtime floors');
+assert_true(plan.transitions[0].publication_action_id == 'application.publish' &&
+	length(plan.transitions[0].id),
+	'a restrictive transition must name its plane publication prerequisite');
+
+print('reconciliation planner tests passed.\n');

@@ -62,6 +62,10 @@ export function run() {
 		fs_stub.advance();
 		reconcile('projection-failure-test');
 	}
+	else if (scenario == 'status_health_failure') {
+		// Runtime health is sampled during reconciliation; status is read-only.
+		reconcile('health-poll-test');
+	}
 	else if (scenario == 'access_approval' || scenario == 'access_revoke' ||
 	         scenario == 'sfo_access_revoke' ||
 	         scenario == 'sfo_deadline_failure' ||

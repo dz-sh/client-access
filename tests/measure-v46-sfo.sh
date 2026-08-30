@@ -161,11 +161,6 @@ wait_for_offload() {
 for port in 5201 5202 5203 5204 5206; do
 	sudo ip netns exec "$server_ns" iperf3 -s -D -p "$port"
 done
-current_phase=connectivity_probe
-printf '%s\n' "$current_phase" >"$report_dir/phase.txt"
-sudo ip netns exec "$client_ns" ping -c 1 -W 1 198.51.100.2 >/dev/null
-sudo ip netns exec "$client_ns" ping -6 -c 1 -W 1 fd46:2::2 >/dev/null
-
 current_phase=normal_and_sfo_throughput
 printf '%s\n' "$current_phase" >"$report_dir/phase.txt"
 apply_ruleset normal

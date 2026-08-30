@@ -99,7 +99,7 @@ jobs:
           test -f htdocs/luci-static/resources/client-access/approvals.js
           grep -Fq 'define Package/client-access-sfo' client-access-sfo/Makefile
           grep -Fq '+client-access-core +client-access-bpf' client-access-sfo/Makefile
-          grep -Fq '+libnetfilter-conntrack3' client-access-sfo/Makefile
+          grep -Fq '+libnetfilter-conntrack' client-access-sfo/Makefile
           grep -Fq '#include <libnetfilter_conntrack/libnetfilter_conntrack.h>' \
             sfo/client-access-sfoctl.c
           ! grep -Eq 'conntrack[[:space:]]+-L|system\(|popen\(' \

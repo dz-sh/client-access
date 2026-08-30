@@ -176,7 +176,11 @@ export function execute(plan, desired, committed, handles) {
 				`Restrictive ${transition.scope} transition did not revoke stale accelerated state`);
 	}
 
-	const sfo_ready = acceleration_ok;
+	const sfo_ready = !desired.acceleration.offload_present ||
+		acceleration_state.mode == 'SFO_ACTIVE';
+	if (!sfo_ready)
+		actions[acceleration_plan.id] = action('FAILED', {},
+			join('; ', acceleration_state.errors));
 	let ok = true;
 	for (let id, value in actions)
 		if (value.status == 'FAILED' ||

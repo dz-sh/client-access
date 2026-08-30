@@ -243,6 +243,18 @@ sudo ip netns exec "$server_ns" sh -c \
 	>"$report_dir/stress-server.log" 2>&1 &
 stress_server_pid=$!
 flow_pids="$flow_pids $stress_server_pid"
+stress_server_ready=false
+for attempt in $(seq 1 100); do
+	if grep -q '^LISTENING$' "$report_dir/stress-server.log"; then
+		stress_server_ready=true
+		break
+	fi
+	sleep 0.1
+done
+if [ "$stress_server_ready" != true ]; then
+	echo 'near-bound candidate flow server did not become ready' >&2
+	exit 1
+fi
 sudo ip netns exec "$client_ns" sh -c \
 	"ulimit -n 8192; exec python3 '$repo_dir/tests/sfo-flow-load.py' client 198.51.100.2 5210 $stress_count" \
 	>"$report_dir/stress-client.log" 2>&1 &

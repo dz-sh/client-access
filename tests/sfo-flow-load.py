@@ -11,6 +11,7 @@ def server(address: str, port: int, count: int) -> None:
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind((address, port))
     listener.listen(count)
+    print("LISTENING", flush=True)
     connections = []
     for _ in range(count):
         connection, _ = listener.accept()

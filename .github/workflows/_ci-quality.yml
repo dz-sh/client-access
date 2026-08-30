@@ -1,0 +1,110 @@
+name: CI Quality
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  source-contracts:
+    name: Source and architecture contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out client-access
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install source-check dependencies
+        run: sudo apt-get update && sudo apt-get install --yes jq nftables python3-yaml
+
+      - name: Check source syntax
+        run: bash tests/ci/check-source-syntax.sh "${GITHUB_WORKSPACE}"
+
+      - name: Check named architecture contracts
+        run: >-
+          python3 tests/ci/check-architecture.py
+          "${GITHUB_WORKSPACE}"
+          "${GITHUB_WORKSPACE}/tests/architecture/contracts.json"
+
+      - name: Check generated nftables syntax
+        run: >-
+          sudo bash tests/ci/check-nft-syntax.sh
+          "${GITHUB_WORKSPACE}"
+          "${RUNNER_TEMP}/client-access.nft"
+
+      - name: Fetch pinned LuCI source
+        run: |
+          source tests/ci/versions.env
+          bash tests/ci/fetch-pinned-source.sh \
+            https://github.com/openwrt/luci.git \
+            "${LUCI_REV}" \
+            "${RUNNER_TEMP}/luci"
+
+      - name: Check LuCI JavaScript
+        run: |
+          mkdir -p "${RUNNER_TEMP}/luci/applications/luci-app-client-access"
+          cp -a htdocs root "${RUNNER_TEMP}/luci/applications/luci-app-client-access/"
+          cp luci-app-client-access/Makefile \
+            "${RUNNER_TEMP}/luci/applications/luci-app-client-access/Makefile"
+          cd "${RUNNER_TEMP}/luci"
+          npm install --ignore-scripts
+          npx eslint \
+            applications/luci-app-client-access/htdocs/luci-static/resources/view/client-access/*.js \
+            applications/luci-app-client-access/htdocs/luci-static/resources/client-access/*.js
+
+      - name: Summarize source evidence
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: >-
+          bash tests/ci/write-summary.sh
+          'Source and architecture contracts'
+          'syntax, structured boundaries, nftables, LuCI'
+
+  ucode-semantics:
+    name: Ucode semantics and daemon lifecycle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out client-access
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install ucode build dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          build-essential cmake jq libjson-c-dev pkg-config
+
+      - name: Fetch and build pinned ucode
+        run: |
+          source tests/ci/versions.env
+          bash tests/ci/fetch-pinned-source.sh \
+            https://github.com/jow-/ucode.git \
+            "${UCODE_REV}" \
+            "${RUNNER_TEMP}/ucode-src"
+          cmake \
+            -S "${RUNNER_TEMP}/ucode-src" \
+            -B "${RUNNER_TEMP}/ucode-build" \
+            -DUBUS_SUPPORT=OFF \
+            -DUCI_SUPPORT=OFF \
+            -DULOOP_SUPPORT=OFF
+          cmake --build "${RUNNER_TEMP}/ucode-build" --parallel 2
+
+      - name: Run semantic, planner, commit, and lifecycle tests
+        run: >-
+          bash tests/ci/run-ucode-tests.sh
+          "${GITHUB_WORKSPACE}"
+          "${RUNNER_TEMP}/ucode-build/ucode"
+
+      - name: Summarize ucode evidence
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: >-
+          bash tests/ci/write-summary.sh
+          'Ucode semantics and daemon lifecycle'
+          'policy, classification, approvals, planner, commit, failure matrix'

@@ -1,0 +1,177 @@
+{
+  "required_paths": [
+    "root/usr/share/ucode/client_access/config.uc",
+    "root/usr/share/ucode/client_access/lease_store.uc",
+    "root/usr/share/ucode/client_access/firewall.uc",
+    "root/usr/share/ucode/client_access/bpf_runtime.uc",
+    "root/usr/share/ucode/client_access/application_reconcile.uc",
+    "root/usr/share/ucode/client_access/status.uc",
+    "root/usr/share/ucode/client_access/classification_ir.uc",
+    "root/usr/share/ucode/client_access/classification_observation.uc",
+    "root/usr/share/ucode/client_access/classification_projection.uc",
+    "root/usr/share/ucode/client_access/desired.uc",
+    "root/usr/share/ucode/client_access/observed.uc",
+    "root/usr/share/ucode/client_access/reconcile.uc",
+    "root/usr/share/ucode/client_access/executor.uc",
+    "root/usr/share/ucode/client_access/commit.uc",
+    "root/usr/share/ucode/client_access/state_schema.uc",
+    "src/bpfctl-internal.h",
+    "src/bpf-object.c",
+    "src/bpf-tc.c",
+    "src/bpf-snapshot.c",
+    "src/bpf-runtime.c",
+    "src/bpf-health.c",
+    "htdocs/luci-static/resources/client-access/rpc.js",
+    "htdocs/luci-static/resources/client-access/common.js",
+    "htdocs/luci-static/resources/client-access/status.js",
+    "htdocs/luci-static/resources/client-access/approvals.js"
+  ],
+  "forbidden_paths": [
+    "Makefile"
+  ],
+  "ucode_imports": {
+    "root/usr/sbin/client-accessd": {
+      "required": [
+        "client_access.lease",
+        "client_access.reconcile",
+        "client_access.desired",
+        "client_access.observed",
+        "client_access.executor",
+        "client_access.commit"
+      ],
+      "forbidden": [
+        "uci",
+        "fs",
+        "client_access.firewall",
+        "client_access.bpf_runtime",
+        "client_access.application_reconcile",
+        "client_access.sfo_manager"
+      ]
+    },
+    "root/usr/share/ucode/client_access/desired.uc": {
+      "forbidden": [
+        "client_access.firewall",
+        "client_access.bpf_runtime",
+        "client_access.application_reconcile",
+        "client_access.sfo_manager"
+      ]
+    },
+    "root/usr/share/ucode/client_access/reconcile.uc": {
+      "forbidden": [
+        "client_access.firewall",
+        "client_access.bpf_runtime",
+        "client_access.application_reconcile",
+        "client_access.sfo_manager"
+      ]
+    },
+    "root/usr/share/ucode/client_access/commit.uc": {
+      "forbidden": [
+        "client_access.firewall",
+        "client_access.bpf_runtime",
+        "client_access.application_reconcile",
+        "client_access.sfo_manager"
+      ]
+    }
+  },
+  "c_lexical_boundaries": [
+    {
+      "id": "V4.2-datapath-abi",
+      "paths": [
+        "src/client-access-bpf.c",
+        "src/client-access-bpf.h"
+      ],
+      "forbidden_identifier_fragments": [
+        "ringbuf",
+        "perf_event",
+        "netlink",
+        "dnsmasq",
+        "provenance"
+      ],
+      "forbidden_identifiers": [
+        "ca_dns4",
+        "ca_dns6",
+        "dns_sync"
+      ]
+    }
+  ],
+  "packages": {
+    "client-access-core": {
+      "makefile": "client-access-core/Makefile",
+      "required_dependencies": [
+        "firewall4",
+        "nftables-json",
+        "ucode"
+      ],
+      "forbidden_dependencies": [
+        "luci-base",
+        "libbpf",
+        "kmod-sched-bpf",
+        "client-access-bpf",
+        "client-access-sfo",
+        "libnetfilter-conntrack"
+      ],
+      "forbidden_install_fragments": [
+        "htdocs",
+        "luci/menu",
+        "rpcd/acl",
+        "client-access-bpf"
+      ]
+    },
+    "client-access-bpf": {
+      "makefile": "client-access-bpf/Makefile",
+      "required_dependencies": [
+        "client-access-core",
+        "libbpf",
+        "kmod-sched-bpf"
+      ],
+      "forbidden_dependencies": [
+        "luci-base",
+        "client-access-sfo"
+      ],
+      "forbidden_install_fragments": [
+        "htdocs",
+        "luci/menu",
+        "rpcd/acl"
+      ]
+    },
+    "client-access-sfo": {
+      "makefile": "client-access-sfo/Makefile",
+      "required_dependencies": [
+        "client-access-core",
+        "client-access-bpf",
+        "libbpf",
+        "libnetfilter-conntrack"
+      ],
+      "forbidden_dependencies": [
+        "luci-base"
+      ],
+      "forbidden_install_fragments": [
+        "htdocs",
+        "luci/menu",
+        "rpcd/acl"
+      ]
+    },
+    "luci-app-client-access": {
+      "makefile": "luci-app-client-access/Makefile",
+      "required_dependencies": [
+        "client-access-core",
+        "luci-base",
+        "rpcd",
+        "rpcd-mod-ucode"
+      ],
+      "forbidden_dependencies": [
+        "client-access-bpf",
+        "client-access-sfo",
+        "libbpf",
+        "kmod-sched-bpf"
+      ],
+      "forbidden_install_fragments": [
+        "etc/config",
+        "client-accessd",
+        "ucode/client_access",
+        "nftables",
+        "lib/bpf"
+      ]
+    }
+  }
+}

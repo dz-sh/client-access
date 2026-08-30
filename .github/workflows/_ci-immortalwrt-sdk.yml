@@ -1,0 +1,66 @@
+name: CI ImmortalWrt SDK
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  full-package:
+    name: ImmortalWrt SDK package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out client-access
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Stage package as an ImmortalWrt feed
+        run: |
+          mkdir -p "${RUNNER_TEMP}/immortalwrt-artifacts"
+          bash tests/ci/stage-feed.sh \
+            "${GITHUB_WORKSPACE}" \
+            "${RUNNER_TEMP}/client-access-feed"
+
+      - name: Build with the official ImmortalWrt SDK
+        uses: immortalwrt/gh-action-sdk@c4848d7f7d899d80e6d98630f0a21ab2e9c4724f
+        env:
+          ARCH: x86_64-openwrt-24.10.6
+          ARTIFACTS_DIR: ${{ runner.temp }}/immortalwrt-artifacts
+          BUILD_LOG: 1
+          FEED_DIR: ${{ runner.temp }}/client-access-feed
+          V: s
+
+      - name: Install packaged-object verification dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          binutils iproute2 iputils-ping libbpf-dev libelf-dev zlib1g-dev zstd
+
+      - name: Verify packaged ImmortalWrt artifacts
+        run: >-
+          bash tests/ci/verify-sdk-artifacts.sh
+          "${GITHUB_WORKSPACE}"
+          "${RUNNER_TEMP}/immortalwrt-artifacts"
+          "${RUNNER_TEMP}/immortalwrt-artifacts"
+
+      - name: Upload ImmortalWrt packages and logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: immortalwrt-x86_64
+          path: ${{ runner.temp }}/immortalwrt-artifacts
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Summarize ImmortalWrt package evidence
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: >-
+          bash tests/ci/write-summary.sh
+          'ImmortalWrt SDK package'
+          'official package build and packaged BPF verifier-load'

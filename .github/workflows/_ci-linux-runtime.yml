@@ -1,0 +1,245 @@
+name: CI Linux Runtime
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  build-linux:
+    name: Build shared Linux artifacts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out client-access
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Linux build dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          binutils clang libbpf-dev libelf-dev libnetfilter-conntrack-dev
+          libnfnetlink-dev llvm zlib1g-dev
+
+      - name: Build shared Linux artifacts and manifest
+        run: >-
+          bash tests/ci/build-linux-artifacts.sh
+          "${GITHUB_WORKSPACE}"
+          "${RUNNER_TEMP}/client-access-linux"
+
+      - name: Upload shared Linux artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: client-access-linux-${{ github.sha }}
+          path: ${{ runner.temp }}/client-access-linux
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Summarize Linux build evidence
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: >-
+          bash tests/ci/write-summary.sh
+          'Shared Linux artifacts'
+          'BPF object, foreign TC fixture, BPF controller, SFO controller'
+
+  continuous-authorization:
+    name: Remote V4.4 continuous authorization
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out client-access
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install isolated datapath dependencies
+        run: >-
+          sudo apt-get update &&
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install --yes
+          iperf3 iproute2 iputils-ping jq netcat-openbsd nftables
+
+      - name: Verify established-flow revocation
+        run: >-
+          bash tests/measure-v44-continuous-authorization.sh
+          "${RUNNER_TEMP}/v44-continuous-authorization"
+
+      - name: Upload V4.4 authorization evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: v44-continuous-authorization-evidence
+          path: ${{ runner.temp }}/v44-continuous-authorization
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Summarize authorization evidence
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: >-
+          bash tests/ci/write-summary.sh
+          'V4.4 continuous authorization'
+          'established-flow revocation'
+
+  bpf-datapath:
+    name: Remote TC eBPF datapath
+    needs: build-linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out client-access
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install eBPF runtime dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          linux-tools-common linux-tools-generic linux-tools-azure
+          "linux-tools-$(uname -r)" libbpf-dev libelf-dev zlib1g-dev
+          iproute2 iputils-ping jq netcat-openbsd nftables util-linux
+
+      - name: Select runner-matched bpftool
+        run: bash tests/ci/setup-bpftool.sh "${RUNNER_TEMP}/client-access-tools"
+
+      - name: Download shared Linux artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: client-access-linux-${{ github.sha }}
+          path: ${{ runner.temp }}/client-access-linux
+
+      - name: Verify and expose shared Linux artifacts
+        run: >-
+          bash tests/ci/prepare-linux-artifacts.sh
+          "${RUNNER_TEMP}/client-access-linux"
+          "${RUNNER_TEMP}"
+
+      - name: Verify independent application-layer enforcement
+        run: bash tests/ci/run-bpf-datapath.sh
+
+      - name: Summarize TC eBPF evidence
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: >-
+          bash tests/ci/write-summary.sh
+          'TC eBPF datapath'
+          'verifier, attachment ownership, classification, policy, recovery'
+
+  bpf-performance:
+    name: Remote TC eBPF performance evidence
+    needs: build-linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out client-access
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install eBPF measurement dependencies
+        run: >-
+          sudo apt-get update &&
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install --yes
+          linux-tools-common linux-tools-generic linux-tools-azure
+          "linux-tools-$(uname -r)" iperf3 iproute2 jq
+          libbpf-dev libelf-dev zlib1g-dev
+
+      - name: Select runner-matched bpftool
+        run: bash tests/ci/setup-bpftool.sh "${RUNNER_TEMP}/client-access-tools"
+
+      - name: Download shared Linux artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: client-access-linux-${{ github.sha }}
+          path: ${{ runner.temp }}/client-access-linux
+
+      - name: Verify shared Linux artifacts
+        run: >-
+          bash tests/ci/prepare-linux-artifacts.sh
+          "${RUNNER_TEMP}/client-access-linux"
+          "${RUNNER_TEMP}"
+
+      - name: Record informational measurements
+        run: >-
+          bash tests/measure-bpf-performance.sh
+          "${RUNNER_TEMP}/client-access-bpf.o"
+          "${RUNNER_TEMP}/client-access-bpfctl"
+          "${RUNNER_TEMP}/client-access-performance"
+
+      - name: Upload performance evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bpf-performance-evidence
+          path: ${{ runner.temp }}/client-access-performance
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Summarize performance evidence
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: >-
+          bash tests/ci/write-summary.sh
+          'TC eBPF performance'
+          'informational forwarding and classifier measurements'
+
+  sfo-runtime:
+    name: Remote V4.6 software-offload runtime evidence
+    needs: build-linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out client-access
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install SFO runtime dependencies
+        run: >-
+          sudo apt-get update &&
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install --yes
+          linux-tools-common linux-tools-generic linux-tools-azure
+          "linux-tools-$(uname -r)" conntrack iperf3 iproute2 jq
+          libbpf-dev libelf-dev libnetfilter-conntrack-dev
+          libnfnetlink-dev nftables zlib1g-dev
+
+      - name: Select runner-matched bpftool
+        run: bash tests/ci/setup-bpftool.sh "${RUNNER_TEMP}/client-access-tools"
+
+      - name: Download shared Linux artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: client-access-linux-${{ github.sha }}
+          path: ${{ runner.temp }}/client-access-linux
+
+      - name: Verify shared Linux artifacts
+        run: >-
+          bash tests/ci/prepare-linux-artifacts.sh
+          "${RUNNER_TEMP}/client-access-linux"
+          "${RUNNER_TEMP}"
+
+      - name: Validate actual software offload
+        run: >-
+          bash tests/measure-v46-sfo.sh
+          "${RUNNER_TEMP}/client-access-bpf.o"
+          "${RUNNER_TEMP}/client-access-bpfctl"
+          "${RUNNER_TEMP}/client-access-sfoctl"
+          "${RUNNER_TEMP}/client-access-v46-sfo"
+
+      - name: Upload V4.6 SFO evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: v46-sfo-runtime-evidence
+          path: ${{ runner.temp }}/client-access-v46-sfo
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Summarize SFO evidence
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: >-
+          bash tests/ci/write-summary.sh
+          'V4.6 software offload'
+          'correlation, eviction, and bounded revocation verification'

@@ -1,0 +1,114 @@
+name: CI OpenWrt SDK
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  core-luci-isolation:
+    name: OpenWrt core and LuCI build isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out client-access
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Stage package as an OpenWrt feed
+        run: |
+          mkdir -p "${RUNNER_TEMP}/openwrt-core-luci-artifacts"
+          bash tests/ci/stage-feed.sh \
+            "${GITHUB_WORKSPACE}" \
+            "${RUNNER_TEMP}/client-access-feed"
+
+      - name: Build core and LuCI without BPF or SFO
+        uses: openwrt/gh-action-sdk@f5813d30eeef3534b58ac7e79c5d8842b6035434
+        env:
+          ARCH: x86_64-24.10.8
+          ARTIFACTS_DIR: ${{ runner.temp }}/openwrt-core-luci-artifacts
+          BUILD_LOG: 1
+          FEED_DIR: ${{ runner.temp }}/client-access-feed
+          PACKAGES: luci-app-client-access
+          V: s
+
+      - name: Verify core and LuCI package isolation
+        run: >-
+          python3 tests/ci/check-sdk-isolation.py
+          "${RUNNER_TEMP}/openwrt-core-luci-artifacts"
+
+      - name: Upload core and LuCI evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: openwrt-core-luci-x86_64
+          path: ${{ runner.temp }}/openwrt-core-luci-artifacts
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Summarize core and LuCI evidence
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: >-
+          bash tests/ci/write-summary.sh
+          'OpenWrt core and LuCI isolation'
+          'official SDK build without BPF or SFO selection'
+
+  full-package:
+    name: OpenWrt SDK package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out client-access
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Stage package as an OpenWrt feed
+        run: |
+          mkdir -p "${RUNNER_TEMP}/openwrt-artifacts"
+          bash tests/ci/stage-feed.sh \
+            "${GITHUB_WORKSPACE}" \
+            "${RUNNER_TEMP}/client-access-feed"
+
+      - name: Build with the official OpenWrt SDK
+        uses: openwrt/gh-action-sdk@f5813d30eeef3534b58ac7e79c5d8842b6035434
+        env:
+          ARCH: x86_64-24.10.8
+          ARTIFACTS_DIR: ${{ runner.temp }}/openwrt-artifacts
+          BUILD_LOG: 1
+          FEED_DIR: ${{ runner.temp }}/client-access-feed
+          V: s
+
+      - name: Install packaged-object verification dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          binutils iproute2 iputils-ping libbpf-dev libelf-dev zlib1g-dev zstd
+
+      - name: Verify packaged OpenWrt artifacts
+        run: >-
+          bash tests/ci/verify-sdk-artifacts.sh
+          "${GITHUB_WORKSPACE}"
+          "${RUNNER_TEMP}/openwrt-artifacts"
+          "${RUNNER_TEMP}/openwrt-artifacts"
+
+      - name: Upload OpenWrt packages and logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: openwrt-x86_64
+          path: ${{ runner.temp }}/openwrt-artifacts
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Summarize OpenWrt package evidence
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: >-
+          bash tests/ci/write-summary.sh
+          'OpenWrt SDK package'
+          'official package build and packaged BPF verifier-load'

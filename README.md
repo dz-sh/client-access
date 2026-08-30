@@ -21,6 +21,8 @@ controlling their Internet access with firewall4/nftables.
 - Temporarily approve a blocked identity or blocked application/category for
   one hour or until local midnight, then automatically restore the saved
   policy.
+- Optionally keep canonical firewall4 software flow offload enabled with
+  bounded, verified revocation after restrictive policy changes.
 
 ## Internet access policy
 
@@ -76,12 +78,17 @@ identity access rules. Classification complexity belongs in userspace. The
 datapath consumes precomputed classification state. A datapath miss MUST NOT
 invoke a userspace classification slow path.
 
-V4.2 remains best effort: it allows packets in a small initial window while
+Application classification remains best effort: it allows packets in a small initial window while
 classifying one early packet of a new flow, uses bounded DNS/IP/port evidence
 rather than full DPI, and treats ambiguous or encrypted traffic as
 unclassified. LuCI reports classification coverage and resource shedding.
-Software and hardware flow offloading must be disabled while this layer is
-enabled.
+
+Canonical firewall4 software flow offload is supported when both
+`client-access-bpf` and `client-access-sfo` are installed. Restrictive changes
+publish policy first and then remove and verify matching accelerated flows
+within a configured deadline. This is bounded revocation, not instant or
+zero-packet termination. Hardware and custom flow-offload paths remain
+unsupported.
 
 ## Temporary approvals
 
@@ -100,13 +107,15 @@ application traffic cannot receive a temporary approval.
 
 For the normal web interface, install `luci-app-client-access`; it installs the
 headless `client-access-core` runtime automatically. A router managed without
-LuCI can install `client-access-core` directly. Install `client-access-bpf` only
-when application filtering is needed.
+LuCI can install `client-access-core` directly. Install `client-access-bpf` for
+application filtering. To use canonical firewall4 software flow offload,
+install `client-access-sfo`; it also installs the BPF correlation backend.
 
 Removing the LuCI package leaves the daemon, saved configuration, and active
-enforcement in place. Removing the optional BPF package disables its datapath
-while preserving the baseline Internet access policy and saved application
-rules.
+enforcement in place. Removing either optional runtime package preserves
+identities, policies, application rules, and temporary-approval state. Removing
+the SFO package first evicts supported software-accelerated state before
+returning to the core fallback behavior.
 
 After installing the web interface, open:
 
@@ -125,8 +134,9 @@ Network → Client Access
 ## Current limitations
 
 - Normal-path nftables and application-policy changes are re-evaluated on the
-  next scoped packet of an existing flow. Flow-offloaded traffic is unsupported;
-  no conntrack, software-flowtable, or hardware-flow eviction is implemented.
+  next scoped packet. With the optional SFO backend, supported accelerated
+  flows converge within a verified deadline; hardware and custom acceleration
+  remain unsupported.
 - Application classification is outbound-only and does not provide full DPI,
   TLS inspection, TCP reconstruction, QUIC parsing/decryption, quota, or
   bandwidth limiting. Return-only traffic is not associated with its outbound
@@ -143,7 +153,7 @@ ImmortalWrt. The firewall4 `auto_includes` option must remain enabled.
 The optional application backend reserves firewall mark mask `0x60000000`;
 custom VPN, QoS, or policy-routing rules must not use those two bits.
 
-The reproducible V4.2 package baselines are OpenWrt 24.10.8 x86_64 and
+The reproducible package baselines are OpenWrt 24.10.8 x86_64 and
 ImmortalWrt 24.10.6 x86_64. Automated datapath coverage includes a Linux
 bridge, 802.1Q VLAN, IPv4 forwarding, and routed IPv6 forwarding. This does not
 claim validation of DSA, PPPoE, big-endian targets, vendor-specific hardware,

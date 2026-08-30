@@ -20,6 +20,7 @@ const approvalActions = approvalUi.actions;
 const temporaryApprovalsPanel = approvalUi.panel;
 const statusPanel = statusUi.accessPanel;
 const applicationStatusPanel = statusUi.applicationPanel;
+const softwareOffloadStatusPanel = statusUi.softwareOffloadPanel;
 
 const DAYS = [
 	{ id: 'mon', label: _('Monday') },
@@ -474,7 +475,7 @@ return view.extend({
 		o = s.taboption('applications', form.Flag, 'app_filter_enabled', _('Enable application filtering'));
 		o.default = '0';
 		o.rmempty = false;
-		o.description = _('Adds a separate application-filter layer for managed identities. It does not replace or consume the nftables Internet access result. Flow offloading must be disabled.');
+		o.description = _('Adds a separate application-filter layer for managed identities. It remains independent from the nftables Internet access result. Canonical firewall4 software flow offload is supported when the optional BPF and SFO packages are installed; hardware and custom offload are not supported.');
 
 		o = s.taboption('applications', form.ListValue, 'unknown_subject_app_verdict', _('Clients without an identity'));
 		o.value('allow', _('Pass the application layer'));
@@ -499,6 +500,12 @@ return view.extend({
 		o.default = [ 'lan' ];
 		o.rmempty = false;
 		o.datatype = 'uciname';
+
+		o = s.taboption('advanced', form.Value, 'sfo_revocation_deadline_ms', _('Software offload revocation deadline'));
+		o.default = '2000';
+		o.rmempty = false;
+		o.datatype = 'range(1,10000)';
+		o.description = _('Maximum time in milliseconds for deleting and verifying stale software-accelerated flows after a restrictive policy change.');
 
 		o = s.taboption('advanced', form.DynamicList, 'destination_zone', _('Internet firewall zones'));
 		o.default = [ 'wan' ];
@@ -859,6 +866,7 @@ return view.extend({
 					unknownClientsSection(observationInventory, configuredIdentities, inventoryById, status)));
 			}
 			return E([], [ statusPanel(status), applicationStatusPanel(status),
+				softwareOffloadStatusPanel(status),
 				temporaryApprovalsPanel(approvalInventory), formNode ]);
 		});
 	}

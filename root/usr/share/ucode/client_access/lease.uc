@@ -391,8 +391,12 @@ function snapshot_entry(scope, identity_id, subject_id, class_id, verdict) {
 		...(scope == 'application' ? { class_id } : {}), verdict };
 }
 
-export function effective_snapshot(access_compiled, app_compiled) {
+export function effective_snapshot(access_compiled, app_compiled,
+		application_enabled) {
 	let entries = {};
+	const default_access = snapshot_entry('access', '__default__', null, null,
+		access_compiled.enabled ? (access_compiled.default_verdict ?? 'allow') : 'allow');
+	entries[default_access.key] = default_access;
 	for (let identity in (access_compiled.identities ?? [])) {
 		let subject_id = null;
 		for (let candidate in (app_compiled.identities ?? []))
@@ -402,9 +406,14 @@ export function effective_snapshot(access_compiled, app_compiled) {
 			identity.verdict);
 		entries[entry.key] = entry;
 	}
+	const unknown_application = snapshot_entry('application', '__unknown__',
+		null, CLASS_DEFAULT, application_enabled
+			? (app_compiled.unknown_subject_app_verdict ?? 'allow') : 'allow');
+	entries[unknown_application.key] = unknown_application;
 	for (let policy in (app_compiled.policies ?? [])) {
 		const entry = snapshot_entry('application', policy.identity_id,
-			policy.subject_id, policy.class_id, policy.verdict);
+			policy.subject_id, policy.class_id,
+			application_enabled ? policy.verdict : 'allow');
 		entries[entry.key] = entry;
 	}
 	return entries;

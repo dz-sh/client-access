@@ -68,7 +68,7 @@ sudo ip link set ca-pkg-a up
 sudo ip netns exec ca-pkg-ns ip link set ca-pkg-b up
 sudo "$work_dir/client-access-bpfctl" attach ca-pkg-a
 printf '%s\n' \
-	'CONFIG 1 1 1 0 0 1 256 200 256 512 64' \
+	'CONFIG 1 1 1 1 0 0 1 256 200 256 512 64' \
 	'SUBJECT 02:00:00:00:00:42 42' \
 	'POLICY 42 1 0' \
 	'POLICY 42 0 0' \
@@ -78,7 +78,7 @@ sudo ip netns exec ca-pkg-ns ping -c 1 -W 1 192.0.2.1
 sudo "$work_dir/client-access-bpfctl" status >"$work_dir/status.json"
 jq -e '
 	.backend_mode == "V4_BPF_BASIC" and
-	.bpf_schema_version == 4 and
+	.bpf_schema_version == 5 and
 	.program_pinned == true and
 	.maps_pinned == true and
 	.flow_map_entries >= 1 and

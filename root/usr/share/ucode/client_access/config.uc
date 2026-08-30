@@ -25,6 +25,7 @@ export function load() {
 		max_pending_entries: uci.get('client_access', 'main', 'max_pending_entries'),
 		max_new_classifications_per_second: uci.get('client_access', 'main', 'max_new_classifications_per_second'),
 		per_subject_new_classification_rate: uci.get('client_access', 'main', 'per_subject_new_classification_rate'),
+		sfo_revocation_deadline_ms: uci.get('client_access', 'main', 'sfo_revocation_deadline_ms'),
 		signature_table_memory_limit: uci.get('client_access', 'main', 'signature_table_memory_limit'),
 		deny_action: uci.get('client_access', 'main', 'deny_action'),
 		source_zone: as_list(uci.get('client_access', 'main', 'source_zone')),

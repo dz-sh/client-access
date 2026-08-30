@@ -237,16 +237,17 @@ static int parse_snapshot(struct snapshot *snapshot)
 		if (sscanf(line, "%15s", command) != 1)
 			continue;
 		if (!strcmp(command, "CONFIG")) {
-			unsigned int enabled, generation, classifier_generation;
+			unsigned int enabled, app_enforcement, generation, classifier_generation;
 			unsigned int unknown, provisional, max_packets, max_bytes;
 			unsigned int max_age, max_pending, max_new, per_subject;
 
 			if (snapshot->have_config ||
-			    sscanf(line, "CONFIG %u %u %u %u %u %u %u %u %u %u %u",
-				   &enabled, &generation, &classifier_generation,
+			    sscanf(line, "CONFIG %u %u %u %u %u %u %u %u %u %u %u %u",
+				   &enabled, &app_enforcement, &generation, &classifier_generation,
 				   &unknown, &provisional, &max_packets, &max_bytes,
-				   &max_age, &max_pending, &max_new, &per_subject) != 11 ||
-			    enabled > 1 || unknown > 1 || provisional > 1 ||
+				   &max_age, &max_pending, &max_new, &per_subject) != 12 ||
+			    enabled > 1 || app_enforcement > 1 ||
+			    app_enforcement > enabled || unknown > 1 || provisional > 1 ||
 			    max_packets != 1 ||
 			    max_bytes < 64 || max_bytes > 8192 ||
 			    max_age < 1 || max_age > 10000 ||
@@ -257,6 +258,7 @@ static int parse_snapshot(struct snapshot *snapshot)
 				break;
 			}
 			snapshot->config.enabled = enabled;
+			snapshot->config.app_enforcement_enabled = app_enforcement;
 			snapshot->config.app_policy_generation = generation;
 			snapshot->config.classifier_generation = classifier_generation;
 			snapshot->config.unknown_subject_app_verdict = unknown;
@@ -500,5 +502,4 @@ out:
 	free(snapshot.ipv6);
 	return ret;
 }
-
 

@@ -74,10 +74,12 @@ function verdict_number(verdict) {
 }
 
 export function serialize_snapshot(app_compiled, runtime_projection,
-		subject_projection, policy_generation, classifier_generation) {
+		subject_projection, policy_generation, classifier_generation,
+		tracking_enabled, app_enforcement_enabled) {
 	const limits = app_compiled.resource_limits;
-	let lines = [ sprintf('CONFIG %d %d %d %d %d %d %d %d %d %d %d',
-		app_compiled.enabled ? 1 : 0, policy_generation, classifier_generation,
+	let lines = [ sprintf('CONFIG %d %d %d %d %d %d %d %d %d %d %d %d',
+		tracking_enabled ? 1 : 0, app_enforcement_enabled ? 1 : 0,
+		policy_generation, classifier_generation,
 		verdict_number(app_compiled.unknown_subject_app_verdict),
 		verdict_number(app_compiled.provisional_app_verdict),
 		limits.max_packets_inspected, limits.max_bytes_examined,

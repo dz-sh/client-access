@@ -105,7 +105,7 @@ export function project(compiled, bindings) {
 	};
 }
 
-export function project_subjects(app_compiled, bindings) {
+export function project_subjects(app_compiled, bindings, tracking_required) {
 	let subjects = {}, subject_counts = {};
 	for (let identity in (app_compiled.identities ?? [])) {
 		subject_counts[identity.id] = (subject_counts[identity.id] ?? 0) + 1;
@@ -153,7 +153,7 @@ export function project_subjects(app_compiled, bindings) {
 
 	sort(selectors, (a, b) => a.mac < b.mac ? -1 : (a.mac > b.mac ? 1 : 0));
 	return {
-		selectors: app_compiled.enabled ? selectors : [],
+		selectors: app_compiled.enabled || tracking_required ? selectors : [],
 		preview_selectors: selectors,
 		details,
 		errors,

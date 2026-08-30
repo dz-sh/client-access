@@ -31,9 +31,12 @@ jobs:
             | xargs -0 -n1 sh -n
           sh -n tests/verify-packaged-bpf.sh
           sh -n tests/verify-v45-packages.sh
+          sh -n tests/verify-v46-packages.sh
           sh -n tests/measure-bpf-performance.sh
           sh -n tests/measure-v44-continuous-authorization.sh
+          sh -n tests/measure-v46-sfo.sh
           python3 -m py_compile tests/send-malformed-frames.py
+          python3 -m py_compile tests/sfo-flow-load.py
 
       - name: Enforce the V4.2 classification boundary
         shell: bash
@@ -56,7 +59,9 @@ jobs:
           ! grep -Eiq 'lease|approval' src/client-access-bpf.c src/client-access-bpf.h \
             root/usr/share/nftables.d/table-pre/30-client-access.nft \
             root/usr/share/nftables.d/chain-pre/forward/30-client-access.nft
-          ! grep -Eiq 'conntrack-tools|\+conntrack' client-access-*/Makefile luci-app-client-access/Makefile
+          ! grep -Eiq 'conntrack-tools|libnetfilter-conntrack|\+conntrack' \
+            client-access-core/Makefile client-access-bpf/Makefile \
+            luci-app-client-access/Makefile
 
       - name: Enforce the V4.5 package and source boundaries
         shell: bash
@@ -92,8 +97,15 @@ jobs:
           test -f htdocs/luci-static/resources/client-access/common.js
           test -f htdocs/luci-static/resources/client-access/status.js
           test -f htdocs/luci-static/resources/client-access/approvals.js
-          test "$(find client-access-core client-access-bpf luci-app-client-access \
-            -mindepth 1 -maxdepth 1 -name Makefile | wc -l)" -eq 3
+          grep -Fq 'define Package/client-access-sfo' client-access-sfo/Makefile
+          grep -Fq '+client-access-core +client-access-bpf' client-access-sfo/Makefile
+          grep -Fq '+libnetfilter-conntrack3' client-access-sfo/Makefile
+          grep -Fq '#include <libnetfilter_conntrack/libnetfilter_conntrack.h>' \
+            sfo/client-access-sfoctl.c
+          ! grep -Eq 'conntrack[[:space:]]+-L|system\(|popen\(' \
+            sfo/client-access-sfoctl.c
+          test "$(find client-access-core client-access-bpf client-access-sfo \
+            luci-app-client-access -mindepth 1 -maxdepth 1 -name Makefile | wc -l)" -eq 4
 
       - name: Check the generated nftables fragment
         shell: bash
@@ -187,6 +199,14 @@ jobs:
           -L "${GITHUB_WORKSPACE}/root/usr/share/ucode"
           "${GITHUB_WORKSPACE}/tests/lease.uc"
 
+      - name: Run V4.6 software-offload manager tests
+        env:
+          TZ: UTC
+        run: >-
+          "${RUNNER_TEMP}/ucode-build/ucode"
+          -L "${GITHUB_WORKSPACE}/root/usr/share/ucode"
+          "${GITHUB_WORKSPACE}/tests/sfo_manager.uc"
+
       - name: Compile-check the daemon with stub target modules
         run: >-
           "${RUNNER_TEMP}/ucode-build/ucode"
@@ -212,8 +232,15 @@ jobs:
             nft_scope_failure \
             prune_failure \
             offload_software \
+            sfo_tracking_only \
+            sfo_capacity \
+            sfo_health_failure \
+            offload_missing \
             offload_hardware \
             offload_custom \
+            sfo_access_revoke \
+            sfo_application_revoke \
+            sfo_deadline_failure \
             access_approval \
             access_revoke \
             application_approval \
@@ -518,7 +545,7 @@ jobs:
           # job. Forwarding and classification use the last complete snapshot
           # without waiting for a userspace Classification Engine.
           printf '%s\n' \
-            'CONFIG 1 1 1 0 0 1 256 200 256 512 64' \
+            'CONFIG 1 1 1 1 0 0 1 256 200 256 512 64' \
             'SUBJECT 02:00:00:00:00:42 42' \
             'PREFIX4 198.51.100.2/32 100 10 1' \
             'PREFIX6 2001:db8:2::2/128 100 10 1' \
@@ -602,7 +629,7 @@ jobs:
           fi
 
           printf '%s\n' \
-            'CONFIG 1 2 1 0 0 1 256 200 256 512 64' \
+            'CONFIG 1 1 2 1 0 0 1 256 200 256 512 64' \
             'SUBJECT 02:00:00:00:00:42 42' \
             'PREFIX4 198.51.100.2/32 100 10 1' \
             'PREFIX6 2001:db8:2::2/128 100 10 1' \
@@ -620,7 +647,7 @@ jobs:
           # The existing ICMP flow keeps class 100, while a different source
           # address creates a new flow and observes the new class 101 mapping.
           printf '%s\n' \
-            'CONFIG 1 3 2 0 0 1 256 200 256 512 64' \
+            'CONFIG 1 1 3 2 0 0 1 256 200 256 512 64' \
             'SUBJECT 02:00:00:00:00:42 42' \
             'PREFIX4 198.51.100.2/32 101 10 1' \
             'POLICY 42 100 0' \
@@ -642,7 +669,7 @@ jobs:
 
           # A failed inactive-slot build must leave generation 3 active.
           if printf '%s\n' \
-              'CONFIG 1 4 2 0 0 1 256 200 256 512 64' \
+              'CONFIG 1 1 4 2 0 0 1 256 200 256 512 64' \
               'SUBJECT 02:00:00:00:00:42 42' \
               'SUBJECT 02:00:00:00:00:42 42' \
               | sudo "${RUNNER_TEMP}/client-access-bpfctl" sync; then
@@ -654,7 +681,7 @@ jobs:
           # The datapath receives only the complete near-final projection:
           # one exact result and one deterministic UNCLASSIFIED conflict.
           printf '%s\n' \
-            'CONFIG 1 4 2 0 0 1 256 200 256 512 64' \
+            'CONFIG 1 1 4 2 0 0 1 256 200 256 512 64' \
             'SUBJECT 02:00:00:00:00:42 42' \
             'PREFIX4 198.51.100.3/32 101 10 1' \
             'PREFIX4 198.51.100.4/32 1 0 3' \
@@ -675,7 +702,7 @@ jobs:
           # They receive the independent UNCLASSIFIED app verdict immediately
           # and remain per-packet bounded rather than entering flow state.
           printf '%s\n' \
-            'CONFIG 1 5 2 0 0 1 256 200 256 512 64' \
+            'CONFIG 1 1 5 2 0 0 1 256 200 256 512 64' \
             'SUBJECT 02:00:00:00:00:42 42' \
             'POLICY 42 1 1' \
             'POLICY 42 0 1' \
@@ -710,7 +737,7 @@ jobs:
           # higher global limit.
           sleep 1.1
           printf '%s\n' \
-            'CONFIG 1 6 2 0 0 1 256 200 256 100 1' \
+            'CONFIG 1 1 6 2 0 0 1 256 200 256 100 1' \
             'SUBJECT 02:00:00:00:00:42 42' \
             'POLICY 42 1 0' \
             'POLICY 42 0 0' \
@@ -730,7 +757,7 @@ jobs:
           # is high enough not to be the limiting dimension.
           sleep 1.1
           printf '%s\n' \
-            'CONFIG 1 7 2 0 0 1 256 200 256 1 100' \
+            'CONFIG 1 1 7 2 0 0 1 256 200 256 1 100' \
             'SUBJECT 02:00:00:00:00:42 42' \
             'POLICY 42 1 0' \
             'POLICY 42 0 0' \
@@ -750,7 +777,7 @@ jobs:
           # prove that a new flow is load-shed without entering classification.
           sleep 1.1
           printf '%s\n' \
-            'CONFIG 1 8 2 0 0 1 256 200 1 100 100' \
+            'CONFIG 1 1 8 2 0 0 1 256 200 1 100 100' \
             'SUBJECT 02:00:00:00:00:42 42' \
             'POLICY 42 1 0' \
             'POLICY 42 0 0' \
@@ -771,7 +798,7 @@ jobs:
           # it must not evict an active terminal flow and reopen leakage.
           sleep 1.1
           printf '%s\n' \
-            'CONFIG 1 9 2 0 0 1 256 200 256 100000 100000' \
+            'CONFIG 1 1 9 2 0 0 1 256 200 256 100000 100000' \
             'SUBJECT 02:00:00:00:00:42 42' \
             'POLICY 42 1 0' \
             'POLICY 42 0 0' \
@@ -786,7 +813,7 @@ jobs:
             | tee "${RUNNER_TEMP}/client-access-bpf-status.json"
           jq -e '
             .enabled == true and
-            .bpf_schema_version == 4 and
+            .bpf_schema_version == 5 and
             .app_policy_generation == 9 and
             .classifier_generation == 2 and
             .subject_entries == 1 and
@@ -856,6 +883,58 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  sfo-runtime:
+    name: Remote V4.6 software-offload runtime evidence
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out client-access
+        uses: actions/checkout@v6
+
+      - name: Install SFO runtime and measurement dependencies
+        run: >-
+          sudo apt-get update &&
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install --yes
+          linux-tools-common linux-tools-generic linux-tools-azure "linux-tools-$(uname -r)"
+          clang conntrack iperf3 iproute2 jq libbpf-dev libelf-dev
+          libnetfilter-conntrack-dev libnfnetlink-dev llvm nftables zlib1g-dev
+
+      - name: Select the runner-matched bpftool
+        shell: bash
+        run: |
+          bpftool_path="$(find /usr/lib/linux-tools -path '*-generic/bpftool' -print -quit)"
+          test -x "${bpftool_path}"
+          sudo ln -sf "${bpftool_path}" /usr/local/bin/bpftool
+
+      - name: Build on Linux and validate actual software offload
+        shell: bash
+        run: |
+          clang -O2 -g -target bpf -D__TARGET_ARCH_x86 \
+            -I/usr/include/x86_64-linux-gnu \
+            -c src/client-access-bpf.c \
+            -o "${RUNNER_TEMP}/client-access-bpf.o"
+          cc -O2 -Wall -Wextra -Werror -std=gnu11 \
+            src/client-access-bpfctl.c src/bpfctl-common.c src/bpf-*.c \
+            -o "${RUNNER_TEMP}/client-access-bpfctl" \
+            -lbpf -lelf -lz
+          cc -O2 -Wall -Wextra -Werror -std=gnu11 \
+            -Isrc sfo/client-access-sfoctl.c \
+            -o "${RUNNER_TEMP}/client-access-sfoctl" \
+            -lbpf -lnetfilter_conntrack
+          sh tests/measure-v46-sfo.sh \
+            "${RUNNER_TEMP}/client-access-bpf.o" \
+            "${RUNNER_TEMP}/client-access-bpfctl" \
+            "${RUNNER_TEMP}/client-access-sfoctl" \
+            "${RUNNER_TEMP}/client-access-v46-sfo"
+
+      - name: Upload V4.6 SFO evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v46-sfo-runtime-evidence
+          path: ${{ runner.temp }}/client-access-v46-sfo
+          if-no-files-found: error
+          retention-days: 14
+
   openwrt-core-luci:
     name: OpenWrt core and LuCI build isolation
     runs-on: ubuntu-24.04
@@ -890,6 +969,8 @@ jobs:
             -name 'luci-app-client-access_*.ipk' -print -quit | grep -q .
           test -z "$(find "${RUNNER_TEMP}/openwrt-core-luci-artifacts" -type f \
             -name 'client-access-bpf_*.ipk' -print -quit)"
+          test -z "$(find "${RUNNER_TEMP}/openwrt-core-luci-artifacts" -type f \
+            -name 'client-access-sfo_*.ipk' -print -quit)"
           printf '%s\n' 'Core and LuCI built without selecting the BPF package.' \
             >"${RUNNER_TEMP}/openwrt-core-luci-artifacts/v45-build-isolation.txt"
 
@@ -935,9 +1016,9 @@ jobs:
           sh tests/verify-packaged-bpf.sh \
             "${RUNNER_TEMP}/openwrt-artifacts" \
             "${RUNNER_TEMP}/openwrt-packaged-bpf"
-          sh tests/verify-v45-packages.sh \
+          sh tests/verify-v46-packages.sh \
             "${RUNNER_TEMP}/openwrt-artifacts" \
-            "${RUNNER_TEMP}/openwrt-artifacts/v45-package-evidence"
+            "${RUNNER_TEMP}/openwrt-artifacts/v46-package-evidence"
 
       - name: Upload OpenWrt packages and logs
         if: always()
@@ -981,9 +1062,9 @@ jobs:
           sh tests/verify-packaged-bpf.sh \
             "${RUNNER_TEMP}/immortalwrt-artifacts" \
             "${RUNNER_TEMP}/immortalwrt-packaged-bpf"
-          sh tests/verify-v45-packages.sh \
+          sh tests/verify-v46-packages.sh \
             "${RUNNER_TEMP}/immortalwrt-artifacts" \
-            "${RUNNER_TEMP}/immortalwrt-artifacts/v45-package-evidence"
+            "${RUNNER_TEMP}/immortalwrt-artifacts/v46-package-evidence"
 
       - name: Upload ImmortalWrt packages and logs
         if: always()

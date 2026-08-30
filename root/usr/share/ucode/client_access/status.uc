@@ -20,6 +20,7 @@ export function application_degraded(result, errors) {
 			...(result.app_filter ?? {}),
 			backend_mode: 'V3_NFT_ONLY',
 			enabled: false,
+			tracking_enabled: false,
 			available: false,
 			applied: false,
 			degraded: true,

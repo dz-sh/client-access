@@ -655,6 +655,8 @@ int ca_ingress(struct __sk_buff *skb)
 	 */
 	bpf_spin_lock(&config_map->lock);
 	config_snapshot.enabled = config_map->enabled;
+	config_snapshot.app_enforcement_enabled =
+		config_map->app_enforcement_enabled;
 	config_snapshot.active_slot = config_map->active_slot;
 	config_snapshot.app_policy_generation = config_map->app_policy_generation;
 	config_snapshot.classifier_generation = config_map->classifier_generation;
@@ -681,12 +683,16 @@ int ca_ingress(struct __sk_buff *skb)
 	subject_id = ca_subject_lookup(config, &mac);
 	if (!subject_id) {
 		ca_stat_inc(CA_STAT_UNKNOWN_SUBJECT_PACKETS);
-		return ca_emit_app_verdict(skb, config->unknown_subject_app_verdict);
+		return config->app_enforcement_enabled
+			? ca_emit_app_verdict(skb, config->unknown_subject_app_verdict)
+			: TC_ACT_UNSPEC;
 	}
 	if (parsed != CA_PARSE_OK) {
 		ca_stat_inc(CA_STAT_PARSE_UNSUPPORTED);
-		return ca_emit_app_verdict(skb, ca_policy_verdict(config, *subject_id,
-										 CA_CLASS_UNCLASSIFIED));
+		return config->app_enforcement_enabled
+			? ca_emit_app_verdict(skb, ca_policy_verdict(config, *subject_id,
+										 CA_CLASS_UNCLASSIFIED))
+			: TC_ACT_UNSPEC;
 	}
 
 	flow_key.subject_id = *subject_id;
@@ -694,15 +700,44 @@ int ca_ingress(struct __sk_buff *skb)
 	flow = bpf_map_lookup_elem(&ca_flows, &flow_key);
 	if (flow) {
 		flow->last_seen_ns = now;
+		if (!config->app_enforcement_enabled)
+			return TC_ACT_UNSPEC;
+		/* Correlation-only records deliberately carry class_kind NONE. Once
+		 * application enforcement is enabled they must re-enter the bounded
+		 * classifier instead of being mistaken for normal unclassified flows.
+		 */
 		if (flow->classification_state == CA_FLOW_PENDING)
-			return ca_emit_app_verdict(skb, config->provisional_app_verdict);
-		if (flow->app_policy_generation != config->app_policy_generation) {
-			flow->app_verdict = ca_policy_verdict(config, *subject_id,
-											 flow->class_id);
-			flow->app_policy_generation = config->app_policy_generation;
-			ca_stat_inc(CA_STAT_POLICY_REEVALUATIONS);
+			return ca_emit_app_verdict(skb,
+				config->provisional_app_verdict);
+		if (flow->class_kind != CA_CLASS_KIND_NONE) {
+			if (flow->app_policy_generation != config->app_policy_generation) {
+				flow->app_verdict = ca_policy_verdict(config, *subject_id,
+										 flow->class_id);
+				flow->app_policy_generation = config->app_policy_generation;
+				ca_stat_inc(CA_STAT_POLICY_REEVALUATIONS);
+			}
+			return ca_emit_app_verdict(skb, flow->app_verdict);
 		}
-		return ca_emit_app_verdict(skb, flow->app_verdict);
+		bpf_map_delete_elem(&ca_flows, &flow_key);
+	}
+
+	/* SFO correlation-only mode records the semantic subject and canonical
+	 * original tuple without activating the independent application policy
+	 * layer or spending classifier admission budget.
+	 */
+	if (!config->app_enforcement_enabled) {
+		initial.first_seen_ns = now;
+		initial.last_seen_ns = now;
+		initial.app_policy_generation = config->app_policy_generation;
+		initial.classifier_generation = config->classifier_generation;
+		initial.class_id = CA_CLASS_UNCLASSIFIED;
+		initial.classification_state = CA_FLOW_UNCLASSIFIED_FINAL;
+		initial.app_verdict = CA_VERDICT_ALLOW;
+		if (!bpf_map_update_elem(&ca_flows, &flow_key, &initial, BPF_NOEXIST))
+			ca_stat_inc(CA_STAT_FLOWS_TOTAL);
+		else if (!bpf_map_lookup_elem(&ca_flows, &flow_key))
+			ca_stat_inc(CA_STAT_FLOW_MAP_FULL);
+		return TC_ACT_UNSPEC;
 	}
 
 	if (!ca_admit_classification(config, *subject_id, now) ||

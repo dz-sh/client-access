@@ -95,7 +95,7 @@ sudo ip netns exec ca-perf-client iperf3 -c 198.51.100.2 \
 sudo nsenter --net=/var/run/netns/ca-perf-router -- \
 	"$controller" attach ca-perf-br
 printf '%s\n' \
-	'CONFIG 1 1 1 0 0 1 256 200 256 512 64' \
+	'CONFIG 1 1 1 1 0 0 1 256 200 256 512 64' \
 	'SUBJECT 02:00:00:00:00:42 42' \
 	'POLICY 42 1 0' \
 	'POLICY 42 0 0' \

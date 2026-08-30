@@ -1,6 +1,7 @@
 # V4.4 continuously authorizes every scoped packet. Established normal-path
 # flows therefore observe ALLOW -> DENY on their next packet without conntrack
-# deletion. Flow offload remains unsupported by the application workflow.
+# deletion. The optional V4.6 SFO workflow handles accelerated-state
+# revocation independently; this nftables access layer remains unchanged.
 iifname @client_access_sources oifname @client_access_destinations jump client_access_dispatch
 
 # Independent application-policy layer. Existing flows are intentionally

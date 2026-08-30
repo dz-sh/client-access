@@ -1,5 +1,6 @@
 let phase = 0;
 let bpf_enabled = false;
+let app_enforcement_enabled = false;
 let policy_generation = 0;
 let classifier_generation = 0;
 let policy_generations = [];
@@ -7,6 +8,8 @@ let attachments = {};
 let scope_active = false;
 let health_checks = 0;
 let files = {};
+let sfo_commands = [];
+let sfo_revocation_started = false;
 
 function scenario() {
 	return getenv('CA_DAEMON_TEST_SCENARIO');
@@ -32,18 +35,31 @@ export function snapshot() {
 	sort(names);
 	return {
 		bpf_enabled,
+		app_enforcement_enabled,
 		policy_generation,
 		classifier_generation,
 		policy_generations,
 		attachments: names,
 		scope_active,
 		journal_present: files['/tmp/client-access-approvals.json'] != null,
+		sfo_commands,
 	};
 }
 
 export function stat(path) {
 	initialize();
-	return path == '/usr/sbin/client-access-bpfctl' ? {} : null;
+	if (path == '/usr/sbin/client-access-bpfctl')
+		return {};
+	if (path == '/usr/sbin/client-access-sfoctl' &&
+	    (scenario() == 'offload_software' ||
+	     scenario() == 'sfo_tracking_only' ||
+	     scenario() == 'sfo_capacity' ||
+	     scenario() == 'sfo_health_failure' ||
+	     scenario() == 'sfo_access_revoke' ||
+	     scenario() == 'sfo_application_revoke' ||
+	     scenario() == 'sfo_deadline_failure'))
+		return {};
+	return null;
 }
 
 export function open(path, mode, permissions) {
@@ -113,9 +129,40 @@ function read_result(argv) {
 		return {
 			code: 0,
 			output: scenario() == 'offload_custom'
-				? 'table inet fw4 { chain forward { ip protocol tcp flow add @ft } }'
-				: 'table inet fw4 { chain forward { counter accept } }',
+				? 'table inet fw4 {\nflowtable fastpath {\n}\nchain forward {\nip protocol tcp flow add @fastpath\n}\n}'
+				: ((scenario() == 'offload_software' ||
+				    scenario() == 'sfo_tracking_only' ||
+				    scenario() == 'sfo_capacity' ||
+				    scenario() == 'sfo_health_failure' ||
+				    scenario() == 'offload_missing' ||
+				    scenario() == 'offload_hardware' ||
+				    scenario() == 'sfo_access_revoke' ||
+				    scenario() == 'sfo_application_revoke' ||
+				    scenario() == 'sfo_deadline_failure')
+					? 'table inet fw4 {\nflowtable ft {\nhook ingress priority filter\n}\nchain forward {\nmeta l4proto { tcp, udp } flow offload @ft\n}\n}'
+					: 'table inet fw4 { chain forward { counter accept } }'),
 		};
+	if (argv[0] == '/usr/sbin/client-access-sfoctl') {
+		push(sfo_commands, [ ...argv ]);
+		if (argv[1] == 'revoke')
+			sfo_revocation_started = true;
+		const failed = scenario() == 'sfo_deadline_failure' &&
+			sfo_revocation_started &&
+			(argv[1] == 'revoke' || argv[1] == 'baseline');
+		return {
+			code: failed ? 1 : 0,
+			output: sprintf('%J\n', {
+				result: failed ? 'FAILED' : 'COMPLETE',
+				correlation_health: failed ? 'DEGRADED' : 'HEALTHY',
+				tracked_flow_count: 7,
+				candidate_count: 1,
+				software_offloaded_flow_count: 1,
+				hardware_offloaded_flow_count: 0,
+				gc_reclaimed: argv[1] == 'gc' ? 1 : 0,
+				revocation_latency_ms: failed ? 2001 : 4,
+			}),
+		};
+	}
 	if (argv[0] != '/usr/sbin/client-access-bpfctl')
 		return { code: 1, output: '' };
 
@@ -152,6 +199,7 @@ function read_result(argv) {
 		return { code: 0, output: '{"removed":0}\n' };
 	if (command == 'health') {
 		const fail_health = scenario() == 'health_failure' ||
+			scenario() == 'sfo_health_failure' ||
 			(scenario() == 'status_health_failure' && health_checks > 0);
 		health_checks++;
 		if (fail_health)
@@ -168,8 +216,12 @@ function read_result(argv) {
 		return healthy
 			? { code: 0, output: sprintf('%J\n', {
 				backend_mode: 'V4_BPF_BASIC', enabled: true,
+				app_enforcement_enabled,
 				app_policy_generation: policy_generation,
 				classifier_generation,
+				flow_map_entries: 1,
+				flow_capacity: 16384,
+				flow_map_full: scenario() == 'sfo_capacity' ? 1 : 0,
 			}) }
 			: { code: 1, output: '' };
 	}
@@ -182,8 +234,9 @@ function write_result(argv, content) {
 			return 1;
 		const header = split(content, '\n')[0];
 		const fields = split(header, /\s+/);
-		policy_generation = +fields[2];
-		classifier_generation = +fields[3];
+		policy_generation = +fields[3];
+		classifier_generation = +fields[4];
+		app_enforcement_enabled = +fields[2] == 1;
 		push(policy_generations, policy_generation);
 		bpf_enabled = true;
 		return 0;

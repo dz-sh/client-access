@@ -10,7 +10,7 @@ function main_option(option) {
 		schema_version: '4',
 		enabled: '1',
 		mode: 'blacklist',
-		app_filter_enabled: '1',
+		app_filter_enabled: scenario == 'sfo_tracking_only' ? '0' : '1',
 		unknown_subject_app_verdict: phase == 1 && scenario == 'generation_nonreuse'
 			? 'deny' : 'allow',
 		provisional_app_verdict: 'allow',
@@ -21,6 +21,7 @@ function main_option(option) {
 		max_new_classifications_per_second: '512',
 		per_subject_new_classification_rate: '64',
 		signature_table_memory_limit: '262144',
+		sfo_revocation_deadline_ms: '2000',
 		deny_action: 'reject',
 		source_zone: [ 'lan' ],
 		destination_zone: [ 'wan' ],
@@ -31,13 +32,14 @@ function main_option(option) {
 
 function access_denied_scenario(name) {
 	return name == 'access_approval' || name == 'access_revoke' ||
+		name == 'sfo_access_revoke' || name == 'sfo_deadline_failure' ||
 		name == 'approval_journal_restart' || name == 'router_reboot' ||
 		name == 'journal_corruption' || name == 'journal_write_failure';
 }
 
 function application_denied_scenario(name) {
 	return name == 'access_approval' || name == 'application_approval' ||
-		name == 'application_revoke';
+		name == 'application_revoke' || name == 'sfo_application_revoke';
 }
 
 export function cursor() {
@@ -73,7 +75,14 @@ export function cursor() {
 					verdict: 'deny', activation: 'always_active' });
 			else if (package_name == 'firewall' && section_type == 'defaults')
 				callback({
-					flow_offloading: scenario == 'offload_software' ? '1' : '0',
+					flow_offloading: scenario == 'offload_software' ||
+						scenario == 'sfo_tracking_only' ||
+						scenario == 'sfo_capacity' ||
+						scenario == 'sfo_health_failure' ||
+						scenario == 'offload_missing' ||
+						scenario == 'sfo_access_revoke' ||
+						scenario == 'sfo_application_revoke' ||
+						scenario == 'sfo_deadline_failure' ? '1' : '0',
 					flow_offloading_hw: scenario == 'offload_hardware' ? '1' : '0',
 				});
 		},

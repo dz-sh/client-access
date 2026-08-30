@@ -127,8 +127,8 @@ assert_equal(lease.create(database, {
 	'reserved UNCLASSIFIED cannot receive a Temporary Approval');
 
 /* V44-TEST-008 and 020: only effective changes transition. */
-const previous = lease.effective_snapshot(base_access, base_app);
-const current = lease.effective_snapshot(access_effective, app_effective);
+const previous = lease.effective_snapshot(base_access, base_app, true);
+const current = lease.effective_snapshot(access_effective, app_effective, true);
 const transitions = lease.plan_transitions(previous, current, 'lease_created');
 assert_equal(length(transitions) > 0, true,
 	'effective DENY to ALLOW changes produce authorization transitions');
@@ -137,8 +137,8 @@ const no_op_access = lease.overlay_access({
 }, database);
 assert_equal(lease.plan_transitions(
 	lease.effective_snapshot({ identities: [ { id: 'alice', verdict: 'allow' } ] },
-		{ identities: [], policies: [] }),
-	lease.effective_snapshot(no_op_access, { identities: [], policies: [] }),
+		{ identities: [], policies: [] }, true),
+	lease.effective_snapshot(no_op_access, { identities: [], policies: [] }, true),
 	'lease_created'), [],
 	'base ALLOW plus lease ALLOW does not create a transition');
 
@@ -146,13 +146,23 @@ const revoked = lease.revoke(database, application.lease.id);
 assert_equal(revoked.ok, true, 'manual revocation removes the selected lease');
 const after_revoke = lease.overlay_application(base_app, revoked.database);
 const restrictive = lease.plan_transitions(
-	lease.effective_snapshot(access_effective, app_effective),
-	lease.effective_snapshot(access_effective, after_revoke), 'lease_revoked');
+	lease.effective_snapshot(access_effective, app_effective, true),
+	lease.effective_snapshot(access_effective, after_revoke, true), 'lease_revoked');
 assert_equal(restrictive[0].ordering, [
 	'restrict_admission', 'publish_restrictive_policy', 'revoke_bypass_state',
 ], 'ALLOW to DENY transition freezes safe future revocation ordering');
 assert_equal(restrictive[0].revocation_state, 'pending_publication',
 	'restrictive transition is not complete before policy publication');
+
+const global_default_transition = lease.plan_transitions(
+	lease.effective_snapshot({ enabled: false, identities: [] },
+		{ identities: [], policies: [] }, false),
+	lease.effective_snapshot({ enabled: true, default_verdict: 'deny', identities: [] },
+		{ identities: [], policies: [] }, false), 'policy_changed');
+assert_equal(global_default_transition[0].subject_id, null,
+	'a restrictive unknown-client default is represented without inventing an identity');
+assert_equal(global_default_transition[0].restrictive, true,
+	'a restrictive unknown-client default requests broader runtime revocation');
 
 /* V44-TEST-012, 013 and 015: journal parsing is volatile and fail closed. */
 const reloaded = lease.parse_database(database, context, EPOCH + 180, [ 1180, 0 ]);
@@ -174,9 +184,9 @@ const expired_access = lease.overlay_access(base_access, wall_expired.database);
 assert_equal(expired_access.identities[0].verdict, 'deny',
 	'expiry automatically restores the base Access verdict');
 assert_equal(lease.plan_transitions(
-	lease.effective_snapshot(access_effective, app_effective),
+	lease.effective_snapshot(access_effective, app_effective, true),
 	lease.effective_snapshot(expired_access,
-		lease.overlay_application(base_app, wall_expired.database)),
+		lease.overlay_application(base_app, wall_expired.database), true),
 	'lease_expired')[0].restrictive, true,
 	'lease expiry is represented as a restrictive authorization transition');
 

@@ -123,4 +123,56 @@ function applicationPanel(status) {
 	]);
 }
 
-return { accessPanel: accessPanel, applicationPanel: applicationPanel };
+function softwareOffloadPanel(status) {
+	const offload = status.software_offload || {};
+	const mode = offload.mode || 'NO_OFFLOAD';
+	const healthy = mode === 'NO_OFFLOAD' || mode === 'SFO_AVAILABLE' ||
+		mode === 'SFO_ACTIVE';
+	const labels = {
+		NO_OFFLOAD: _('Software flow offload is off.'),
+		SFO_AVAILABLE: _('Software flow offload is off; bounded-revocation support is installed.'),
+		SFO_ACTIVE: _('Software flow offload is active with bounded revocation.'),
+		SFO_DEGRADED: _('Software flow offload is degraded; stale accelerated traffic may exceed the revocation deadline.'),
+		SFO_BACKEND_MISSING: _('Software flow offload is enabled, but the optional revocation package is missing.'),
+		HFO_UNSUPPORTED: _('Unsupported hardware flow offload is enabled.'),
+		CUSTOM_OFFLOAD_UNSUPPORTED: _('A custom flow-offload topology is present and is not supported.'),
+		OFFLOAD_UNVERIFIABLE: _('The active flow-offload topology could not be verified.')
+	};
+
+	return E('div', { 'class': 'cbi-section' }, [
+		E('div', { 'class': healthy ? 'alert-message success' : 'alert-message warning' }, [
+			labels[mode] || _('Flow-offload state is unknown.')
+		]),
+		E('details', {}, [
+			E('summary', {}, [ _('Software offload diagnostics') ]),
+			E('p', {}, [
+				_('A restrictive change is published first, then matching accelerated flows are removed and verified. This is bounded revocation, not instant or zero-packet termination.')
+			]),
+			E('div', { 'class': 'table' }, [
+				E('div', { 'class': 'tr' }, [
+					E('div', { 'class': 'td left' }, [ _('Mode / correlation') ]),
+					E('div', { 'class': 'td left' }, [ '%s / %s'.format(mode, offload.correlation_health || 'UNKNOWN') ]),
+					E('div', { 'class': 'td left' }, [ _('Tracked / accelerated flows') ]),
+					E('div', { 'class': 'td left' }, [ '%s / %s'.format(offload.tracked_flow_count || 0, offload.software_offloaded_flow_count || 0) ])
+				]),
+				E('div', { 'class': 'tr' }, [
+					E('div', { 'class': 'td left' }, [ _('Last revocation') ]),
+					E('div', { 'class': 'td left' }, [ offload.last_revocation_result || _('Not required') ]),
+					E('div', { 'class': 'td left' }, [ _('Latency / deadline') ]),
+					E('div', { 'class': 'td left' }, [ '%s / %s ms'.format(offload.last_revocation_latency_ms || 0, offload.revocation_deadline_ms || 0) ])
+				]),
+				E('div', { 'class': 'tr' }, [
+					E('div', { 'class': 'td left' }, [ _('Targeted / fallback revocations') ]),
+					E('div', { 'class': 'td left' }, [ '%s / %s'.format(offload.targeted_revocations || 0, offload.fallback_revocations || 0) ]),
+					E('div', { 'class': 'td left' }, [ _('Failures') ]),
+					E('div', { 'class': 'td left' }, [ String(offload.revocation_failures || 0) ])
+				])
+			]),
+			(offload.errors || []).length
+				? E('p', { 'class': 'alert-message error' }, [ offload.errors.join('; ') ]) : ''
+		])
+	]);
+}
+
+return { accessPanel: accessPanel, applicationPanel: applicationPanel,
+	softwareOffloadPanel: softwareOffloadPanel };

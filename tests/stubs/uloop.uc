@@ -63,6 +63,8 @@ export function run() {
 		reconcile('projection-failure-test');
 	}
 	else if (scenario == 'access_approval' || scenario == 'access_revoke' ||
+	         scenario == 'sfo_access_revoke' ||
+	         scenario == 'sfo_deadline_failure' ||
 	         scenario == 'journal_write_failure') {
 		const approved = service.approve.call(null, {
 			scope: 'access', identity_id: 'alice', duration: 'one_hour',
@@ -73,22 +75,28 @@ export function run() {
 		}
 		else if (!approved.ok)
 			fail(`access approval failed: ${sprintf('%J', approved)}`);
-		if (scenario == 'access_revoke') {
+		if (scenario == 'access_revoke' || scenario == 'sfo_access_revoke' ||
+		    scenario == 'sfo_deadline_failure') {
 			const revoked = service.revoke_approval.call(null, {
 				lease_id: approved.approval.id,
 			});
-			if (!revoked.ok)
+			if (scenario == 'sfo_deadline_failure') {
+				if (revoked.ok || !revoked.degraded)
+					fail(`deadline failure was not surfaced: ${sprintf('%J', revoked)}`);
+			}
+			else if (!revoked.ok)
 				fail(`access revocation failed: ${sprintf('%J', revoked)}`);
 		}
 	}
-	else if (scenario == 'application_approval' || scenario == 'application_revoke') {
+	else if (scenario == 'application_approval' || scenario == 'application_revoke' ||
+	         scenario == 'sfo_application_revoke') {
 		const approved = service.approve.call(null, {
 			scope: 'application', identity_id: 'alice', class_id: 10,
 			duration: 'one_hour',
 		});
 		if (!approved.ok)
 			fail(`application approval failed: ${sprintf('%J', approved)}`);
-		if (scenario == 'application_revoke') {
+		if (scenario == 'application_revoke' || scenario == 'sfo_application_revoke') {
 			const revoked = service.revoke_approval.call(null, {
 				lease_id: approved.approval.id,
 			});
@@ -139,14 +147,37 @@ export function run() {
 	         scenario == 'ensure_failure' ||
 	         scenario == 'attach_failure' ||
 	         scenario == 'sync_failure' ||
-	         scenario == 'nft_scope_failure' ||
-	         scenario == 'offload_software' ||
-	         scenario == 'offload_hardware' ||
-	         scenario == 'offload_custom') {
+	         scenario == 'nft_scope_failure') {
 		if (!status.applied || app.backend_mode != 'V3_NFT_ONLY' || app.enabled ||
 		    !app.degraded || runtime.bpf_enabled || runtime.scope_active ||
 		    length(runtime.attachments))
 			fail(`${scenario} did not neutralize V4 and retain V3-only mode`);
+	}
+	else if (scenario == 'offload_missing' || scenario == 'offload_hardware' ||
+	         scenario == 'offload_custom') {
+		if (status.applied || app.backend_mode != 'V3_NFT_ONLY' || app.enabled ||
+		    !app.degraded || runtime.bpf_enabled || runtime.scope_active ||
+		    length(runtime.attachments))
+			fail(`${scenario} was not explicitly rejected as unsupported acceleration`);
+	}
+	else if (scenario == 'offload_software') {
+		if (!status.applied || app.backend_mode != 'V4_BPF_BASIC' || !app.enabled ||
+		    status.software_offload.mode != 'SFO_ACTIVE' ||
+		    status.software_offload.correlation_health != 'HEALTHY' ||
+		    !length(runtime.sfo_commands))
+			fail(`canonical SFO did not establish tracked healthy operation: ${sprintf('%J', status.software_offload)}`);
+	}
+	else if (scenario == 'sfo_tracking_only') {
+		if (!status.applied || app.backend_mode != 'V46_SFO_TRACKING' ||
+		    app.enabled || !app.tracking_enabled || !runtime.bpf_enabled ||
+		    runtime.app_enforcement_enabled || runtime.scope_active ||
+		    status.software_offload.mode != 'SFO_ACTIVE')
+			fail(`V3 SFO did not use correlation-only tracking: ${sprintf('%J', { app, runtime, offload: status.software_offload })}`);
+	}
+	else if (scenario == 'sfo_capacity' || scenario == 'sfo_health_failure') {
+		if (status.applied || status.software_offload.mode != 'SFO_DEGRADED' ||
+		    status.software_offload.correlation_health != 'DEGRADED')
+			fail(`${scenario} silently trusted lost SFO correlation: ${sprintf('%J', status.software_offload)}`);
 	}
 	else if (scenario == 'prune_failure') {
 		if (!status.applied || app.backend_mode != 'V3_NFT_ONLY' || app.enabled ||
@@ -186,6 +217,31 @@ export function run() {
 		    application.effective_verdict != 'deny' ||
 		    runtime.policy_generation != 3 || runtime.classifier_generation != 1)
 			fail(`Application Lease revocation did not reuse cached class: ${sprintf('%J', approvals)}`);
+	}
+	else if (scenario == 'sfo_access_revoke' ||
+	         scenario == 'sfo_application_revoke') {
+		const transitions = approvals.latest_transitions ?? [];
+		const expected_scope = scenario == 'sfo_access_revoke' ? 'access' : 'application';
+		let transition = null, command = null;
+		for (let candidate in transitions)
+			if (candidate.scope == expected_scope && candidate.restrictive)
+				transition = candidate;
+		for (let candidate in runtime.sfo_commands)
+			if (candidate[1] == 'revoke')
+				command = candidate;
+		if (!status.applied || status.software_offload.mode != 'SFO_ACTIVE' ||
+		    !transition || transition.revocation_state != 'complete' ||
+		    transition.revocation_backend != 'sfo_targeted' || !command ||
+		    command[2] != '42' || command[3] !=
+			(expected_scope == 'application' ? '10' : '-'))
+			fail(`SFO ${expected_scope} transition lost semantic targeting: ${sprintf('%J', { transitions, command })}`);
+	}
+	else if (scenario == 'sfo_deadline_failure') {
+		const transitions = approvals.latest_transitions ?? [];
+		if (status.applied || status.software_offload.mode != 'SFO_DEGRADED' ||
+		    !length(transitions) || transitions[0].revocation_state != 'failed' ||
+		    status.software_offload.revocation_failures < 1)
+			fail(`SFO deadline failure was not retained as degraded state: ${sprintf('%J', status.software_offload)}`);
 	}
 	else if (scenario == 'approval_journal_restart') {
 		const access = target(approvals, 'access');

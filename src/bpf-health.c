@@ -185,7 +185,7 @@ int ca_bpf_print_status(void)
 	printf("{\"backend_mode\":\"V4_BPF_BASIC\"," 
 	       "\"program_pinned\":true,\"maps_pinned\":true,"
 	       "\"bpf_schema_version\":%u,"
-	       "\"enabled\":%s,\"active_slot\":%u,"
+	       "\"enabled\":%s,\"app_enforcement_enabled\":%s,\"active_slot\":%u,"
 	       "\"app_policy_generation\":%u,\"classifier_generation\":%u,"
 	       "\"subject_entries\":%d,\"subject_count\":%d,"
 	       "\"app_policy_snapshot_entries\":%d,\"policy_entries\":%d,"
@@ -219,7 +219,9 @@ int ca_bpf_print_status(void)
 	       "\"max_classification_age_ms\":%u,\"max_pending_entries\":%u,"
 	       "\"max_new_classifications_per_second\":%u,"
 	       "\"per_subject_new_classification_rate\":%u}\n",
-	       schema, config.enabled ? "true" : "false", config.active_slot,
+	       schema, config.enabled ? "true" : "false",
+	       config.app_enforcement_enabled ? "true" : "false",
+	       config.active_slot,
 	       config.app_policy_generation, config.classifier_generation,
 	       subject_entries, unique_subjects,
 	       policy_entries, policy_entries,
@@ -272,5 +274,4 @@ out:
 		close(schema_fd);
 	return ret;
 }
-
 

@@ -13,6 +13,13 @@ function assert_true(value, message) {
 		fail(message);
 }
 
+function contains(values, expected) {
+	for (let value in values)
+		if (value == expected)
+			return true;
+	return false;
+}
+
 function observed(policy_generation, classifier_generation) {
 	return {
 		access: { publication_observable: false, runtime_signature: null },
@@ -45,8 +52,10 @@ assert_true(plan.actions.access.operation == 'publish' &&
 assert_true(plan.actions.application.candidate_policy_generation == 1 &&
 	plan.actions.application.candidate_classifier_generation == 1,
 	'initial application and classifier snapshots need independent generations');
-assert_true(sprintf('%J', plan.actions.application.interfaces_to_attach) ==
-	'["lan0","lan1"]', 'planner must expose the complete TC attach delta');
+assert_true(length(plan.actions.application.interfaces_to_attach) == 2 &&
+	contains(plan.actions.application.interfaces_to_attach, 'lan0') &&
+	contains(plan.actions.application.interfaces_to_attach, 'lan1'),
+	'planner must expose the complete TC attach delta');
 
 committed.access = { generation: 5, signature: 'access-a', applied: true };
 committed.application.policy_generation = 7;
@@ -63,9 +72,11 @@ assert_true(plan.actions.access.operation == 'publish' &&
 assert_true(plan.actions.application.candidate_policy_generation == 7 &&
 	plan.actions.application.candidate_classifier_generation == 3,
 	'forced reconciliation must not advance unchanged application generations');
-assert_true(sprintf('%J', plan.actions.application.interfaces_to_keep) ==
-	'["lan0"]' && sprintf('%J', plan.actions.application.interfaces_to_attach) ==
-	'["lan1"]', 'planner must distinguish kept and newly attached interfaces');
+assert_true(length(plan.actions.application.interfaces_to_keep) == 1 &&
+	plan.actions.application.interfaces_to_keep[0] == 'lan0' &&
+	length(plan.actions.application.interfaces_to_attach) == 1 &&
+	plan.actions.application.interfaces_to_attach[0] == 'lan1',
+	'planner must distinguish kept and newly attached interfaces');
 
 plan = reconciliation.plan(committed, observed(10, 8),
 	desired('access-b', 'app-b', 'classifier-b'), [ {

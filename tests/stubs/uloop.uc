@@ -136,15 +136,16 @@ export function run() {
 			fail(`restart did not reconcile the exact attachment set: app=${sprintf('%J', app)} runtime=${sprintf('%J', runtime)}`);
 	}
 	else if (scenario == 'interface_add') {
-		if (sprintf('%J', runtime.attachments) != '["lan0","lan1"]')
+		if (length(runtime.attachments) != 2 ||
+		    runtime.attachments[0] != 'lan0' || runtime.attachments[1] != 'lan1')
 			fail(`application runtime did not converge an added target interface: ${sprintf('%J', runtime.attachments)}`);
 	}
 	else if (scenario == 'interface_remove') {
-		if (sprintf('%J', runtime.attachments) != '["lan1"]')
+		if (length(runtime.attachments) != 1 || runtime.attachments[0] != 'lan1')
 			fail(`application runtime did not prune a removed target interface: ${sprintf('%J', runtime.attachments)}`);
 	}
 	else if (scenario == 'interface_repair') {
-		if (sprintf('%J', runtime.attachments) != '["lan0"]')
+		if (length(runtime.attachments) != 1 || runtime.attachments[0] != 'lan0')
 			fail(`application runtime did not repair the unchanged target: ${sprintf('%J', runtime.attachments)}`);
 	}
 	else if (scenario == 'fw4_restore') {
@@ -169,7 +170,8 @@ export function run() {
 	else if (scenario == 'runtime_generation_floor') {
 		if (app.app_policy_generation != 11 || app.classifier_generation != 9 ||
 		    runtime.policy_generation != 11 || runtime.classifier_generation != 9 ||
-		    sprintf('%J', runtime.policy_generations) != '[11]')
+		    length(runtime.policy_generations) != 1 ||
+		    runtime.policy_generations[0] != 11)
 			fail(`observed runtime generations did not flow through the authoritative plan: ${sprintf('%J', { app, runtime })}`);
 	}
 	else if (scenario == 'health_failure' ||

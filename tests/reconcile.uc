@@ -20,6 +20,10 @@ function contains(values, expected) {
 	return false;
 }
 
+function same(actual, expected) {
+	return sprintf('%J', actual) == sprintf('%J', expected);
+}
+
 function observed(policy_generation, classifier_generation) {
 	return {
 		application: {
@@ -52,8 +56,8 @@ assert_true(plan.actions.access.operation == 'publish' &&
 assert_true(plan.actions.application.candidate_policy_generation == 1 &&
 	plan.actions.application.candidate_classifier_generation == 1,
 	'initial application and classifier snapshots need independent generations');
-assert_true(sprintf('%J', plan.actions.application.target_interfaces) ==
-		'["lan0","lan1"]' &&
+assert_true(same(plan.actions.application.target_interfaces,
+		[ 'lan0', 'lan1' ]) &&
 	!contains(keys(plan.actions.application), 'interfaces_to_attach') &&
 	!contains(keys(plan.actions.application), 'interfaces_to_detach') &&
 	!contains(keys(plan.actions.application), 'interfaces_to_keep'),
@@ -74,8 +78,8 @@ assert_true(plan.actions.access.operation == 'publish' &&
 assert_true(plan.actions.application.candidate_policy_generation == 7 &&
 	plan.actions.application.candidate_classifier_generation == 3,
 	'forced reconciliation must not advance unchanged application generations');
-assert_true(sprintf('%J', plan.actions.application.target_interfaces) ==
-		'["lan0","lan1"]' && plan.actions.application.repair,
+assert_true(same(plan.actions.application.target_interfaces,
+		[ 'lan0', 'lan1' ]) && plan.actions.application.repair,
 	'repair must preserve the semantic target without exposing attach operations');
 
 plan = reconciliation.plan(committed, observed(10, 8),
@@ -95,15 +99,14 @@ assert_true(plan.transitions[0].publication_action_id == 'application.publish' &
 plan = reconciliation.plan(committed, observed(11, 9),
 	desired('access-b', 'app-b', 'classifier-b', [ 'lan1' ]), [],
 	reconciliation.attempt_context('interface-remove', false, 4));
-assert_true(sprintf('%J', plan.actions.application.target_interfaces) ==
-		'["lan1"]',
+assert_true(same(plan.actions.application.target_interfaces, [ 'lan1' ]),
 	'interface removal must be represented only as a new target set');
 
 plan = reconciliation.plan(committed, observed(12, 10),
 	desired('access-b', 'app-b', 'classifier-b', [ 'lan0', 'lan1', 'lan2' ]), [],
 	reconciliation.attempt_context('interface-add', false, 5));
-assert_true(sprintf('%J', plan.actions.application.target_interfaces) ==
-		'["lan0","lan1","lan2"]',
+assert_true(same(plan.actions.application.target_interfaces,
+		[ 'lan0', 'lan1', 'lan2' ]),
 	'interface addition must be represented only as a new target set');
 
 print('reconciliation planner tests passed.\n');

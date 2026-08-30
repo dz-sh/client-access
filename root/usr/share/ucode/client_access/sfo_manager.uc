@@ -4,8 +4,6 @@
  * this module owns only bounded backend convergence and diagnostics.
  */
 
-import * as sfo_runtime from 'client_access.sfo_runtime';
-
 const DEFAULT_DEADLINE_MS = 2000;
 const MAX_DEADLINE_MS = 10000;
 
@@ -64,7 +62,8 @@ function absorb(state, result) {
 }
 
 export function reconcile_gc(state, capability, tracking_healthy, backend) {
-	backend ??= sfo_runtime;
+	if (!backend)
+		return state;
 	if (capability.mode != 'SFO_ACTIVE' || state.mode != 'SFO_ACTIVE' ||
 	    !tracking_healthy)
 		return state;
@@ -84,10 +83,9 @@ export function reconcile_gc(state, capability, tracking_healthy, backend) {
 
 export function reconcile(state, capability, tracking_healthy, configured_deadline,
 		backend) {
-	backend ??= sfo_runtime;
 	const previous_mode = state.mode;
 	state.mode = capability.mode;
-	state.backend_available = backend.present();
+	state.backend_available = !!backend && backend.present();
 	state.runtime_ruleset_verified = capability.runtime_ruleset_verified;
 	state.hardware_offload_detected = capability.hardware_offload_detected;
 	state.revocation_deadline_ms = parse_deadline(configured_deadline);
@@ -98,6 +96,13 @@ export function reconcile(state, capability, tracking_healthy, configured_deadli
 		state.baseline_required = true;
 		if (capability.reason)
 			push(state.errors, capability.reason);
+		return state;
+	}
+	if (!backend) {
+		state.mode = 'SFO_BACKEND_MISSING';
+		state.correlation_health = 'DEGRADED';
+		state.baseline_required = true;
+		push(state.errors, 'Structured conntrack runtime backend is unavailable');
 		return state;
 	}
 	if (!tracking_healthy) {
@@ -133,13 +138,12 @@ export function reconcile(state, capability, tracking_healthy, configured_deadli
 }
 
 export function revoke_transitions(state, transitions, capability, backend) {
-	backend ??= sfo_runtime;
 	let published = [], broad_required = false, broad_result = null;
 	for (let transition in transitions)
 		if (transition.restrictive && transition.policy_published &&
 		    transition.subject_id == null)
 			broad_required = true;
-	if (broad_required && capability.offload_present &&
+	if (backend && broad_required && capability.offload_present &&
 	    capability.mode == 'SFO_ACTIVE' && state.mode == 'SFO_ACTIVE') {
 		broad_result = backend.baseline(state.revocation_deadline_ms);
 		state.fallback_revocations++;
@@ -169,7 +173,7 @@ export function revoke_transitions(state, transitions, capability, backend) {
 			continue;
 		}
 		state.revocation_generation++;
-		if (capability.mode != 'SFO_ACTIVE' ||
+		if (!backend || capability.mode != 'SFO_ACTIVE' ||
 		    (state.mode != 'SFO_ACTIVE' && broad_result == null)) {
 			state.last_revocation_result = 'FAILED';
 			state.revocation_failures++;

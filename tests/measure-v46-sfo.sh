@@ -10,8 +10,14 @@ repo_dir=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 router_ns=ca46-router
 client_ns=ca46-client
 server_ns=ca46-server
+current_phase=initialization
 
 cleanup() {
+	status=$?
+	if [ "$status" -ne 0 ]; then
+		printf 'V4.6 SFO measurement failed during: %s\n' "$current_phase" >&2
+		printf '%s\n' "$current_phase" >"$report_dir/failed-phase.txt" 2>/dev/null || true
+	fi
 	for pid in ${flow_pids:-}; do
 		sudo kill "$pid" >/dev/null 2>&1 || true
 	done
@@ -30,12 +36,15 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 mkdir -p "$report_dir"
+printf '%s\n' "$current_phase" >"$report_dir/phase.txt"
 sudo mkdir -p /sys/fs/bpf
 if ! mountpoint --quiet /sys/fs/bpf; then
 	sudo mount -t bpf bpf /sys/fs/bpf
 fi
 
 sudo "$bpfctl" load "$object"
+current_phase=network_namespace_setup
+printf '%s\n' "$current_phase" >"$report_dir/phase.txt"
 sudo ip netns add "$router_ns"
 sudo ip netns add "$client_ns"
 sudo ip netns add "$server_ns"
@@ -51,8 +60,8 @@ sudo ip netns exec "$router_ns" ip link set ca46-lan up
 sudo ip netns exec "$router_ns" ip link set ca46-wan up
 sudo ip netns exec "$router_ns" ip address add 192.0.2.1/24 dev ca46-lan
 sudo ip netns exec "$router_ns" ip address add 198.51.100.1/24 dev ca46-wan
-sudo ip netns exec "$router_ns" ip -6 address add fd46:1::1/64 dev ca46-lan
-sudo ip netns exec "$router_ns" ip -6 address add fd46:2::1/64 dev ca46-wan
+sudo ip netns exec "$router_ns" ip -6 address add fd46:1::1/64 dev ca46-lan nodad
+sudo ip netns exec "$router_ns" ip -6 address add fd46:2::1/64 dev ca46-wan nodad
 sudo ip netns exec "$router_ns" sysctl -w net.ipv4.ip_forward=1
 sudo ip netns exec "$router_ns" sysctl -w net.ipv6.conf.all.forwarding=1
 
@@ -60,14 +69,14 @@ sudo ip netns exec "$client_ns" ip link set lo up
 sudo ip netns exec "$client_ns" ip link set ca46-client address 02:00:00:00:00:46
 sudo ip netns exec "$client_ns" ip link set ca46-client up
 sudo ip netns exec "$client_ns" ip address add 192.0.2.2/24 dev ca46-client
-sudo ip netns exec "$client_ns" ip -6 address add fd46:1::2/64 dev ca46-client
+sudo ip netns exec "$client_ns" ip -6 address add fd46:1::2/64 dev ca46-client nodad
 sudo ip netns exec "$client_ns" ip route add default via 192.0.2.1
 sudo ip netns exec "$client_ns" ip -6 route add default via fd46:1::1
 
 sudo ip netns exec "$server_ns" ip link set lo up
 sudo ip netns exec "$server_ns" ip link set ca46-server up
 sudo ip netns exec "$server_ns" ip address add 198.51.100.2/24 dev ca46-server
-sudo ip netns exec "$server_ns" ip -6 address add fd46:2::2/64 dev ca46-server
+sudo ip netns exec "$server_ns" ip -6 address add fd46:2::2/64 dev ca46-server nodad
 sudo ip netns exec "$server_ns" ip route add 192.0.2.0/24 via 198.51.100.1
 sudo ip netns exec "$server_ns" ip -6 route add fd46:1::/64 via fd46:2::1
 
@@ -152,9 +161,13 @@ wait_for_offload() {
 for port in 5201 5202 5203 5204 5206; do
 	sudo ip netns exec "$server_ns" iperf3 -s -D -p "$port"
 done
+current_phase=connectivity_probe
+printf '%s\n' "$current_phase" >"$report_dir/phase.txt"
 sudo ip netns exec "$client_ns" ping -c 1 -W 1 198.51.100.2 >/dev/null
 sudo ip netns exec "$client_ns" ping -6 -c 1 -W 1 fd46:2::2 >/dev/null
 
+current_phase=normal_and_sfo_throughput
+printf '%s\n' "$current_phase" >"$report_dir/phase.txt"
 apply_ruleset normal
 sudo ip netns exec "$client_ns" iperf3 -c 198.51.100.2 -p 5206 \
 	-t 3 -P 2 -J >"$report_dir/baseline.json"
@@ -169,6 +182,8 @@ sudo ip netns exec "$client_ns" iperf3 -c 198.51.100.2 -p 5206 \
 	-t 3 -P 2 -J >"$report_dir/ca-sfo.json"
 wait_for_offload 1 "$report_dir/actual-sfo.json"
 
+current_phase=targeted_revocation
+printf '%s\n' "$current_phase" >"$report_dir/phase.txt"
 sudo ip netns exec "$client_ns" iperf3 -c 198.51.100.2 -p 5201 \
 	-t 30 -P 4 -J >"$report_dir/class10-flow.json" 2>&1 &
 flow10_pid=$!
@@ -213,6 +228,8 @@ sudo ip netns exec "$router_ns" "$sfoctl" revoke 42 - 2000 \
 jq -e '.result == "COMPLETE" and .candidate_count >= 1 and .remaining == 0 and
 	.revocation_latency_ms <= 2000' "$report_dir/subject-revocation.json"
 
+current_phase=near_candidate_bound
+printf '%s\n' "$current_phase" >"$report_dir/phase.txt"
 stress_count=3072
 sudo ip netns exec "$server_ns" sh -c \
 	"ulimit -n 8192; exec python3 '$repo_dir/tests/sfo-flow-load.py' server 198.51.100.2 5210 $stress_count" \
@@ -252,6 +269,8 @@ sudo ip netns exec "$router_ns" "$sfoctl" gc 1 \
 jq -e '.result == "COMPLETE" and .correlation_health == "HEALTHY"' \
 	"$report_dir/offload-aware-gc.json"
 
+current_phase=summary
+printf '%s\n' "$current_phase" >"$report_dir/phase.txt"
 jq -n \
 	--slurpfile baseline "$report_dir/baseline.json" \
 	--slurpfile normal "$report_dir/ca-normal.json" \

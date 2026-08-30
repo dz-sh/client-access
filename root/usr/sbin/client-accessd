@@ -396,11 +396,11 @@ function reconcile(reason, force) {
 	sfo_runtime_state = sfo_manager.reconcile(sfo_runtime_state, acceleration,
 		app_apply.tracking_enabled && app_runtime.available &&
 			app_runtime.correlation_healthy,
-		config.sfo_revocation_deadline_ms);
+		config.sfo_revocation_deadline_ms, sfo_runtime);
 	if (acceleration.mode == 'SFO_ACTIVE')
 		sfo_runtime_state = sfo_manager.reconcile_gc(sfo_runtime_state,
 			acceleration, app_apply.tracking_enabled && app_runtime.available &&
-				app_runtime.correlation_healthy);
+				app_runtime.correlation_healthy, sfo_runtime);
 	else if (app_apply.tracking_enabled && app_runtime.available)
 		bpf_runtime.gc(300);
 
@@ -428,7 +428,7 @@ function reconcile(reason, force) {
 				`Restrictive ${transition.scope} authorization transition could not be published`);
 	}
 	const published_transitions = sfo_manager.revoke_transitions(
-		sfo_runtime_state, transition_candidates, acceleration);
+		sfo_runtime_state, transition_candidates, acceleration, sfo_runtime);
 	for (let transition in published_transitions)
 		if (transition.restrictive && transition.revocation_state == 'failed')
 			push(errors,

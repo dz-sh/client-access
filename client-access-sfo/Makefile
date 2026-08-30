@@ -16,7 +16,7 @@ define Package/client-access-sfo
   CATEGORY:=Network
   TITLE:=Software flow-offload revocation backend for Client Access
   DEPENDS:=+client-access-core +client-access-bpf +libbpf \
-	+libnetfilter-conntrack3
+	+libnetfilter-conntrack
 endef
 
 define Package/client-access-sfo/description
@@ -36,8 +36,8 @@ define Build/Compile
 	$(MAKE) -C $(PKG_BUILD_DIR) \
 		CC="$(TARGET_CC)" \
 		CFLAGS="$(TARGET_CFLAGS)" \
-		CPPFLAGS="$(TARGET_CPPFLAGS)" \
-		LDFLAGS="$(TARGET_LDFLAGS)" \
+		CPPFLAGS="$(TARGET_CPPFLAGS) -I$(STAGING_DIR)/usr/include" \
+		LDFLAGS="$(TARGET_LDFLAGS) -L$(STAGING_DIR)/usr/lib" \
 		LDLIBS="-lbpf -lnetfilter_conntrack"
 endef
 

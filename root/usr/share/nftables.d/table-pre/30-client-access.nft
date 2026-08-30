@@ -1,4 +1,4 @@
-# Managed by luci-app-client-access. Runtime contents are reconciled by client-accessd.
+# Managed by Client Access. Runtime contents are reconciled by client-accessd.
 set client_access_exceptions {
 	type ether_addr
 	policy performance

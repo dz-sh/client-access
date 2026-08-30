@@ -4,7 +4,7 @@ PKG_NAME:=luci-app-client-access
 PKG_RELEASE:=1
 PKG_LICENSE:=Apache-2.0
 PKG_LICENSE_FILES:=LICENSE
-PKG_MAINTAINER:=luci-app-client-access contributors
+PKG_MAINTAINER:=Client Access contributors
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)
 
 CLIENT_ACCESS_REPO_DIR:=$(patsubst %/,%,$(dir $(realpath $(CURDIR))))

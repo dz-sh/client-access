@@ -2,7 +2,6 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=client-access-bpf
-PKG_RELEASE:=1
 PKG_LICENSE:=Apache-2.0
 PKG_LICENSE_FILES:=LICENSE
 PKG_MAINTAINER:=Client Access contributors
@@ -10,6 +9,10 @@ PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)
 PKG_BUILD_DEPENDS:=HAS_BPF_TOOLCHAIN:bpf-headers
 
 CLIENT_ACCESS_REPO_DIR:=$(patsubst %/,%,$(dir $(realpath $(CURDIR))))
+include $(CLIENT_ACCESS_REPO_DIR)/version.mk
+
+PKG_VERSION:=$(CLIENT_ACCESS_VERSION)
+PKG_RELEASE:=$(CLIENT_ACCESS_RELEASE)
 
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/bpf.mk

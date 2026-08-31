@@ -1,0 +1,127 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  validate:
+    name: Validate release identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      package_release: ${{ steps.release.outputs.package_release }}
+      tag: ${{ steps.release.outputs.tag }}
+      commit: ${{ steps.release.outputs.commit }}
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Validate source version and main ancestry
+        id: release
+        run: |
+          release_tag=
+          if [[ "${GITHUB_EVENT_NAME}" == push ]]; then
+            release_tag=${GITHUB_REF_NAME}
+          fi
+          bash tests/ci/validate-release.sh \
+            "${GITHUB_WORKSPACE}" \
+            "${release_tag}" \
+            "${GITHUB_SHA}" | tee "${GITHUB_OUTPUT}"
+
+  verification:
+    name: Release verification
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+
+  assemble-release:
+    name: Assemble release candidate
+    needs:
+      - validate
+      - verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download OpenWrt packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openwrt-x86_64
+          path: ${{ runner.temp }}/release-input/openwrt
+
+      - name: Download ImmortalWrt packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: immortalwrt-x86_64
+          path: ${{ runner.temp }}/release-input/immortalwrt
+
+      - name: Assemble exact platform bundles
+        run: >-
+          bash tests/ci/assemble-release.sh
+          "${GITHUB_WORKSPACE}"
+          "${RUNNER_TEMP}/release-input/openwrt"
+          "${RUNNER_TEMP}/release-input/immortalwrt"
+          "${RUNNER_TEMP}/release-candidate"
+          "${{ needs.validate.outputs.tag }}"
+          "${{ needs.validate.outputs.commit }}"
+
+      - name: Upload release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: client-access-release-${{ needs.validate.outputs.version }}-${{ needs.validate.outputs.commit }}
+          path: ${{ runner.temp }}/release-candidate
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub Release
+    if: github.event_name == 'push'
+    needs:
+      - validate
+      - assemble-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: client-access-release-${{ needs.validate.outputs.version }}-${{ needs.validate.outputs.commit }}
+          path: ${{ runner.temp }}/release-candidate
+
+      - name: Publish verified tag artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          mapfile -t assets < <(find "${RUNNER_TEMP}/release-candidate" \
+            -maxdepth 1 -type f -print | sort)
+          if (( ${#assets[@]} != 3 )); then
+            echo "expected two platform bundles and SHA256SUMS" >&2
+            exit 1
+          fi
+          gh release create "${RELEASE_TAG}" "${assets[@]}" \
+            --verify-tag \
+            --fail-on-no-commits \
+            --generate-notes \
+            --title "Client Access ${RELEASE_VERSION}"

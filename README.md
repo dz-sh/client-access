@@ -119,6 +119,13 @@ The interface uses English by default. Install
 Chinese in LuCI's language settings. The translation package installs the web
 interface automatically if it is not already present.
 
+Published releases are grouped by the exact validated platform rather than as
+a flat collection of packages. Download the bundle matching the router's
+OpenWrt or ImmortalWrt version and architecture from GitHub Releases. Each
+bundle contains the five Client Access packages and a `MANIFEST`; the release
+also provides `SHA256SUMS` for verifying the downloaded bundles. Do not install
+a bundle built for a different distribution baseline or target.
+
 Removing the LuCI package leaves the daemon, saved configuration, and active
 enforcement in place. Removing either optional runtime package preserves
 identities, policies, application rules, and temporary-approval state. Removing

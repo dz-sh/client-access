@@ -1,5 +1,8 @@
 {
   "required_paths": [
+    "version.mk",
+    "tests/ci/validate-release.sh",
+    "tests/ci/assemble-release.sh",
     "root/usr/share/ucode/client_access/config.uc",
     "root/usr/share/ucode/client_access/lease_store.uc",
     "root/usr/share/ucode/client_access/firewall.uc",
@@ -30,6 +33,15 @@
   "forbidden_paths": [
     "Makefile"
   ],
+  "release_versioning": {
+    "version_file": "version.mk",
+    "package_makefiles": [
+      "client-access-core/Makefile",
+      "client-access-bpf/Makefile",
+      "client-access-sfo/Makefile",
+      "luci-app-client-access/Makefile"
+    ]
+  },
   "ucode_imports": {
     "root/usr/sbin/client-accessd": {
       "required": [

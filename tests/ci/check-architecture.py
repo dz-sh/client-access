@@ -202,6 +202,37 @@ def validate_packages(repo: pathlib.Path, contracts, errors):
                 errors.append(f"packages: {package} install owns forbidden fragment {fragment!r}")
 
 
+def validate_release_versioning(repo: pathlib.Path, contracts, errors):
+    rules = contracts["release_versioning"]
+    version_file = rules["version_file"]
+    source = (repo / version_file).read_text(encoding="utf-8")
+    assignments = dict(
+        re.findall(r"^([A-Z][A-Z0-9_]*)\s*:=\s*([^\s]+)\s*$", source, re.MULTILINE)
+    )
+    version = assignments.get("CLIENT_ACCESS_VERSION", "")
+    package_release = assignments.get("CLIENT_ACCESS_RELEASE", "")
+    if not re.fullmatch(
+        r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version
+    ):
+        errors.append(f"release-versioning: invalid source version {version!r}")
+    if not re.fullmatch(r"[1-9][0-9]*", package_release):
+        errors.append(f"release-versioning: invalid package release {package_release!r}")
+
+    for relative in rules["package_makefiles"]:
+        makefile = (repo / relative).read_text(encoding="utf-8")
+        required = [
+            "include $(CLIENT_ACCESS_REPO_DIR)/version.mk",
+            "PKG_VERSION:=$(CLIENT_ACCESS_VERSION)",
+            "PKG_RELEASE:=$(CLIENT_ACCESS_RELEASE)",
+        ]
+        for declaration in required:
+            if makefile.count(declaration) != 1:
+                errors.append(
+                    f"release-versioning: {relative} must contain exactly one "
+                    f"{declaration!r}"
+                )
+
+
 def validate_workflows(repo: pathlib.Path, errors):
     workflow_dir = repo / ".github/workflows"
     workflows = sorted(workflow_dir.glob("*.yml"))
@@ -211,6 +242,7 @@ def validate_workflows(repo: pathlib.Path, errors):
         "_ci-linux-runtime.yml",
         "_ci-openwrt-sdk.yml",
         "_ci-immortalwrt-sdk.yml",
+        "release.yml",
     }
     observed = {path.name for path in workflows}
     if observed != expected:
@@ -219,7 +251,12 @@ def validate_workflows(repo: pathlib.Path, errors):
     documents = {}
     for path in workflows:
         line_count = len(path.read_text(encoding="utf-8").splitlines())
-        limit = 150 if path.name == "ci.yml" else 300
+        if path.name == "ci.yml":
+            limit = 150
+        elif path.name == "release.yml":
+            limit = 180
+        else:
+            limit = 300
         if line_count > limit:
             errors.append(
                 f"workflows: {path.name} has {line_count} lines; maintainability limit is {limit}"
@@ -234,11 +271,19 @@ def validate_workflows(repo: pathlib.Path, errors):
 
         triggers = workflow_triggers(document)
         if path.name == "ci.yml":
-            if set(triggers) != {"push"}:
-                errors.append(f"workflows: ci.yml must have only push trigger")
+            if set(triggers) != {"push", "workflow_call"}:
+                errors.append("workflows: ci.yml must have push and workflow_call triggers")
             branches = (triggers.get("push") or {}).get("branches", [])
             if branches != ["main"]:
                 errors.append(f"workflows: ci.yml push branches must be [main]")
+        elif path.name == "release.yml":
+            if set(triggers) != {"push", "workflow_dispatch"}:
+                errors.append(
+                    "workflows: release.yml must have tag-push and workflow_dispatch triggers"
+                )
+            tags = (triggers.get("push") or {}).get("tags", [])
+            if tags != ["v*"]:
+                errors.append("workflows: release.yml push tags must be [v*]")
         elif set(triggers) != {"workflow_call"}:
             errors.append(f"workflows: {path.name} must have only workflow_call trigger")
 
@@ -275,6 +320,36 @@ def validate_workflows(repo: pathlib.Path, errors):
     if set(gate_needs) != expected_jobs - {"ci-gate"}:
         errors.append("workflows: CI Gate must depend on every validation lane")
 
+    release = documents.get("release.yml", {})
+    release_jobs = release.get("jobs") or {}
+    expected_release_jobs = {"validate", "verification", "assemble-release", "publish"}
+    if set(release_jobs) != expected_release_jobs:
+        errors.append(
+            f"workflows: release.yml jobs must be {sorted(expected_release_jobs)}"
+        )
+        return
+
+    verification = release_jobs["verification"]
+    if verification.get("uses") != "./.github/workflows/ci.yml":
+        errors.append("workflows: release verification must reuse ci.yml")
+    if verification.get("needs") != "validate":
+        errors.append("workflows: release verification must depend on validation")
+
+    assemble_needs = set(release_jobs["assemble-release"].get("needs", []))
+    if assemble_needs != {"validate", "verification"}:
+        errors.append("workflows: release assembly must depend on validation and verification")
+
+    publish = release_jobs["publish"]
+    if set(publish.get("needs", [])) != {"validate", "assemble-release"}:
+        errors.append("workflows: release publication must depend on verified assembly")
+    if publish.get("permissions") != {"contents": "write"}:
+        errors.append("workflows: only release publication receives contents: write")
+    if publish.get("if") != "github.event_name == 'push'":
+        errors.append("workflows: release publication must be limited to tag push events")
+    for name, job in release_jobs.items():
+        if name != "publish" and "permissions" in job:
+            errors.append(f"workflows: release job {name} must inherit read-only permissions")
+
 
 def main() -> int:
     if len(sys.argv) != 3:
@@ -289,6 +364,7 @@ def main() -> int:
     validate_ucode_boundaries(repo, contracts, errors)
     validate_c_lexical_boundaries(repo, contracts, errors)
     validate_packages(repo, contracts, errors)
+    validate_release_versioning(repo, contracts, errors)
     validate_workflows(repo, errors)
 
     if errors:

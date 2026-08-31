@@ -68,9 +68,6 @@ jobs:
           msgcmp \
             applications/luci-app-client-access/po/zh_Hans/client-access.po \
             "${RUNNER_TEMP}/client-access.generated.pot"
-          msgcmp \
-            "${RUNNER_TEMP}/client-access.generated.pot" \
-            applications/luci-app-client-access/po/zh_Hans/client-access.po
           msgattrib --translated --no-obsolete \
             applications/luci-app-client-access/po/zh_Hans/client-access.po \
             --output-file="${RUNNER_TEMP}/client-access.zh_Hans.translated.po"

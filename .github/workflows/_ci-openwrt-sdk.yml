@@ -81,6 +81,12 @@ jobs:
           ARTIFACTS_DIR: ${{ runner.temp }}/openwrt-artifacts
           BUILD_LOG: 1
           FEED_DIR: ${{ runner.temp }}/client-access-feed
+          PACKAGES: >-
+            client-access-core
+            luci-app-client-access
+            luci-i18n-client-access-zh-cn
+            client-access-bpf
+            client-access-sfo
           V: s
 
       - name: Install packaged-object verification dependencies

@@ -29,6 +29,7 @@ define Package/luci-i18n-client-access-zh-cn
   CATEGORY:=LuCI
   TITLE:=luci-app-client-access - zh-cn translation
   HIDDEN:=1
+  DEFAULT:=LUCI_LANG_zh_Hans||(ALL&&m)
   DEPENDS:=+luci-app-client-access
   PKGARCH:=all
 endef

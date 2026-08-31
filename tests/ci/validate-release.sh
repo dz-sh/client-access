@@ -23,8 +23,8 @@ version_file=${repo_dir}/version.mk
 version=$(read_value CLIENT_ACCESS_VERSION "${version_file}")
 package_release=$(read_value CLIENT_ACCESS_RELEASE "${version_file}")
 
-semver='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
-if [[ ! ${version} =~ ^${semver}$ ]]; then
+release_version='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+if [[ ! ${version} =~ ^${release_version}$ ]]; then
 	echo "invalid CLIENT_ACCESS_VERSION: ${version}" >&2
 	exit 1
 fi
@@ -34,8 +34,8 @@ if [[ ! ${package_release} =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 tag=${requested_tag:-v${version}}
-if [[ ! ${tag} =~ ^v${semver}$ ]]; then
-	echo "release tag must use vMAJOR.MINOR.PATCH: ${tag}" >&2
+if [[ ! ${tag} =~ ^v${release_version}$ ]]; then
+	echo "release tag must use vMAJOR.MINOR: ${tag}" >&2
 	exit 1
 fi
 if [[ ${tag} != "v${version}" ]]; then

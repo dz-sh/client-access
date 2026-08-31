@@ -211,9 +211,7 @@ def validate_release_versioning(repo: pathlib.Path, contracts, errors):
     )
     version = assignments.get("CLIENT_ACCESS_VERSION", "")
     package_release = assignments.get("CLIENT_ACCESS_RELEASE", "")
-    if not re.fullmatch(
-        r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version
-    ):
+    if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version):
         errors.append(f"release-versioning: invalid source version {version!r}")
     if not re.fullmatch(r"[1-9][0-9]*", package_release):
         errors.append(f"release-versioning: invalid package release {package_release!r}")

@@ -6,6 +6,7 @@ PKG_LICENSE:=Apache-2.0
 PKG_LICENSE_FILES:=LICENSE
 PKG_MAINTAINER:=Client Access contributors
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)
+PKG_BUILD_DEPENDS:=luci-base/host
 
 CLIENT_ACCESS_REPO_DIR:=$(patsubst %/,%,$(dir $(realpath $(CURDIR))))
 
@@ -23,10 +24,24 @@ define Package/luci-app-client-access/description
  Web frontend for the headless Client Access control plane.
 endef
 
+define Package/luci-i18n-client-access-zh-cn
+  SECTION:=luci
+  CATEGORY:=LuCI
+  TITLE:=luci-app-client-access - zh-cn translation
+  HIDDEN:=1
+  DEPENDS:=+luci-app-client-access
+  PKGARCH:=all
+endef
+
+define Package/luci-i18n-client-access-zh-cn/description
+ Simplified Chinese translation for luci-app-client-access.
+endef
+
 define Build/Prepare
 	rm -rf $(PKG_BUILD_DIR)
 	mkdir -p $(PKG_BUILD_DIR)
 	$(CP) $(CLIENT_ACCESS_REPO_DIR)/htdocs $(PKG_BUILD_DIR)/
+	$(CP) $(CLIENT_ACCESS_REPO_DIR)/po $(PKG_BUILD_DIR)/
 	$(CP) $(CLIENT_ACCESS_REPO_DIR)/root $(PKG_BUILD_DIR)/
 endef
 
@@ -68,4 +83,15 @@ define Package/luci-app-client-access/postrm
 exit 0
 endef
 
+define Package/luci-i18n-client-access-zh-cn/install
+	$(INSTALL_DIR) $(1)/etc/uci-defaults
+	echo "uci set luci.languages.zh_cn='简体中文 (Simplified Chinese)'; uci commit luci" \
+		> $(1)/etc/uci-defaults/luci-i18n-client-access-zh-cn
+	$(INSTALL_DIR) $(1)/usr/lib/lua/luci/i18n
+	$(STAGING_DIR_HOSTPKG)/bin/po2lmo \
+		$(PKG_BUILD_DIR)/po/zh_Hans/client-access.po \
+		$(1)/usr/lib/lua/luci/i18n/client-access.zh-cn.lmo
+endef
+
 $(eval $(call BuildPackage,luci-app-client-access))
+$(eval $(call BuildPackage,luci-i18n-client-access-zh-cn))

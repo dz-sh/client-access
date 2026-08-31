@@ -215,6 +215,27 @@
         "nftables",
         "lib/bpf"
       ]
+    },
+    "luci-i18n-client-access-zh-cn": {
+      "makefile": "luci-app-client-access/Makefile",
+      "required_dependencies": [
+        "luci-app-client-access"
+      ],
+      "forbidden_dependencies": [
+        "client-access-core",
+        "client-access-bpf",
+        "client-access-sfo",
+        "libbpf",
+        "kmod-sched-bpf"
+      ],
+      "forbidden_install_fragments": [
+        "htdocs",
+        "etc/config",
+        "client-accessd",
+        "ucode/client_access",
+        "nftables",
+        "lib/bpf"
+      ]
     }
   }
 }

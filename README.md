@@ -114,6 +114,11 @@ LuCI can install `client-access-core` directly. Install `client-access-bpf` for
 application filtering. To use canonical firewall4 software flow offload,
 install `client-access-sfo`; it also installs the BPF correlation backend.
 
+The interface uses English by default. Install
+`luci-i18n-client-access-zh-cn` for Simplified Chinese, then select Simplified
+Chinese in LuCI's language settings. The translation package installs the web
+interface automatically if it is not already present.
+
 Removing the LuCI package leaves the daemon, saved configuration, and active
 enforcement in place. Removing either optional runtime package preserves
 identities, policies, application rules, and temporary-approval state. Removing

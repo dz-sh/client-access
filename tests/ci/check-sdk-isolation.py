@@ -13,7 +13,11 @@ def main() -> int:
 
     root = pathlib.Path(sys.argv[1])
     required = ["client-access-core_*.ipk", "luci-app-client-access_*.ipk"]
-    forbidden = ["client-access-bpf_*.ipk", "client-access-sfo_*.ipk"]
+    forbidden = [
+        "client-access-bpf_*.ipk",
+        "client-access-sfo_*.ipk",
+        "luci-i18n-client-access-zh-cn_*.ipk",
+    ]
     errors = []
 
     for pattern in required:

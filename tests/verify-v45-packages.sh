@@ -116,17 +116,21 @@ assert_control_excludes() {
 
 core_package=$(find_package client-access-core)
 luci_package=$(find_package luci-app-client-access)
+i18n_package=$(find_package luci-i18n-client-access-zh-cn)
 bpf_package=$(find_package client-access-bpf)
 : >"$evidence_dir/packages.tsv"
 extract_package client-access-core "$core_package"
 extract_package luci-app-client-access "$luci_package"
+extract_package luci-i18n-client-access-zh-cn "$i18n_package"
 extract_package client-access-bpf "$bpf_package"
 
 core_files="$evidence_dir/client-access-core.files"
 luci_files="$evidence_dir/luci-app-client-access.files"
+i18n_files="$evidence_dir/luci-i18n-client-access-zh-cn.files"
 bpf_files="$evidence_dir/client-access-bpf.files"
 core_control="$evidence_dir/client-access-core.control"
 luci_control="$evidence_dir/luci-app-client-access.control"
+i18n_control="$evidence_dir/luci-i18n-client-access-zh-cn.control"
 bpf_control="$evidence_dir/client-access-bpf.control"
 
 assert_contains "$core_files" '^/etc/config/client_access$'
@@ -143,17 +147,25 @@ assert_contains "$luci_files" '^/usr/share/(luci/menu\.d|rpcd/acl\.d)/'
 assert_excludes "$luci_files" '^/etc/config/'
 assert_excludes "$luci_files" '^/usr/(sbin/client-accessd|share/ucode|share/nftables\.d|lib/bpf)'
 
+assert_contains "$i18n_files" '^/etc/uci-defaults/luci-i18n-client-access-zh-cn$'
+assert_contains "$i18n_files" '^/usr/lib/lua/luci/i18n/client-access\.zh-cn\.lmo$'
+test "$(wc -l <"$i18n_files" | tr -d ' ')" -eq 2
+
 assert_contains "$bpf_files" '^/usr/sbin/client-access-bpfctl$'
 assert_contains "$bpf_files" '^/usr/lib/bpf/client-access-bpf\.o$'
 assert_excludes "$bpf_files" '^/(etc/config|www|usr/share/ucode|usr/share/nftables\.d)'
 
 assert_control_depends "$luci_control" '(^|, )client-access-core(,|$)'
+assert_control_depends "$i18n_control" '(^|, )luci-app-client-access(,|$)'
+assert_control_excludes "$i18n_control" '(^|, )(client-access-core|client-access-bpf|client-access-sfo)(,|$)'
 assert_control_depends "$bpf_control" '(^|, )client-access-core(,|$)'
 assert_control_excludes "$bpf_control" '(^|, )luci-app-client-access(,|$)'
 assert_control_excludes "$core_control" '(^|, )(luci-|libbpf|kmod-sched-bpf)'
 
-for left in client-access-core luci-app-client-access client-access-bpf; do
-	for right in client-access-core luci-app-client-access client-access-bpf; do
+for left in client-access-core luci-app-client-access \
+	luci-i18n-client-access-zh-cn client-access-bpf; do
+	for right in client-access-core luci-app-client-access \
+		luci-i18n-client-access-zh-cn client-access-bpf; do
 		[ "$left" = "$right" ] && continue
 		overlap="$work_dir/${left}-${right}.overlap"
 		comm -12 "$evidence_dir/$left.files" "$evidence_dir/$right.files" >"$overlap"
@@ -190,6 +202,8 @@ compose() {
 
 compose core-only client-access-core
 compose luci-no-bpf client-access-core luci-app-client-access
+compose luci-zh client-access-core luci-app-client-access \
+	luci-i18n-client-access-zh-cn
 compose headless-bpf client-access-core client-access-bpf
 compose full client-access-core luci-app-client-access client-access-bpf
 
@@ -197,6 +211,8 @@ assert_excludes "$evidence_dir/composition-core-only.files" '^/www/|client-acces
 assert_contains "$evidence_dir/composition-luci-no-bpf.files" '^/usr/sbin/client-accessd$'
 assert_contains "$evidence_dir/composition-luci-no-bpf.files" '^/www/'
 assert_excludes "$evidence_dir/composition-luci-no-bpf.files" 'client-access-bpf'
+assert_contains "$evidence_dir/composition-luci-zh.files" \
+	'^/usr/lib/lua/luci/i18n/client-access\.zh-cn\.lmo$'
 assert_contains "$evidence_dir/composition-headless-bpf.files" '^/usr/sbin/client-accessd$'
 assert_contains "$evidence_dir/composition-headless-bpf.files" '^/usr/sbin/client-access-bpfctl$'
 assert_excludes "$evidence_dir/composition-headless-bpf.files" '^/www/'

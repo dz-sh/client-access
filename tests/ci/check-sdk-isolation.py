@@ -12,11 +12,14 @@ def main() -> int:
         raise SystemExit("usage: check-sdk-isolation.py ARTIFACT_DIRECTORY")
 
     root = pathlib.Path(sys.argv[1])
-    required = ["client-access-core_*.ipk", "luci-app-client-access_*.ipk"]
+    required = [
+        "client-access-core_*.ipk",
+        "luci-app-client-access_*.ipk",
+        "luci-i18n-client-access-zh-cn_*.ipk",
+    ]
     forbidden = [
         "client-access-bpf_*.ipk",
         "client-access-sfo_*.ipk",
-        "luci-i18n-client-access-zh-cn_*.ipk",
     ]
     errors = []
 
@@ -34,7 +37,8 @@ def main() -> int:
         return 1
 
     (root / "v45-build-isolation.txt").write_text(
-        "Core and LuCI built without selecting the BPF or SFO package.\n",
+        "Core, LuCI, and its optional locale output built without selecting "
+        "the BPF or SFO package.\n",
         encoding="utf-8",
     )
     print("OpenWrt core/LuCI package isolation passed")
